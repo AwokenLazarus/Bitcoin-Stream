@@ -16,6 +16,7 @@
 # The binaries come from $CARGO_TARGET_DIR (default target/). --only builds a subset (the base layer is shared,
 # so a subset's archives match the others only when built from the same mkbase.py).
 set -euo pipefail
+lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 LOAD=0

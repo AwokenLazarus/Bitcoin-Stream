@@ -47,7 +47,10 @@ python3 "$XBT063/tools/portcheck.py" wait --timeout 75 $((REHEARSAL_PORT_BASE + 
   || { echo "signer_interop: ports busy" >&2; exit 1; }
 rm -rf "${RUN:?}"
 mkdir -p "$RUN/src/b1" "$RUN/src/b2" "$OUT"
-export REHEARSAL_B1_PIN=$(awk '$1=="b1"{print $2}' "$XBT063/rehearsal/PINS") REHEARSAL_B2_PIN=$(awk '$1=="b2"{print $2}' "$XBT063/rehearsal/PINS")
+# AGP-055: SIGNER_INTEROP_B2_PIN overrides the B2 pin. Part 3 needs a B2 that reads the append-only
+# payments log (agp-055 or later): the xbt-063 pin b4f2fe5 reads payments from ledger.json, where they no longer are.
+export REHEARSAL_B1_PIN=$(awk '$1=="b1"{print $2}' "$XBT063/rehearsal/PINS")
+export REHEARSAL_B2_PIN=${SIGNER_INTEROP_B2_PIN:-$(awk '$1=="b2"{print $2}' "$XBT063/rehearsal/PINS")}
 git -C "$HOME/xbt-rnd/b1" archive "$REHEARSAL_B1_PIN" xbt402 scripts | tar -x -C "$RUN/src/b1"
 git -C "$HOME/xbt-rnd/b2" archive "$REHEARSAL_B2_PIN" agentwallet agentwallet-approve | tar -x -C "$RUN/src/b2"
 echo "== AGP-027 signer interop on regtest: ports $REHEARSAL_PORT_BASE-$((REHEARSAL_PORT_BASE + 99)), b1 $REHEARSAL_B1_PIN, b2 $REHEARSAL_B2_PIN, signer $XBT_SIGNER_BIN"

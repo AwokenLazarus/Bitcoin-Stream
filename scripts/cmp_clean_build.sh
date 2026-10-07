@@ -20,6 +20,7 @@
 #   XBT_CLEAN_TARGETS (space separated), XBT_CLEAN_KEEP=1 keeps the temp dir.
 # Soak rules: CPUQuota 200%, 4G, nice 19, cargo -j2. Writes nothing in this repo.
 set -euo pipefail
+lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REF=${1:-main}
 ZB=${XBT_ZIGBUILD:-$HOME/xbt-rnd/tools/zigbuild/bin/cargo-zigbuild}

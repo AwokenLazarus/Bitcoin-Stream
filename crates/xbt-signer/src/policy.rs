@@ -5,8 +5,8 @@
 //! `tests/policy_conformance.rs` replays a decision table generated from the Python engine
 //! (`vectors/b2_policy.json`). The on-disk ledger (`.run/ledger.json`) and audit log
 //! (`.run/audit.jsonl`) have B2's formats, so a signer can move between implementations.
+use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -14,6 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
+use crate::applog::AppendLog;
 use crate::keystore::random_bytes;
 use crate::pyjson::{dumps_indent, dumps_sorted_compact, now_f64, py_int, ts_value};
 use crate::{err, Result};
@@ -390,8 +391,8 @@ impl AuditLog {
         let line = dumps_sorted_compact(&event);
         let _g = self.lock.lock();
         if let Ok(mut f) = fs::OpenOptions::new().append(true).create(true).open(&self.path) {
-            let _ = f.write_all(format!("{line}\n").as_bytes());
-            let _ = f.sync_all();
+            let _ = crate::fsx::write_all(&mut f, format!("{line}\n").as_bytes());
+            let _ = crate::fsx::sync(&f);
         }
     }
 
@@ -403,10 +404,86 @@ impl AuditLog {
     }
 }
 
-/// Committed payments and pending human approvals (`ledger.json`).
+/// Commits between two prunes of the in-memory payments.
+pub const PRUNE_EVERY: usize = 1024;
+
+struct Payments {
+    log: AppendLog,
+    entries: Vec<LedgerEntry>,
+    unpruned: usize,
+    prune_every: usize,
+    /// What stays in memory and what a compaction keeps; `None` keeps everything.
+    retain_s: Option<f64>,
+}
+
+fn entry_row(e: &LedgerEntry) -> Value {
+    json!({"dest": e.dest, "amount_sats": e.amount_sats, "ts": ts_value(e.ts), "txid": e.txid, "memo": e.memo})
+}
+
+fn row_entry(e: &Value) -> LedgerEntry {
+    LedgerEntry {
+        dest: e.get("dest").and_then(Value::as_str).unwrap_or("").into(),
+        amount_sats: py_int(e.get("amount_sats")).unwrap_or(0),
+        ts: e.get("ts").and_then(Value::as_f64).unwrap_or(0.0),
+        txid: e.get("txid").and_then(Value::as_str).unwrap_or("").into(),
+        memo: e.get("memo").and_then(Value::as_str).unwrap_or("").into(),
+    }
+}
+
+/// A payment's identity for the one-time move out of an old `ledger.json`.
+fn entry_key(e: &LedgerEntry) -> (String, i64, u64, String, String) {
+    (e.dest.clone(), e.amount_sats, e.ts.to_bits(), e.txid.clone(), e.memo.clone())
+}
+
+impl Payments {
+    /// Apply one log line: a payment, or `{"amend": txid, "amount_sats": n | null}`.
+    fn apply(&mut self, row: &Value, n: usize) -> Result<()> {
+        let Some(txid) = row.get("amend").and_then(Value::as_str) else {
+            if row.get("dest").and_then(Value::as_str).is_none() || py_int(row.get("amount_sats")).is_none() || row.get("ts").and_then(Value::as_f64).is_none() {
+                return Err(err("log", format!("{}: line {n} is not a payment", self.log.path.display())));
+            }
+            self.entries.push(row_entry(row));
+            return Ok(());
+        };
+        let i = self.entries.iter().rposition(|e| e.txid == txid)
+            .ok_or_else(|| err("log", format!("{}: line {n} amends {txid:?}, which the log does not hold", self.log.path.display())))?;
+        match py_int(row.get("amount_sats")) {
+            Some(a) => self.entries[i].amount_sats = a,
+            None => {
+                self.entries.remove(i);
+            }
+        }
+        Ok(())
+    }
+
+    fn rows(&self) -> Vec<Value> {
+        self.entries.iter().map(entry_row).collect()
+    }
+
+    fn prune(&mut self, now: f64) -> Result<()> {
+        self.unpruned = 0;
+        if let Some(keep) = self.retain_s {
+            self.entries.retain(|e| e.ts >= now - keep);
+        }
+        if self.log.file_rows > 2 * self.entries.len() + self.prune_every {
+            self.log.compact(&self.rows())?;
+        }
+        Ok(())
+    }
+}
+
+/// Committed payments and pending human approvals.
+///
+/// AGP-055 (as B2 `policy.py`, same files): `ledger.json` holds the approvals. The payments are an
+/// append-only log next to it (`ledger.payments.jsonl`, [`crate::applog`]): a commit is one line
+/// and one fsync, and the engine reads the payments from memory. Both used to be one JSON document,
+/// read and rewritten whole on every commit. Payments found in `ledger.json` (the old format) move
+/// to the log at open. [`PolicyStore::amend`] appends `{"amend": txid, "amount_sats": n | null}`.
 pub struct PolicyStore {
     pub path: PathBuf,
+    pub log_path: PathBuf,
     lock: Mutex<()>,
+    payments: Mutex<Payments>,
 }
 
 impl PolicyStore {
@@ -414,11 +491,66 @@ impl PolicyStore {
         if let Some(p) = path.parent() {
             fs::create_dir_all(p).map_err(|e| err("io", e.to_string()))?;
         }
-        let s = Self { path: path.into(), lock: Mutex::new(()) };
-        if !path.exists() {
-            s.write(&json!({"payments": [], "approvals": {}}))?;
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("ledger");
+        let log_path = path.with_file_name(format!("{stem}.payments.jsonl"));
+        let log_name = log_path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let (log, rows) = AppendLog::open(&log_path, "payments")?;
+        let mut pay = Payments { log, entries: vec![], unpruned: 0, prune_every: PRUNE_EVERY, retain_s: None };
+        for (i, row) in rows.iter().enumerate() {
+            pay.apply(row, i + 2)?;
         }
+        let s = Self { path: path.into(), log_path, lock: Mutex::new(()), payments: Mutex::new(pay) };
+        if !path.exists() {
+            s.write(&json!({"approvals": {}, "payments_log": log_name}))?;
+        }
+        s.migrate(&log_name)?;
         Ok(s)
+    }
+
+    fn pay(&self) -> std::sync::MutexGuard<'_, Payments> {
+        match self.payments.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Move the payments of an old-format `ledger.json` to the log. Safe to run again after a crash
+    /// between its two writes: only rows the log does not already hold are added.
+    fn migrate(&self, log_name: &str) -> Result<()> {
+        let mut data = self.read()?;
+        let Some(old) = data.get("payments").cloned() else { return Ok(()) };
+        let mut pay = self.pay();
+        let mut have: HashMap<_, usize> = HashMap::new();
+        for e in &pay.entries {
+            *have.entry(entry_key(e)).or_default() += 1;
+        }
+        let mut added = false;
+        for row in old.as_array().into_iter().flatten() {
+            let e = row_entry(row);
+            match have.get_mut(&entry_key(&e)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => {
+                    pay.entries.push(e);
+                    added = true;
+                }
+            }
+        }
+        if added {
+            let rows = pay.rows();
+            pay.log.compact(&rows)?;
+        }
+        drop(pay);
+        if let Some(m) = data.as_object_mut() {
+            m.remove("payments");
+            m.insert("payments_log".into(), log_name.into());
+        }
+        self.write(&data)
+    }
+
+    /// Bound what stays in memory and what a compaction keeps (the engine sets its longest window
+    /// plus a day). The audit log has every commit regardless.
+    pub fn set_retain(&self, seconds: Option<f64>) {
+        self.pay().retain_s = seconds;
     }
 
     fn read(&self) -> Result<Value> {
@@ -429,47 +561,37 @@ impl PolicyStore {
     fn write(&self, data: &Value) -> Result<()> {
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, dumps_indent(data, 2, true)).map_err(|e| err("io", e.to_string()))?;
-        fs::rename(&tmp, &self.path).map_err(|e| err("io", e.to_string()))
+        crate::fsx::rename(&tmp, &self.path).map_err(|e| err("io", e.to_string()))
     }
 
     pub fn payments(&self) -> Result<Vec<LedgerEntry>> {
-        let _g = self.lock.lock();
-        let d = self.read()?;
-        Ok(d.get("payments").and_then(Value::as_array).map(|a| a.iter().map(|e| LedgerEntry {
-            dest: e.get("dest").and_then(Value::as_str).unwrap_or("").into(),
-            amount_sats: py_int(e.get("amount_sats")).unwrap_or(0),
-            ts: e.get("ts").and_then(Value::as_f64).unwrap_or(0.0),
-            txid: e.get("txid").and_then(Value::as_str).unwrap_or("").into(),
-            memo: e.get("memo").and_then(Value::as_str).unwrap_or("").into(),
-        }).collect()).unwrap_or_default())
+        Ok(self.pay().entries.clone())
     }
 
     pub fn commit(&self, e: &LedgerEntry) -> Result<()> {
-        let _g = self.lock.lock();
-        let mut d = self.read()?;
-        let row = json!({"dest": e.dest, "amount_sats": e.amount_sats, "ts": ts_value(e.ts), "txid": e.txid, "memo": e.memo});
-        match d.get_mut("payments").and_then(Value::as_array_mut) {
-            Some(a) => a.push(row),
-            None => d["payments"] = json!([row]),
+        let mut pay = self.pay();
+        pay.log.append(&entry_row(e))?; // durable before it counts
+        pay.entries.push(e.clone());
+        pay.unpruned += 1;
+        if pay.unpruned >= pay.prune_every {
+            pay.prune(e.ts)?;
         }
-        self.write(&d)
+        Ok(())
     }
 
     /// AGP-048: settle a booking. The row committed under `txid` (a Lightning payment booked at its
     /// worst case before it was sent) becomes what was actually spent, or goes when nothing was
     /// (`None`). `false`: no such row. The audit log keeps the history.
     pub fn amend(&self, txid: &str, amount_sats: Option<i64>) -> Result<bool> {
-        let _g = self.lock.lock();
-        let mut d = self.read()?;
-        let Some(a) = d.get_mut("payments").and_then(Value::as_array_mut) else { return Ok(false) };
-        let Some(i) = a.iter().rposition(|e| e.get("txid").and_then(Value::as_str) == Some(txid)) else { return Ok(false) };
+        let mut pay = self.pay();
+        let Some(i) = pay.entries.iter().rposition(|e| e.txid == txid) else { return Ok(false) };
+        pay.log.append(&json!({"amend": txid, "amount_sats": amount_sats}))?;
         match amount_sats {
-            Some(n) => a[i]["amount_sats"] = n.into(),
+            Some(n) => pay.entries[i].amount_sats = n,
             None => {
-                a.remove(i);
+                pay.entries.remove(i);
             }
         }
-        self.write(&d)?;
         Ok(true)
     }
 
@@ -534,7 +656,13 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     pub fn new(config: PolicyConfig, store: PolicyStore, audit: AuditLog, clock: Option<Clock>) -> Self {
         let allowlist = config.normalized_allowlist();
+        store.set_retain(Some(Self::retain_s(&config)));
         Self { config: RwLock::new(config), allowlist: RwLock::new(allowlist), store, audit, clock: clock.unwrap_or_else(|| Arc::new(now_f64)) }
+    }
+
+    /// What the store keeps: what the longest window of `config` can still read, and a day more.
+    fn retain_s(config: &PolicyConfig) -> f64 {
+        WEEK_S.max(config.velocity_window_s as f64).max(config.split_window_s as f64) + DAY_S
     }
 
     /// The policy in force now.
@@ -550,6 +678,7 @@ impl PolicyEngine {
     /// Replace the policy (AGP-039 `policy_set`); later decisions use it.
     pub fn set_config(&self, config: PolicyConfig) {
         *self.allowlist.write().unwrap_or_else(|p| p.into_inner()) = config.normalized_allowlist();
+        self.store.set_retain(Some(Self::retain_s(&config)));
         *self.config.write().unwrap_or_else(|p| p.into_inner()) = config;
     }
 
@@ -669,6 +798,128 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(i: i64, ts: f64) -> LedgerEntry {
+        LedgerEntry { dest: "http://api.test".into(), amount_sats: 10 + i, ts, txid: format!("t{i}"), memo: "m".into() }
+    }
+
+    fn txids(s: &PolicyStore) -> Vec<String> {
+        s.payments().unwrap().into_iter().map(|e| e.txid).collect()
+    }
+
+    fn crashing<T>(step: u64, f: impl FnOnce() -> T) -> Option<T> {
+        use crate::fsx::probe;
+        probe::crash_at(step, true);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        probe::reset();
+        match out {
+            Ok(v) => Some(v),
+            Err(e) if e.is::<probe::Crash>() => None,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn commit_appends_one_line_and_does_not_grow_with_the_ledger() {
+        use crate::fsx::probe;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ledger.json");
+        let s = PolicyStore::open(&p).unwrap();
+        for i in 0..50 {
+            s.commit(&entry(i, 1000.0 + i as f64)).unwrap();
+        }
+        let before = fs::read(&p).unwrap();
+        let size = fs::metadata(&s.log_path).unwrap().len();
+        probe::reset();
+        s.commit(&entry(50, 1050.0)).unwrap();
+        let c = probe::counts();
+        assert_eq!((c.writes, c.syncs, c.renames), (1, 1, 0));
+        assert!(fs::metadata(&s.log_path).unwrap().len() - size < 120);
+        assert_eq!(fs::read(&p).unwrap(), before, "the approvals file is not touched");
+        let doc: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(doc, json!({"approvals": {}, "payments_log": "ledger.payments.jsonl"}), "no empty list a reader could trust");
+        drop(s);
+        assert_eq!(txids(&PolicyStore::open(&p).unwrap()), (0..51).map(|i| format!("t{i}")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn old_ledger_moves_to_the_log_and_a_crash_at_any_step_loses_or_doubles_nothing() {
+        let same = json!({"dest": "d", "amount_sats": 5, "ts": 7.0, "txid": "same", "memo": ""});
+        let old = json!({"payments": [same, same, {"dest": "d", "amount_sats": 9, "ts": 8.0, "txid": "x", "memo": ""}], "approvals": {"tok": {"dest": "d"}}});
+        let mut step = 0;
+        loop {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ledger.json");
+            fs::write(&p, old.to_string()).unwrap();
+            let done = crashing(step, || drop(PolicyStore::open(&p).unwrap())).is_some();
+            let s = PolicyStore::open(&p).unwrap(); // the restart finishes the move
+            let mut amounts: Vec<i64> = s.payments().unwrap().iter().map(|e| e.amount_sats).collect();
+            amounts.sort();
+            assert_eq!(amounts, [5, 5, 9], "step {step}");
+            assert_eq!(s.get_approval("tok").unwrap(), Some(json!({"dest": "d"})));
+            if done {
+                let doc: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+                assert_eq!(doc, json!({"approvals": {"tok": {"dest": "d"}}, "payments_log": "ledger.payments.jsonl"}));
+                break;
+            }
+            step += 1;
+        }
+        assert!(step > 3);
+    }
+
+    #[test]
+    fn retention_and_compaction() {
+        let d = tempfile::tempdir().unwrap();
+        let s = PolicyStore::open(&d.path().join("ledger.json")).unwrap();
+        s.set_retain(Some(100.0));
+        s.pay().prune_every = 8;
+        for i in 0..40 {
+            s.commit(&entry(i, 1000.0 + i as f64)).unwrap();
+        }
+        for i in 40..48 {
+            s.commit(&entry(i, 5000.0 + i as f64)).unwrap();
+        }
+        assert_eq!(txids(&s), (40..48).map(|i| format!("t{i}")).collect::<Vec<_>>());
+        assert_eq!(fs::read_to_string(&s.log_path).unwrap().lines().count(), 1 + 8);
+        let all = PolicyStore::open(&d.path().join("other.json")).unwrap(); // no engine, no retention: nothing is dropped
+        all.pay().prune_every = 8;
+        for i in 0..40 {
+            all.commit(&entry(i, i as f64)).unwrap();
+        }
+        assert_eq!(all.payments().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn amend_is_a_line_and_survives_a_restart_and_a_compaction() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ledger.json");
+        let s = PolicyStore::open(&p).unwrap();
+        for i in 0..3 {
+            s.commit(&entry(i, 1000.0 + i as f64)).unwrap();
+        }
+        assert!(s.amend("t1", Some(99)).unwrap());
+        assert!(s.amend("t2", None).unwrap());
+        let size = fs::metadata(&s.log_path).unwrap().len();
+        assert!(!s.amend("nope", Some(1)).unwrap());
+        assert_eq!(fs::metadata(&s.log_path).unwrap().len(), size, "no line for a row that is not there");
+        let text = fs::read_to_string(&s.log_path).unwrap();
+        assert!(text.ends_with("{\"amend\":\"t1\",\"amount_sats\":99}\n{\"amend\":\"t2\",\"amount_sats\":null}\n"), "{text}");
+        let want = vec![("t0".to_string(), 10), ("t1".to_string(), 99)];
+        let got = |s: &PolicyStore| s.payments().unwrap().into_iter().map(|e| (e.txid, e.amount_sats)).collect::<Vec<_>>();
+        assert_eq!(got(&s), want);
+        drop(s);
+        let s = PolicyStore::open(&p).unwrap();
+        assert_eq!(got(&s), want);
+        s.pay().prune_every = 1;
+        s.pay().log.file_rows = 100; // as if many amended rows had piled up: the next commit compacts
+        s.commit(&entry(7, 2000.0)).unwrap();
+        assert_eq!(fs::read_to_string(&s.log_path).unwrap().lines().count(), 1 + 3, "folded: no amend lines left");
+        drop(s);
+        assert_eq!(got(&PolicyStore::open(&p).unwrap()), [want, vec![("t7".to_string(), 17)]].concat());
+        // an amend whose row the log does not hold is damage
+        fs::write(p.with_file_name("ledger.payments.jsonl"), "{\"kind\":\"payments\",\"v\":1}\n{\"amend\":\"gone\",\"amount_sats\":1}\n").unwrap();
+        assert_eq!(PolicyStore::open(&p).err().map(|e| e.code), Some("log".to_string()));
+    }
 
     #[test]
     fn normalize_like_python() {

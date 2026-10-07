@@ -8,6 +8,7 @@
 # MemoryMax 4G, nice 19, -j2. Evidence: run/container-test/<stamp>/.
 #   scripts/container_test.sh [--skip-build]      CONTAINER_TEST_KEEP=1 keeps the volumes
 set -euo pipefail
+lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 STAMP=$(date +%Y%m%d-%H%M%S)

@@ -6,6 +6,7 @@
 //! expiry (the watcher), the pending close-change retry and the anchored signature log, with
 //! B2's socket protocol (`docs/B2_SIGNER_API.md`) and on-disk formats.
 //!
+//! * [`applog`], [`fsx`]: the append-only logs (AGP-055) and the durable-write steps under every file.
 //! * [`keystore`]: AES-256-GCM sealing (keyfile or scrypt passphrase), B2's blob format.
 //! * [`sigaudit`], [`anchor`]: the hash-chained signature log and the witness protocol.
 //! * [`policy`], [`approval`]: B2's policy engine and the ed25519 human approvals.
@@ -22,6 +23,7 @@
 //! * [`client`]: the socket client and [`client::RemoteSigner`], an xbt402 `StateSigner`/`Wallet`.
 pub mod admin;
 pub mod anchor;
+pub mod applog;
 pub mod client;
 pub mod approval;
 pub mod bolt11;

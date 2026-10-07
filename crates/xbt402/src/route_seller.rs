@@ -1002,6 +1002,7 @@ impl Provider {
         }
         st.extra.insert("route_locks".into(), Value::Object(locks));
         st.extra.insert("routed_sat".into(), (routed + amount).into());
+        st.extra.insert("max_lock".into(), py_u64(st.extra.get("max_lock")).unwrap_or(0).max(amount).into());
         self.save_state(l, st)?;
         let sess = rs.sessions.get_mut(&sid).ok_or_else(|| ChannelError::code("unknown_session"))?;
         sess.paid_sat += amount;
@@ -1040,7 +1041,16 @@ impl Provider {
             return err_json(400, "channel_closing", "");
         }
         if st.suspended {
-            return err_json(400, "unconfirmed", "");
+            // AGP-057: `suspended` is the watcher's last look, and a block that came during that look
+            // leaves a rollover child suspended although it confirmed (the parent was then spent in a
+            // block, so it was no zero-conf child either). A hub looks at the chain itself before it
+            // sends a lock: so do we before refusing one on an unconfirmed child
+            let pending = st.extra.get("zero_conf").is_some_and(|z| z.is_object() && !crate::json::truthy(z.get("confirmed")));
+            if !(pending && matches!(self.zc_confirmed(&mut st, true), Ok(true))) {
+                return err_json(400, "unconfirmed", "");
+            }
+            st.suspended = false;
+            let _ = self.save_state(&mut l, &st);
         }
         if let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object() && !crate::json::truthy(z.get("confirmed"))).cloned() {
             // AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin

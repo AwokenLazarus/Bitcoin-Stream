@@ -347,8 +347,27 @@ impl LnRig {
     }
 
     fn ledger_net(&self) -> i64 {
+        // AGP-055: the payments are the append-only log next to ledger.json, read here as written:
+        // the header, a payment per line, and amend lines that change or drop the last row of a txid
         let v: Value = serde_json::from_str(&std::fs::read_to_string(self.root.join(".run/ledger.json")).unwrap()).unwrap();
-        v["payments"].as_array().unwrap().iter().filter(|p| p["dest"] == dest()).map(|p| p["amount_sats"].as_i64().unwrap()).sum()
+        assert!(v.get("payments").is_none(), "ledger.json no longer carries payments");
+        let text = std::fs::read_to_string(self.root.join(".run").join(v["payments_log"].as_str().unwrap())).unwrap();
+        let mut rows: Vec<Value> = vec![];
+        for line in text.lines().skip(1) {
+            let r: Value = serde_json::from_str(line).unwrap();
+            match r.get("amend") {
+                None => rows.push(r),
+                Some(txid) => {
+                    let i = rows.iter().rposition(|p| &p["txid"] == txid).expect("an amend names a row of the log");
+                    if r["amount_sats"].is_null() {
+                        rows.remove(i);
+                    } else {
+                        rows[i]["amount_sats"] = r["amount_sats"].clone();
+                    }
+                }
+            }
+        }
+        rows.iter().filter(|p| p["dest"] == dest()).map(|p| p["amount_sats"].as_i64().unwrap()).sum()
     }
 
     fn audit(&self, ty: &str) -> Vec<Value> {

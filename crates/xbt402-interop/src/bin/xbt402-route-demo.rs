@@ -1,10 +1,10 @@
 //! The AGP-021 demo scenarios, all Rust, on regtest (a port of B1 `scripts/demo_route.py`; run by
 //! `scripts/route_interop.sh`). Real HTTP (tiny_http + ureq) between every party.
 //!
-//! 1 client (LocalSigner), 1 hub, 4 providers: operator 1 runs A and B under ONE payTo key (one
-//! provider serving two mounts on two ports), C and D are separate operators. The client has ONE
-//! channel (to the hub); the hub funds one ch2 per payTo itself (AGP-044: A and B share one),
-//! payee-pays (v1.2).
+//! 1 client (LocalSigner), 1 hub, 4 providers: operator 1 runs A and B under ONE payTo key (two
+//! provider processes: each its own ledger, origin and sessions), C and D are separate operators. The
+//! client has ONE channel (to the hub); the hub funds one ch2 per provider process itself (AGP-056: A
+//! and B have one each), payee-pays (v1.2).
 //!
 //! * phase 1 (~10 s): the client streams to all 4 at 12 calls/s each; per-window adaptor locks pay
 //!   each provider's accrued amount through the hub. A and B cost under a sat per call (amsat, B with
@@ -142,14 +142,8 @@ fn main() {
     let mut urls: HashMap<&str, String> = HashMap::new();
     for (i, n) in NAMES.iter().enumerate() {
         urls.insert(n, format!("http://127.0.0.1:{}", pb + 1 + i as u16));
-        if *n == "B" {
-            // operator 1's second mount, on its own port: the same provider (one payTo, one ledger)
-            let a = provs["A"].clone();
-            a.offer_route(RouteOffer { window: WINDOW, lock_wait: LOCK_WAIT, invoice_ttl: INVOICE_TTL, ..RouteOffer::new(mount(n), price(n)) });
-            serve_http(a.clone(), &format!("127.0.0.1:{}", pb + 1 + i as u16), 8).expect("bind provider");
-            provs.insert(n, a);
-            continue;
-        }
+        // operator 1 runs two provider processes on one payTo key, A and B: each has its own ledger,
+        // origin and sessions (AGP-056: the hub pays each on its own ch2)
         let mut cfg = ProviderConfig::new(&net);
         cfg.close_margin = 144;
         cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 1_008, max_expiry_blocks: 8_640, close_margin: 144, ..FundingPolicy::default() };
@@ -176,21 +170,22 @@ fn main() {
                                      &net, Some(&run.join("hub")), cfg).unwrap());
     serve_service(hub.clone(), &format!("127.0.0.1:{pb}"), 16).expect("bind hub");
     let hub_url = format!("http://127.0.0.1:{pb}");
-    println!("== hub funds one channel per payTo from its own wallet (providers open nothing)");
+    println!("== hub funds one channel per provider process from its own wallet (providers open nothing)");
     let committed0 = hub.committed_sat();
     for n in NAMES {
         let cap = if n == "D" { 30_000 } else { 150_000 };
         let oc = hub.connect(&urls[n], Some(cap), None).expect("connect");
-        println!("   ch2 hub->{n}: {}... capacity {}{}", &oc.params.channel_id()[..20], oc.params.capacity,
-                 if oc.origin != urls[n] { " (A's: one ch2 per payTo)" } else { "" });
+        println!("   ch2 hub->{n}: {}... capacity {}", &oc.params.channel_id()[..20], oc.params.capacity);
     }
     hub.watch_tick();
     let ch2 = |n: &str| hub.ch2_for(&urls[n]).expect("ch2");
     let opened: Vec<&str> = NAMES.iter().copied().filter(|n| ch2(n).state == "open").collect();
     ck.check("hub-funded ch2 open to all 4 providers", opened.len() == 4, opened.join(","));
-    ck.check("one live ch2 per payTo: A and B share one ch2, 3 funded for 4 origins, the cap counts it once",
-             ch2("A").params.channel_id() == ch2("B").params.channel_id() && hub.out_channels().len() == 3
-             && hub.committed_sat() - committed0 == 150_000 * 2 + 30_000,
+    ck.check("one ch2 per provider process: A and B (one payTo key, two ledgers) have a ch2 each, 4 funded",
+             ch2("A").params.channel_id() != ch2("B").params.channel_id() && hub.out_channels().len() == 4
+             && hub.committed_sat() - committed0 == 150_000 * 3 + 30_000
+             && provs["B"].channel_state(&ch2("B").params.channel_id()).is_some()
+             && provs["A"].channel_state(&ch2("B").params.channel_id()).is_none(),
              format!("{} ch2s, {} sat committed", hub.out_channels().len(), hub.committed_sat() - committed0));
     let r402 = hub.serve("GET", HUB_ROUTE_PATH, &[], b"", "", None);
     let routing = xbt402::wire::unb64json(r402.header("PAYMENT-REQUIRED").unwrap()).unwrap()["accepts"][0]["extra"]["routing"].clone();
@@ -358,11 +353,11 @@ fn main() {
     let (routed, fee_units, fee_paid, _) = payer.counters();
     ck.check("hub fee carried exactly across every lock: fees == ceil(units / 1e9)", fee_paid as u128 == ceil_div(fee_units, FEE_UNITS_PER_SAT),
              format!("{fee_paid} sat for {fee_units} units"));
-    let ab = ch2("A");
     let (la, lb) = (shards["A"].snapshot().locked_sat, shards["B"].snapshot().locked_sat);
-    ck.check("one ch2 per payTo: A's and B's locks all went over operator 1's one ch2",
-             ch2("B").params.channel_id() == ab.params.channel_id() && ab.routed == la + lb && la > 0 && lb > 0,
-             format!("ch2 routed {} = A {la} + B {lb}", ab.routed));
+    ck.check("one key, two processes: A's locks went over A's ch2 and B's over B's, none sent to the other",
+             ch2("A").routed == la && la > 0 && ch2("B").routed == lb && lb > 0
+             && !hub.stats.lock().unwrap().refused.contains_key("unknown_session"),
+             format!("ch2 A routed {} = {la}, ch2 B routed {} = {lb}", ch2("A").routed, ch2("B").routed));
     let at_fwd = hub.stats.lock().unwrap().ch1_locks_at_forward.clone();
     ck.check("fan-out: at most one lock pending on ch1 at every forward", !at_fwd.is_empty() && at_fwd.iter().all(|n| *n == 1),
              format!("{} forwards", at_fwd.len()));
@@ -374,9 +369,8 @@ fn main() {
     let c1 = payer.close().expect("close ch1");
     let mut closes = vec![];
     for n in NAMES {
-        // B's ch2 is A's: closed once
         if let Some(oc) = hub.ch2_for(&urls[n]).filter(|c| c.state == "open") {
-            closes.push((if n == "A" { "A+B" } else { n }, hub.close_ch2(&oc, false).expect("close ch2")));
+            closes.push((n, hub.close_ch2(&oc, false).expect("close ch2")));
         }
     }
     chain.mine(1);

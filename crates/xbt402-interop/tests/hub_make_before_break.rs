@@ -63,7 +63,7 @@ struct W {
 fn world(zc_max: Option<u64>, zc: bool) -> W {
     let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
     let mut hc = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                                              "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000,
+                                              "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0,
                                               "close_margin": 36,
                                               "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
     hc.zero_conf_rollover = zc;
@@ -75,6 +75,7 @@ fn world(zc_max: Option<u64>, zc: bool) -> W {
     cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 500, max_expiry_blocks: 8_640, close_margin: 36, ..FundingPolicy::default() };
     cfg.settle_multiple = 2;
     cfg.height_ttl = Duration::ZERO;
+    cfg.settle_lock_multiple = 0; // the settle floor (AGP-056) has its own tests: hub_multi_process.rs
     cfg.route_close_fee_payer = FeePayer::Payee;
     cfg.rollover_zero_conf_max = zc_max;
     let ledger = Ledger::open(&dir.0.join("prov.jsonl")).unwrap();

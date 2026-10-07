@@ -17,8 +17,8 @@ use xbt402::funding::{ChainBackend, FundingPolicy};
 use xbt402::hub::{HubConfig, OutChannel, RouteHub, LIVE};
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
-use xbt402::route::{canon_origin, HUB_ROUTE_PATH};
-use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
+use xbt402::route::canon_origin;
+use xbt402::route_client::{RoutePayer, RoutePayerConfig};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::LocalSigner;
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
@@ -80,13 +80,6 @@ fn hub_cfg(extra: Value) -> HubConfig {
     HubConfig::from_json(&c).unwrap()
 }
 
-fn stream(pay: &RoutePayer, sh: &Arc<Shard>, n: usize) {
-    for _ in 0..n {
-        let r = pay.call(sh, "POST", br#"{"tokens":1}"#).unwrap();
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    }
-}
-
 fn has(acts: &[Value], f: impl Fn(&Value) -> bool) -> bool {
     acts.iter().any(f)
 }
@@ -106,6 +99,9 @@ impl Wallet for CountingWallet {
     }
 }
 
+/// `net`, `pay` and `dir` are held for the world's lifetime (the per-payTo tests that read them moved to
+/// hub_multi_process.rs with AGP-056).
+#[allow(dead_code)]
 struct W {
     chain: Arc<MemChain>,
     net: Arc<MemNet>,
@@ -162,10 +158,6 @@ impl W {
 
     fn events(&self, name: &str) -> Vec<Value> {
         self.hub.events.lock().unwrap().iter().filter(|e| e["event"] == name).cloned().collect()
-    }
-
-    fn live(&self) -> usize {
-        self.hub.out_channels().values().filter(|c| LIVE.contains(&c.state.as_str())).count()
     }
 }
 
@@ -367,36 +359,11 @@ fn bump_config_keys_round_trip() {
     assert_eq!((d.refund_bump_blocks, d.refund_max_fee_sat), (3, 5000));
 }
 
-// --- 2 one live ch2 per payTo -----------------------------------------------------------------------
-
-#[test]
-fn payto_two_origins_one_operator_get_one_ch2_and_the_cap_is_unchanged() {
-    // the cap holds exactly one ch2: a second funding would be refused with liquidity_cap
-    let w = W::new(&[0xA1, 0xA1], true, hub_cfg(json!({"liquidity_cap_sat": 100000})));
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
-    let oa = w.hub.connect(&a, None, None).unwrap();
-    let ob = w.hub.connect(&b, None, None).unwrap();
-    assert_eq!(oa.params.channel_id(), ob.params.channel_id());
-    assert_eq!((w.funds.load(Ordering::SeqCst), w.hub.committed_sat(), w.live()), (1, 100_000, 1));
-    let reuse = w.events("ch2_reuse");
-    assert_eq!((reuse.len(), reuse[0]["provider"].as_str().unwrap(), reuse[0]["ch2"].as_str().unwrap()), (1, b.as_str(), a.as_str()));
-    w.chain.confirm_all();
-    w.hub.watch_tick();
-    // the hub's 402 lists both origins as routable
-    let r = w.hub.serve("GET", HUB_ROUTE_PATH, &[], b"", "", None);
-    let routing = xbt402::wire::unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap()["accepts"][0]["extra"]["routing"].clone();
-    assert_eq!(routing["providers"], json!([a, b]));
-    let sa = w.pay.shard(&format!("{a}/v1/chunk"), "POST").unwrap();
-    let sb = w.pay.shard(&format!("{b}/v1/chunk"), "POST").unwrap();
-    for sh in [&sa, &sb, &sa] {
-        stream(&w.pay, sh, 6);
-        assert_eq!(w.pay.lock(sh).unwrap().unwrap()["status"], "paid");
-    }
-    let oc = w.oc(&a);
-    assert_eq!(oc.routed, sa.snapshot().locked_sat + sb.snapshot().locked_sat);
-    assert!(!w.hub.out_channels().contains_key(&b));
-    assert_eq!(w.hub.committed_sat(), 100_000);
-}
+// --- 2 one live ch2 per origin -----------------------------------------------------------------------
+// AGP-044 kept one live ch2 per payTo and routed a second origin of that key over it. That broke
+// operators who run several provider processes on one key (each has its own ledger): AGP-056 keys the
+// ch2 by origin again. What is left of item 2 here is the guard on ONE origin; the rest is in
+// hub_multi_process.rs.
 
 #[test]
 fn payto_a_second_connect_to_the_same_origin_funds_nothing() {
@@ -412,26 +379,25 @@ fn payto_a_second_connect_to_the_same_origin_funds_nothing() {
 }
 
 #[test]
-fn payto_while_funding_a_second_origin_is_refused_not_funded() {
-    let w = W::new(&[0xA1, 0xA1], true, hub_cfg(json!({})));
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
+fn payto_while_funding_the_same_origin_is_refused_not_funded() {
+    let w = W::new(&[0xA1], false, hub_cfg(json!({})));
+    let a = w.origins[0].clone();
     w.hub.connect(&a, None, None).unwrap();
     w.hub.with_out(|bk| bk.chans.get_mut(&a).unwrap().state = "funding".into()); // the wallet call still out
-    let e = w.hub.connect(&b, None, None).unwrap_err();
+    let e = w.hub.connect(&format!("{a}/"), None, None).unwrap_err();
     assert_eq!(e.code, "ch2_funding");
     assert_eq!(w.funds.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn payto_racing_connects_fund_one_ch2() {
+fn payto_racing_connects_to_one_origin_fund_one_ch2() {
     let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
     let funds = Arc::new(AtomicUsize::new(0));
     let hub = Arc::new(RouteHub::new(chain.clone(), chain.clone(),
                                      Box::new(CountingWallet { chain: chain.clone(), n: funds.clone(), delay: Duration::from_millis(150) }),
                                      Box::new(NetTransport(net.clone())), sk(0x4B4B), NET, Some(&dir.0.join("hub")), hub_cfg(json!({}))).unwrap());
-    let p = provider(&chain, &net, &dir, "http://a.test", sk(0xA1));
-    net.add("http://b.test", p);
-    let ths: Vec<_> = ["http://a.test", "http://b.test"].into_iter().map(|o| {
+    provider(&chain, &net, &dir, "http://a.test", sk(0xA1));
+    let ths: Vec<_> = ["http://a.test", "http://a.test/"].into_iter().map(|o| {
         let h = hub.clone();
         std::thread::spawn(move || h.connect(o, None, None).map(|c| c.params.channel_id()).map_err(|e| e.code))
     }).collect();
@@ -440,82 +406,6 @@ fn payto_racing_connects_fund_one_ch2() {
     assert!(res.iter().any(|r| r.is_ok()), "{res:?}");
     assert!(res.iter().all(|r| r.is_ok() || r.as_ref().err().map(String::as_str) == Some("ch2_funding")), "{res:?}");
     assert_eq!(hub.out_channels().values().filter(|c| LIVE.contains(&c.state.as_str())).count(), 1);
-}
-
-#[test]
-fn payto_rollover_keeps_both_origins_on_the_next_ch2() {
-    let w = W::new(&[0xA1, 0xA1], true, hub_cfg(json!({})));
-    w.connect_all();
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
-    let sb = w.pay.shard(&format!("{b}/v1/chunk"), "POST").unwrap();
-    stream(&w.pay, &sb, 6);
-    assert_eq!(w.pay.lock(&sb).unwrap().unwrap()["status"], "paid");
-    let before = w.oc(&a);
-    w.chain.set_height(before.params.expiry - 40); // near its close margin: the provider co-signs
-    w.hub.rollover(&before).unwrap();
-    let after = w.oc(&a);
-    assert_ne!(after.params.channel_id(), before.params.channel_id());
-    w.chain.confirm_all();
-    w.hub.watch_tick();
-    assert_eq!(w.oc(&a).state, "open");
-    stream(&w.pay, &sb, 6);
-    assert_eq!(w.pay.lock(&sb).unwrap().unwrap()["status"], "paid");
-    assert_eq!(w.oc(&a).params.channel_id(), after.params.channel_id());
-    assert!(w.oc(&a).routed > 0);
-    assert_eq!(w.live(), 1);
-}
-
-#[test]
-fn payto_after_a_close_the_next_origin_funds_the_one_new_ch2() {
-    let w = W::new(&[0xA1, 0xA1], true, hub_cfg(json!({})));
-    w.connect_all();
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
-    let sa = w.pay.shard(&format!("{a}/v1/chunk"), "POST").unwrap();
-    stream(&w.pay, &sa, 6);
-    assert_eq!(w.pay.lock(&sa).unwrap().unwrap()["status"], "paid");
-    w.hub.close_ch2(&w.oc(&a), false).unwrap();
-    assert_eq!(w.live(), 0);
-    let nb = w.hub.connect(&b, None, None).unwrap(); // not live any more: a new ch2, under b
-    assert_eq!((nb.origin.as_str(), w.funds.load(Ordering::SeqCst), w.live()), (b.as_str(), 2, 1));
-    assert!(w.hub.connect(&a, None, None).unwrap().params.channel_id() == nb.params.channel_id()); // a reuses it
-    assert_eq!(w.funds.load(Ordering::SeqCst), 2);
-    w.chain.confirm_all();
-    w.hub.watch_tick();
-    stream(&w.pay, &sa, 6);
-    assert_eq!(w.pay.lock(&sa).unwrap().unwrap()["status"], "paid"); // a's locks go over b's ch2
-    assert!(w.oc(&b).routed > 0);
-}
-
-#[test]
-fn payto_the_origin_map_survives_a_restart() {
-    let w = W::new(&[0xA1, 0xA1], true, hub_cfg(json!({})));
-    w.connect_all();
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
-    let h2 = RouteHub::new(w.chain.clone(), w.chain.clone(), Box::new(ChainWallet(w.chain.clone())), Box::new(NetTransport(w.net.clone())),
-                           sk(0x4B4B), NET, Some(&w.dir.0.join("hub")), hub_cfg(json!({}))).unwrap();
-    let r = h2.serve("GET", HUB_ROUTE_PATH, &[], b"", "", None);
-    let routing = xbt402::wire::unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap()["accepts"][0]["extra"]["routing"].clone();
-    assert_eq!(routing["providers"], json!([a, b]));
-    assert_eq!(h2.connect(&b, None, None).unwrap().origin, a);
-}
-
-#[test]
-fn payto_separate_backends_under_one_key_share_the_ch2_and_the_other_device_is_refused() {
-    // two provider processes with one operator key and separate ledgers: the second origin reuses
-    // the first's ch2, so its locks reach a provider that has no session for them: refused, and
-    // only that lock (nothing is blocked; the first origin keeps routing)
-    let w = W::new(&[0xA1, 0xA1], false, hub_cfg(json!({})));
-    w.connect_all();
-    let (a, b) = (w.origins[0].clone(), w.origins[1].clone());
-    assert_eq!((w.funds.load(Ordering::SeqCst), w.live()), (1, 1));
-    let sb = w.pay.shard(&format!("{b}/v1/chunk"), "POST").unwrap();
-    stream(&w.pay, &sb, 6);
-    let r = w.pay.lock(&sb).unwrap().unwrap();
-    assert_eq!((r["status"].as_str(), r["error"].as_str()), (Some("refused"), Some("route_failed")), "{r}");
-    assert!(w.oc(&a).blocked.is_empty());
-    let sa = w.pay.shard(&format!("{a}/v1/chunk"), "POST").unwrap();
-    stream(&w.pay, &sa, 6);
-    assert_eq!(w.pay.lock(&sa).unwrap().unwrap()["status"], "paid");
 }
 
 #[test]

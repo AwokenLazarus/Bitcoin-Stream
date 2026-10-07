@@ -56,6 +56,9 @@ def main():
     sock = os.path.join(tmp, "signer.sock")
     MockSigner(sock)
     env = {"PATH": os.environ.get("PATH", ""), "B2_SIGNER_SOCK": sock, "B2_SIGNER_TIMEOUT": "5"}
+    b1_root = os.environ.get("B1_ROOT", "").strip() or os.environ.get("XBT402_B1", "").strip()
+    if b1_root:
+        env["B1_ROOT"] = b1_root
     srv = subprocess.Popen([a.rust, "--http", f"127.0.0.1:{a.port}"], env=env, stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):

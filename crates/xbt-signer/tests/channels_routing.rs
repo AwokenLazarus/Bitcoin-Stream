@@ -168,6 +168,30 @@ fn a_lock_is_written_ahead_recovered_after_a_restart_and_resolved_once() {
     assert_eq!(rig.s.book.get(PROVIDER).unwrap().used_sats, 2_145);
 }
 
+/// AGP-055: a lock changes no key, so the keys file (sealed, with a fresh salt on every rewrite) is
+/// not rewritten by it; a restart still opens the same keys, and the lock resolves.
+#[test]
+fn a_lock_does_not_rewrite_the_keys_file() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rig = routing_rig();
+    let keys = rig.root.join(".run/channel_keys.json");
+    let before = std::fs::read(&keys).unwrap();
+    let chan = rig.s.book.get(PROVIDER).unwrap().chan;
+    let t = secret("t");
+    let r = rig.call("xbt402_sign_state_adaptor", json!({"chan": chan, "cum": 1_146, "point": point(&t),
+                                                         "route": {"hub": PROVIDER, "amount": 594, "fee": 6, "lockId": "L1"}}));
+    assert_eq!(std::fs::read(&keys).unwrap(), before, "sign_state_adaptor rewrote the keys file");
+    let r_tweak = SecretKey::from_slice(&hex::decode(r["tweak"].as_str().unwrap()).unwrap()).unwrap();
+    let y = t.add_tweak(&Scalar::from(r_tweak)).unwrap().secret_bytes();
+    assert_eq!(rig.call("xbt402_resolve_lock", json!({"chan": chan, "secret": hex::encode(y)}))["t"], hex::encode(t.secret_bytes()));
+    assert_eq!(std::fs::read(&keys).unwrap(), before, "resolve_lock rewrote the keys file");
+    rig.restart().unwrap();
+    assert_eq!(std::fs::read(&keys).unwrap(), before, "a restart rewrote the keys file");
+    let r = rig.call("xbt402_sign_state_adaptor", json!({"chan": chan, "cum": 1_446, "point": point(&t),
+                                                         "route": {"hub": PROVIDER, "amount": 295, "fee": 5, "lockId": "L2"}}));
+    assert_eq!(r["cum"], 1_446, "the restarted signer still holds the channel key: {r}");
+}
+
 #[test]
 fn without_an_adaptor_implementation_routed_locks_are_refused() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -177,7 +201,7 @@ fn without_an_adaptor_implementation_routed_locks_are_refused() {
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     // the signer's default scheme is xbt402's adaptor (AGP-034); a RouteSigner built without one refuses
     assert_eq!(rig.call("routing_status", json!({}))["adaptor"], "available");
-    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy(), None, None, None);
+    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy(), None, None, None).unwrap();
     let e = bare.sign_state_adaptor(&chan, 1_146, &point(&secret("t")), json!({"hub": PROVIDER, "amount": 594, "fee": 6})).unwrap_err();
     assert_eq!(e.code, "adaptor_unavailable");
     assert_eq!(bare.status()["adaptor"], "unavailable (AGP-026)");

@@ -216,7 +216,9 @@ pub fn absolute(p: &Path) -> PathBuf {
     }
 }
 
-/// Atomic 0600 write: the temp file is 0600 before any byte lands, fsynced, then renamed.
+/// Atomic, durable 0600 write: the temp file is 0600 before any byte lands, fsynced, renamed, and
+/// the directory fsynced (AGP-055: the rename itself must be durable before the caller goes on, since
+/// a lock is written ahead of its pre-signature; without it the rename waits for the next journal commit).
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -224,10 +226,11 @@ pub fn write_private(path: &Path, text: &str) -> Result<()> {
     {
         let mut f = crate::fsx::create_truncate(&tmp, 0o600)
             .map_err(|e| err("io", format!("{}: {e}", tmp.display())))?;
-        f.write_all(text.as_bytes()).map_err(|e| err("io", e.to_string()))?;
-        f.sync_all().map_err(|e| err("io", e.to_string()))?;
+        crate::fsx::write_all(&mut f, text.as_bytes()).map_err(|e| err("io", e.to_string()))?;
+        crate::fsx::sync(&f).map_err(|e| err("io", e.to_string()))?;
     }
-    fs::rename(&tmp, path).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
+    crate::fsx::rename(&tmp, path).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
+    crate::fsx::sync_dir(crate::fsx::parent_of(path)).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
     crate::fsx::set_mode(path, 0o600).map_err(|e| err("io", e.to_string()))?;
     Ok(())
 }

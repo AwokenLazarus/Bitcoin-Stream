@@ -237,6 +237,10 @@ def main():
     signer = MockSigner(sock)
     base = {k: v for k, v in os.environ.items() if not k.startswith(("B2_", "XBT_MCP_"))}
     env = dict(base, B2_SIGNER_SOCK=sock, B2_SIGNER_TIMEOUT="5", PYTHONPATH=a.b2)
+    if not env.get("B1_ROOT", "").strip():
+        xbt_b1 = env.get("XBT402_B1", "").strip()
+        if xbt_b1:
+            env["B1_ROOT"] = xbt_b1
     servers = {"b2": [a.py, "-m", "agentwallet.mcp_server"], "rust": [a.rust]}
     report = {"sessions": [], "diffs": [], "requests": 0, "tool_calls": 0}
     for label, messages in sessions() + [("unreachable signer", [init(1), INITIALIZED, call(2, "balance", {}), call(3, "pay", {"to": "x", "amount_xbt": 1})])]:

@@ -98,6 +98,58 @@ impl ClientConfig {
     }
 }
 
+/// What an embedder adds to one paid call (AGP-059): its own request headers, and the cumulative
+/// amount to sign when it meters the channel itself.
+///
+/// ```
+/// # use xbt402::client::CallOpts;
+/// let headers = [("X-CMP-Payer".to_string(), "…".to_string())];
+/// let opts = CallOpts::new().headers(&headers).cum(1_234);
+/// # let _ = opts;
+/// ```
+///
+/// A chosen `cum` replaces only the amount [`Client`] would work out from its receipts; every
+/// check still applies. It is refused below the last signed state (`bad_amount`: a state never
+/// goes down), above the channel's capacity (`exhausted`), above the receipted spend plus one call
+/// at the price pinned at open (`too_expensive`: the client never signs past what receipts show
+/// plus the call it is making) and over the daily budget (`budget`). While it is under the
+/// channel's minimum state and nothing is signed yet, the call goes out unsigned (cum 0): the
+/// client never signs more than was asked.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct CallOpts<'a> {
+    /// Sent with every request of the call (the first try and the paid retry after a 402). A
+    /// `PAYMENT-SIGNATURE` header, an empty name or a CR/LF/NUL is refused (`bad_header`).
+    pub headers: &'a [(String, String)],
+    /// The cumulative sats to sign instead of the client's own amount.
+    pub cum: Option<u64>,
+}
+
+impl<'a> CallOpts<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn headers(mut self, headers: &'a [(String, String)]) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    pub fn cum(mut self, cum: u64) -> Self {
+        self.cum = Some(cum);
+        self
+    }
+
+    fn checked_headers(&self) -> Result<&'a [(String, String)]> {
+        for (k, v) in self.headers {
+            if k.is_empty() || k.eq_ignore_ascii_case("PAYMENT-SIGNATURE") || k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0']) {
+                return fail("bad_header", format!("extra header {k:?} is not allowed"));
+            }
+        }
+        Ok(self.headers)
+    }
+}
+
 /// Called with (refund tx hex, expiry height).
 pub type RefundHook = Box<dyn Fn(&str, u32) + Send + Sync>;
 
@@ -613,7 +665,8 @@ impl Client {
         Ok(())
     }
 
-    fn payload(&mut self, origin: &str, price: u64, method: &str, path: &str, body: &[u8]) -> Result<Value> {
+    /// `chosen`: the caller's cumulative amount (AGP-059, [`CallOpts::cum`]), bounded here.
+    fn payload(&mut self, origin: &str, price: u64, method: &str, path: &str, body: &[u8], chosen: Option<u64>) -> Result<Value> {
         let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let billing = ch.accepted.get("extra").and_then(|e| e.get("billing")).and_then(Value::as_str).unwrap_or("postpay");
         let need_msat = ch.spent_msat + if billing == "prepay" { price * 1000 } else { 0 };
@@ -621,6 +674,21 @@ impl Client {
         let pmin = ch.payer.params.min_amount();
         if cum > 0 && cum < pmin {
             cum = pmin;
+        }
+        if let Some(c) = chosen {
+            let quote = if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) };
+            if c < ch.payer.signed {
+                return fail("bad_amount", format!("cum {c} is below the last signed state {}", ch.payer.signed));
+            }
+            if c > ch.payer.params.max_amount() {
+                return fail("exhausted", format!("cum {c} is above the channel's capacity for states {}", ch.payer.params.max_amount()));
+            }
+            let most = ch.spent_msat.div_ceil(1000).saturating_add(quote).max(ch.payer.signed);
+            if c > most {
+                return fail("too_expensive", format!("cum {c} is above the receipted spend plus one call ({most} sat)"));
+            }
+            // under the minimum state nothing is signed yet (c >= signed): never round the caller up
+            cum = if c < pmin { 0 } else { c };
         }
         let delta = cum - ch.payer.signed;
         self.check_daily(delta)?;
@@ -647,21 +715,32 @@ impl Client {
         Ok(pl)
     }
 
-    fn signature_header(&mut self, origin: &str, method: &str, path: &str, body: &[u8]) -> Result<Vec<(String, String)>> {
+    fn signature_header(&mut self, origin: &str, method: &str, path: &str, body: &[u8], chosen: Option<u64>) -> Result<Vec<(String, String)>> {
         let accepted = self.channels[origin].accepted.clone();
         let price = py_u64(accepted.get("amount")).unwrap_or(0);
-        let pl = self.payload(origin, price, method, path, body)?;
+        let pl = self.payload(origin, price, method, path, body, chosen)?;
         Ok(vec![("PAYMENT-SIGNATURE".into(), b64json(&payment_payload(&accepted, &pl)))])
     }
 
     /// One paid HTTP request. Opens a channel on the first 402 from an origin.
     pub fn request(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
-        let r = self.request_inner(method, url, body);
+        self.request_with(method, url, body, &CallOpts::new())
+    }
+
+    /// [`request`](Self::request) with the embedder's own headers and, when it meters the channel
+    /// itself, the cumulative amount to sign (AGP-059). See [`CallOpts`] for the bounds.
+    pub fn request_with(&mut self, method: &str, url: &str, body: &[u8], opts: &CallOpts<'_>) -> Result<HttpResponse> {
+        let r = self.request_inner(method, url, body, opts);
         self.saved(&split_url(url).0, r)
     }
 
-    fn request_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
+    fn request_inner(&mut self, method: &str, url: &str, body: &[u8], opts: &CallOpts<'_>) -> Result<HttpResponse> {
         let (origin, path) = split_url(url);
+        let extra = opts.checked_headers()?;
+        let with_extra = |mut h: Vec<(String, String)>| {
+            h.extend_from_slice(extra);
+            h
+        };
         let mut hdrs = vec![];
         let mut used: Option<Arc<dyn crate::scheme::SchemePayer>> = None;
         for p in &self.payers {
@@ -672,9 +751,9 @@ impl Client {
             }
         }
         if used.is_none() && self.channels.contains_key(&origin) {
-            hdrs = self.signature_header(&origin, method, &path, body)?;
+            hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
         }
-        let mut r = self.transport.request(method, url, body, &hdrs)?;
+        let mut r = self.transport.request(method, url, body, &with_extra(hdrs))?;
         if r.status == 402 {
             let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
             let offered = |sc: &str| pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
@@ -682,7 +761,7 @@ impl Client {
                 .cloned();
             if let Some((p, acc)) = self.payers.iter().find_map(|p| offered(p.scheme()).map(|a| (p.clone(), a))) {
                 let h = p.answer(self.transport.as_ref(), &origin, &acc, &pr, method, &path, body)?;
-                r = self.transport.request(method, url, body, &h)?;
+                r = self.transport.request(method, url, body, &with_extra(h))?;
                 if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
                     p.check(&origin, &unb64json(h)?, method, &path, body)?;
                 }
@@ -710,8 +789,8 @@ impl Client {
                 ch.slack_msat += extra;
                 ch.spent_msat = ch.spent_msat.max(claimed);
             }
-            let hdrs = self.signature_header(&origin, method, &path, body)?;
-            r = self.transport.request(method, url, body, &hdrs)?;
+            let hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
+            r = self.transport.request(method, url, body, &with_extra(hdrs))?;
         }
         if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
             let resp = unb64json(h)?;
@@ -760,12 +839,18 @@ impl Client {
 
     /// Cooperative close; in postpay the final state pays exactly what is owed.
     pub fn close(&mut self, origin: &str) -> Result<Value> {
-        let r = self.close_inner(origin);
+        self.close_with(origin, &CallOpts::new())
+    }
+
+    /// [`close`](Self::close) whose final state is the caller's cumulative amount (AGP-059), under
+    /// the bounds of [`CallOpts`]. Its headers are not used: the close is a control request.
+    pub fn close_with(&mut self, origin: &str, opts: &CallOpts<'_>) -> Result<Value> {
+        let r = self.close_inner(origin, opts.cum);
         self.saved(origin, r)
     }
 
-    fn close_inner(&mut self, origin: &str) -> Result<Value> {
-        let pl = self.payload(origin, 0, "", "", b"")?;
+    fn close_inner(&mut self, origin: &str, chosen: Option<u64>) -> Result<Value> {
+        let pl = self.payload(origin, 0, "", "", b"", chosen)?;
         let ch = &self.channels[origin];
         let chan = ch.payer.params.channel_id();
         let sig = hex::encode(ch.payer.sign_close()?);

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use xbt402::channel::{channel_auth_key, sign_with_type, ChannelParams, Payer};
 use xbt402::conditional::ConditionalParams;
 use xbt_primitives::ecdsa;
@@ -66,6 +67,11 @@ pub struct ChannelRecord {
     pub acked_sats: i64,
     pub pending_lock: Value,
     pub given_up: Vec<Value>,
+    /// AGP-055: the last resolved (or adopted) locks `{key, amount, hub, lockId, at}`, written with
+    /// the resolve itself. The route signer books each one (spend row, ledger row) under its key,
+    /// and at start books any that a crash left unbooked. `key` is `lock:<chan>:<cum>`: the
+    /// signer's own id for a lock, never the caller's.
+    pub resolved: Vec<Value>,
     pub close_change: String,
     pub close_scan_from: i64,
     pub close_hex: String,
@@ -79,7 +85,7 @@ impl Default for ChannelRecord {
                funding_vout: 0, funding_sats: 0, seq: 0, origin: String::new(), pending_cond: json!({}), state: "open".into(),
                closed_txid: String::new(), refund_txid: String::new(), open_height: 0, spent_sats: -1, open_url: String::new(),
                network: String::new(), min_conf: 0, funding_hex: String::new(), funding_height: 0, open_error: String::new(),
-               last_sig: String::new(), acked_sats: 0, pending_lock: json!({}), given_up: vec![], close_change: String::new(),
+               last_sig: String::new(), acked_sats: 0, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
                close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into() }
     }
 }
@@ -173,7 +179,39 @@ pub struct ChannelBook {
     audit: Option<Arc<SigAudit>>,
     /// `(height, margin)`: refuse new states once height >= expiry - margin.
     pub expiry_guard: Mutex<Option<(HeightFn, i64)>>,
+    /// AGP-055: SHA-256 of the keys document the keys file holds (`None`: no usable file yet).
+    /// `persist` rewrites the keys file only when the keys differ: a state, a lock or a seq
+    /// changes no key, and a rewrite re-seals (a fresh scrypt salt under a passphrase).
+    keys_on_disk: Mutex<Option<[u8; 32]>>,
     inner: Mutex<Inner>,
+}
+
+/// The keys file's plaintext document: every secret, sorted by channel.
+fn keys_doc(g: &Inner) -> String {
+    let mut secrets: Vec<(&String, String)> = g.secrets.iter().map(|(k, v)| (k, secret_hex(v))).collect();
+    secrets.sort();
+    let sm: serde_json::Map<String, Value> = secrets.into_iter().map(|(k, v)| (k.clone(), v.into())).collect();
+    dumps_indent(&json!({"secrets": sm}), 2, false)
+}
+
+fn doc_hash(doc: &str) -> [u8; 32] {
+    Sha256::digest(doc.as_bytes()).into()
+}
+
+/// Resolved locks a record remembers (the newest ones).
+pub const RESOLVED_KEPT: usize = 16;
+
+/// Record a resolved lock in its channel record (the caller persists): what there is to book.
+fn note_resolved(rec: &mut ChannelRecord, cum: i64, amount: i64, route: &Value) -> Value {
+    let s = |k: &str| route.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let booking = json!({"key": format!("lock:{}:{cum}", rec.chan), "amount": amount, "hub": s("hub"), "lockId": s("lockId"),
+                         "at": crate::pyjson::now_ts()});
+    rec.resolved.push(booking.clone());
+    if rec.resolved.len() > RESOLVED_KEPT {
+        let cut = rec.resolved.len() - RESOLVED_KEPT;
+        rec.resolved.drain(..cut);
+    }
+    booking
 }
 
 fn secret_hex(s: &SecretKey) -> String {
@@ -208,6 +246,7 @@ impl ChannelBook {
             std::fs::create_dir_all(p).map_err(|e| err("io", e.to_string()))?;
         }
         let b = Self { records_path: records_path.into(), keys_path: keys_path.into(), keystore, audit, expiry_guard: Mutex::new(None),
+                       keys_on_disk: Mutex::new(None),
                        inner: Mutex::new(Inner { records: IndexMap::new(), archived: vec![], secrets: HashMap::new() }) };
         b.load()?;
         Ok(b)
@@ -215,6 +254,13 @@ impl ChannelBook {
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn keys_seen(&self) -> MutexGuard<'_, Option<[u8; 32]>> {
+        match self.keys_on_disk.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
@@ -254,6 +300,8 @@ impl ChannelBook {
             }
             if plain && self.keystore.is_some() && !g.secrets.is_empty() {
                 self.persist(&g)?; // first start with a wrapping key: re-seal the plaintext file
+            } else {
+                *self.keys_seen() = Some(doc_hash(&keys_doc(&g)));
             }
         }
         Ok(())
@@ -261,14 +309,18 @@ impl ChannelBook {
 
     fn persist(&self, g: &Inner) -> Result<()> {
         // keys first: a record on disk never names a channel whose payer key is not on disk (P1)
-        let mut secrets: Vec<(&String, String)> = g.secrets.iter().map(|(k, v)| (k, secret_hex(v))).collect();
-        secrets.sort();
-        let sm: serde_json::Map<String, Value> = secrets.into_iter().map(|(k, v)| (k.clone(), v.into())).collect();
-        let mut doc = dumps_indent(&json!({"secrets": sm}), 2, false);
-        if let Some(ks) = &self.keystore {
-            doc = dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false);
+        let doc = keys_doc(g);
+        let hash = doc_hash(&doc);
+        let mut on_disk = self.keys_seen();
+        if *on_disk != Some(hash) {
+            let out = match &self.keystore {
+                Some(ks) => dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false),
+                None => doc,
+            };
+            write_private(&self.keys_path, &out)?;
+            *on_disk = Some(hash);
         }
-        write_private(&self.keys_path, &doc)?;
+        drop(on_disk);
         let chans: serde_json::Map<String, Value> = g.records.iter()
             .map(|(d, r)| (d.clone(), serde_json::to_value(r).unwrap_or(Value::Null))).collect();
         let mut body = json!({"channels": chans});
@@ -276,6 +328,11 @@ impl ChannelBook {
             body["archived"] = g.archived.clone().into();
         }
         write_private(&self.records_path, &dumps_indent(&body, 2, true))
+    }
+
+    /// `(chan, booking)` for the resolved locks every record still remembers, whatever its state.
+    pub fn resolved_bookings(&self) -> Vec<(String, Value)> {
+        self.lock().records.values().flat_map(|r| r.resolved.iter().map(|b| (r.chan.clone(), b.clone()))).collect()
     }
 
     pub fn list_public(&self) -> Vec<Value> {
@@ -727,8 +784,10 @@ impl ChannelBook {
         rec.acked_sats = rec.used_sats; // the hub holds the completed state
         rec.last_sig.clear();
         rec.pending_lock = json!({});
+        let route = lk.get("route").cloned().unwrap_or(json!({}));
+        let booking = note_resolved(rec, cum, cum - lk_int(&lk, "prev_used"), &route);
         self.persist(&g)?;
-        Ok(json!({"t": hex::encode(t), "cum": cum, "amount": cum - lk_int(&lk, "prev_used"), "route": lk.get("route").cloned().unwrap_or(json!({}))}))
+        Ok(json!({"t": hex::encode(t), "cum": cum, "amount": cum - lk_int(&lk, "prev_used"), "route": route, "booking": booking}))
     }
 
     /// Give the pending lock up (the hub refused it, or its invoice expired unanswered).
@@ -764,8 +823,10 @@ impl ChannelBook {
         rec.used_sats = rec.used_sats.max(cum);
         rec.spent_sats = rec.spent().max(cum);
         rec.acked_sats = rec.used_sats;
+        let route = gu.get("route").cloned().unwrap_or(json!({}));
+        let booking = if amount != 0 { note_resolved(rec, cum, amount, &route) } else { Value::Null };
         self.persist(&g)?;
-        Ok(json!({"cum": cum, "amount": amount, "route": gu.get("route").cloned().unwrap_or(json!({}))}))
+        Ok(json!({"cum": cum, "amount": amount, "route": route, "booking": booking}))
     }
 
     /// After a restart: the hub closed ch1 with our completed pre-signature; t + r is in it.

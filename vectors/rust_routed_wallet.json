@@ -1,0 +1,137 @@
+{
+ "booked": {
+  "amount": 1000,
+  "key": "lock:4444444444444444444444444444444444444444444444444444444444444444:0:1000"
+ },
+ "chan": "4444444444444444444444444444444444444444444444444444444444444444:0",
+ "channel_keys.json": {
+  "sealed": {
+   "aad": "b2/channel-keys",
+   "alg": "aes-256-gcm",
+   "ct": "9fb6d6affd9e1dd2e324eb464321b6c5677937da163ef90a0849a0735f44ccc878a6341577a76f72c5bbdd5c0118f20b60658bf25dd536c793fa4ea10252ee5ad1eadc1cbfc7d750db0ef3020233ee783799b373078593c77d1f711fb7097a7de597adef22a7e80b6b97750585de57ec70afd08946a641887b36edd0e6fbbcf953d63278231b13081df919638c0033b13aa92f6f7273ec1e12da70bf05d7f2e0251d88c8bd708b644a19417b0f642bec3ef5ae",
+   "kdf": "keyfile",
+   "nonce": "6d01c346d6480887490a3823",
+   "salt": "9228649047a32cf8f1884cf4e933c2ac",
+   "v": 1
+  }
+ },
+ "channels.json": {
+  "channels": {
+   "http://127.0.0.1:33212": {
+    "acked_sats": 1500,
+    "cap_sats": 100000,
+    "chan": "4444444444444444444444444444444444444444444444444444444444444444:0",
+    "close_change": "",
+    "close_fee": 600,
+    "close_fee_payer": "payer",
+    "close_hex": "",
+    "close_scan_from": 0,
+    "closed_txid": "",
+    "dest": "http://127.0.0.1:33212",
+    "expiry": 7734,
+    "funding_height": 0,
+    "funding_hex": "",
+    "funding_sats": 100600,
+    "funding_txid": "4444444444444444444444444444444444444444444444444444444444444444",
+    "funding_vout": 0,
+    "given_up": [],
+    "last_sig": "",
+    "min_conf": 0,
+    "network": "",
+    "open_error": "",
+    "open_height": 0,
+    "open_url": "",
+    "origin": "http://127.0.0.1:33212",
+    "payee_pub": "03bb01c90bd18fa0592b0a18428c2097810e175c9c7b6092a9974bab531d0b18bd",
+    "payee_spk": "00148308c3b5f20d22a99ba7fe220d62a5b8f41eface",
+    "payer_pub": "03f335f7fe9542a58709d48b4f4ab1287fef0072894d93bc2123463a777d535d7b",
+    "payer_spk": "0014abababababababababababababababababababab",
+    "pending_cond": {},
+    "pending_lock": {
+     "T": "0218ab7d9c7f10bea1d28f0ed064b0d36885aef935f84091ede43028ea344a8fe2",
+     "T1": "026da69985f3c43fad73556e9c3c0afa45f625745bc748418e54ad588d59319935",
+     "at": 1791227576.876,
+     "cum": 1800,
+     "pre": {
+      "R": "03e922cecbdbd16557ba099ef3511ddaf450adfb201c34865f2986c951dee56cd7",
+      "R1": "03b4d19f5a1083c3387b1dae5660c64377e292e5409498a3ca98390562468c813c",
+      "c": "d991f620accf45358ba861c103a0512a43f8fad4f45afaa9c95ba08e1fbd4320",
+      "s1": "8defe879cd95a94543e09d237cb90daa58ec6bb1ba538592d03f87b1568b9c2e",
+      "z": "844e3639cc4343c25fda21bbcc63002727cfa6a724e8f1eed2395dfe0e9ae08f"
+     },
+     "prev_used": 1500,
+     "r": "582de5eda9c65469a3b4c310fc567cfcb76334e2bbfbdd9ba8ede65656b9f7ac",
+     "route": {
+      "amount": 299,
+      "fee": 1,
+      "hub": "http://127.0.0.1:33212",
+      "lockId": "L3"
+     }
+    },
+    "refund_txid": "",
+    "resolved": [
+     {
+      "amount": 1000,
+      "at": 1791227576.834,
+      "hub": "http://127.0.0.1:33212",
+      "key": "lock:4444444444444444444444444444444444444444444444444444444444444444:0:1000",
+      "lockId": "L1"
+     },
+     {
+      "amount": 500,
+      "at": 1791227576.868,
+      "hub": "http://127.0.0.1:33212",
+      "key": "lock:4444444444444444444444444444444444444444444444444444444444444444:0:1500",
+      "lockId": "L2"
+     }
+    ],
+    "seq": 0,
+    "spent_sats": 1500,
+    "state": "open",
+    "used_sats": 1500
+   }
+  }
+ },
+ "created": 1791227576.8486454,
+ "generator": "cargo test -p xbt-signer --test custody_compat writes_a_routed_wallet_for_b2 (XBT_GEN_VECTORS=1)",
+ "hub": "http://127.0.0.1:33212",
+ "keyfile_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+ "ledger.json": {
+  "approvals": {},
+  "payments_log": "ledger.payments.jsonl"
+ },
+ "ledger.payments.jsonl": "{\"kind\":\"payments\",\"v\":1}\n{\"amount_sats\":1000,\"dest\":\"http://127.0.0.1:33212\",\"memo\":\"routed lock\",\"ts\":1791227576.834,\"txid\":\"lock:4444444444444444444444444444444444444444444444444444444444444444:0:1000\"}\n{\"amount_sats\":50,\"dest\":\"ln:02ab\",\"memo\":\"ln\",\"ts\":1791227576.8486454,\"txid\":\"ln:aa\"}\n{\"amend\":\"ln:aa\",\"amount_sats\":7}\n{\"amount_sats\":50,\"dest\":\"ln:02ab\",\"memo\":\"ln\",\"ts\":1791227576.8486454,\"txid\":\"ln:bb\"}\n{\"amend\":\"ln:bb\",\"amount_sats\":null}\n",
+ "ln": {
+  "amount": 7,
+  "dropped": "ln:bb",
+  "txid": "ln:aa"
+ },
+ "pending": {
+  "adaptor": {
+   "R": "03e922cecbdbd16557ba099ef3511ddaf450adfb201c34865f2986c951dee56cd7",
+   "R1": "03b4d19f5a1083c3387b1dae5660c64377e292e5409498a3ca98390562468c813c",
+   "c": "d991f620accf45358ba861c103a0512a43f8fad4f45afaa9c95ba08e1fbd4320",
+   "s1": "8defe879cd95a94543e09d237cb90daa58ec6bb1ba538592d03f87b1568b9c2e",
+   "z": "844e3639cc4343c25fda21bbcc63002727cfa6a724e8f1eed2395dfe0e9ae08f"
+  },
+  "amount": 300,
+  "cum": 1800,
+  "secret": "beaf4398bf6a63c66083a398af78cefb52d6dae1bac8744ba5956171c6bc415b",
+  "t": "66815dab15a40f5cbccee087b32251fe9b73a5fefecc96affca77b1b700249af"
+ },
+ "routing.json": "{\"kind\":\"route-spend\",\"v\":1}\n{\"amount\":1000,\"at\":1791227576.834,\"chan\":\"4444444444444444444444444444444444444444444444444444444444444444:0\",\"key\":\"lock:4444444444444444444444444444444444444444444444444444444444444444:0:1000\",\"lockId\":\"L1\"}\n",
+ "routing_policy": {
+  "daily_budget_sats": 50000,
+  "hubs": {
+   "http://127.0.0.1:33212": {
+    "max_fee_base_msat": 2000,
+    "max_fee_ppm": 5000
+   }
+  },
+  "max_lock_sats": 20000
+ },
+ "unbooked": {
+  "amount": 500,
+  "key": "lock:4444444444444444444444444444444444444444444444444444444444444444:0:1500"
+ }
+}

@@ -5,6 +5,10 @@ is the reference). Writes vectors/retarget_main_cases.json.  B2 = $XBT402_B2 (~/
 import json, os, random, sys
 B2 = os.environ.get("XBT402_B2", os.path.expanduser("~/xbt-rnd/b2"))
 sys.path.insert(0, B2)
+if not os.environ.get("B1_ROOT", "").strip():
+    xbt_b1 = os.environ.get("XBT402_B1", "").strip()
+    if xbt_b1:
+        os.environ["B1_ROOT"] = xbt_b1
 from agentwallet.headers import RULES, Header, bits_to_target, target_to_bits  # noqa: E402
 
 rules = RULES["main"]

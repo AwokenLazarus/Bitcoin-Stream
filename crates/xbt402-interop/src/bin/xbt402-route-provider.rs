@@ -2,10 +2,11 @@
 //!
 //! xbt402-route-provider --port P --rpc-port R --cookie PATH --secret HEX --amsat N
 //!                       [--window 1.0] [--lock-wait 3.0] [--ttl 8.0] [--settle-multiple 20] [--ledger FILE]
-//!                       [--zero-conf-max SAT] [--watch-secs 5] [--route-wal FILE]
+//!                       [--zero-conf-max SAT] [--watch-secs 5] [--route-wal FILE] [--settle-lock-multiple 4]
 //! `--zero-conf-max` (AGP-053): the cap on an unconfirmed rollover child (0: never; default: 2 ×
 //! settleMultiple × closeFee). `--route-wal` (AGP-054): the provider's RouteWal (each call's meter
-//! durable before its ROUTE-STATE leaves, written ahead while the handler runs).
+//! durable before its ROUTE-STATE leaves, written ahead while the handler runs). `--settle-lock-multiple`
+//! (AGP-056): the default zero-conf cap is at least 2 × this × the largest lock (0: the AGP-053 cap).
 //! Serves `/v1/chunk` (routed, N amsat per call) with a watcher; prints "ready" on stderr.
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +39,7 @@ fn main() {
     cfg.settle_multiple = f("--settle-multiple", 20.0) as u64;
     cfg.rollover_zero_conf_max = arg("--zero-conf-max").map(|v| v.parse().expect("--zero-conf-max"));
     cfg.height_ttl = Duration::from_millis(500);
+    cfg.settle_lock_multiple = f("--settle-lock-multiple", cfg.settle_lock_multiple as f64) as u64;
     cfg.route_wal = arg("--route-wal").map(std::path::PathBuf::from);
     let ledger = match arg("--ledger") {
         Some(p) => Ledger::open(std::path::Path::new(&p)).expect("ledger"),

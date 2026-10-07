@@ -13,7 +13,6 @@
 //! decision is behind it.
 use std::cell::RefCell;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -87,6 +86,9 @@ impl SigAudit {
         if let Some(p) = path.parent() {
             fs::create_dir_all(p).map_err(|e| err("io", e.to_string()))?;
         }
+        // AGP-055: a crash mid-append leaves a line without its newline. That signature never left
+        // (it is logged before it is returned), and the next line must not be glued onto it.
+        crate::applog::cut_torn_tail(path)?;
         let last = tail_hash(path);
         Ok(Self { path: path.to_path_buf(), last: Mutex::new(last) })
     }
@@ -121,8 +123,8 @@ impl SigAudit {
             .map_err(|e| err("sigaudit", format!("{}: {e}", self.path.display())))?;
         let mut buf = line.clone().into_bytes();
         buf.push(b'\n');
-        f.write_all(&buf).map_err(|e| err("sigaudit", e.to_string()))?;
-        f.sync_all().map_err(|e| err("sigaudit", e.to_string()))?;
+        crate::fsx::write_all(&mut f, &buf).map_err(|e| err("sigaudit", e.to_string()))?;
+        crate::fsx::sync(&f).map_err(|e| err("sigaudit", e.to_string()))?;
         *last = sha256_hex(line.as_bytes());
         Ok(entry)
     }

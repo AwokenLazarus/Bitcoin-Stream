@@ -145,20 +145,28 @@ def part_r():
 
 
 PY_OPEN = r'''
-import json, sys
+import json, shutil, sys, tempfile
 from pathlib import Path
 from agentwallet import sigaudit
 from agentwallet.channels import ChannelBook
 from agentwallet.hot import HotWallet
 from agentwallet.keystore import KeyStore
 from agentwallet.policy import PolicyStore
-run, key = Path(sys.argv[1]), Path(sys.argv[2]).read_bytes()
+from agentwallet.routing import RouteSpend
+# AGP-055: on a copy. Opening a store may write (a torn last line is cut, an old-format file is
+# converted), and the Rust signer that owns this directory is still running: one process per wallet.
+run = Path(shutil.copytree(sys.argv[1], Path(tempfile.mkdtemp(prefix="py-opens-rust-")) / "run"))
+key = Path(sys.argv[2]).read_bytes()
 ks = KeyStore(key=key)
 hw = HotWallet(run / "hot.json", rpc=None, hrp="bcrt", keystore=ks)
 book = ChannelBook(run / "channels.json", run / "channel_keys.json", keystore=ks)
+ledger = json.loads((run / "ledger.json").read_text())
+store, spend = PolicyStore(run / "ledger.json"), RouteSpend(run / "routing.json")
 print(json.dumps({"hot_address": hw.address, "hot_sats": hw.balance_sats(), "retired": len(hw._retired),
                   "channels": [r["state"] for r in book.list_public()], "keys": len(book._secrets),
-                  "payments": len(PolicyStore(run / "ledger.json").payments()), "chain": sigaudit.check_chain(run / "signatures.jsonl")}))
+                  "payments": len(store.payments()), "payments_log": ledger.get("payments_log"), "payments_in_json": "payments" in ledger,
+                  "log_torn_bytes": store._log.torn_bytes + spend._log.torn_bytes, "spend_rows": len(spend.rows),
+                  "chain": sigaudit.check_chain(run / "signatures.jsonl")}))
 '''
 
 
@@ -176,6 +184,9 @@ def py_opens_rust_files():
           doc.get("channels") == rust_chans and doc.get("keys", 0) >= len(rust_chans), doc)
     check("compat", "B2 reads the policy ledger and verifies the Rust signature log's chain",
           doc.get("payments", 0) > 0 and doc.get("chain", {}).get("ok"), doc)
+    check("compat", "B2 opens the Rust payments log and spend log as written (AGP-055: append-only, nothing torn, no payments in ledger.json)",
+          doc.get("payments_log") == "ledger.payments.jsonl" and doc.get("payments_in_json") is False
+          and doc.get("log_torn_bytes") == 0 and doc.get("spend_rows") is not None, doc)
 
 
 def main(out):

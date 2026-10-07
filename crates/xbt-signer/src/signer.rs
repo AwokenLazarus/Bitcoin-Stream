@@ -273,7 +273,7 @@ impl Signer {
         let session = Session::new(book.clone(), hot.clone(), node.clone(), transport, &chain, mine, config.open_wait_s as f64,
                                    config.close_fee_max_sats, config.refund_margin_blocks)?;
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
-                                       Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))));
+                                       Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))))?;
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
         // an LN misconfiguration shuts only the LN rail (every ln_pay is refused with it)
         let (ln, ln_error) = match opts.ln.clone() {

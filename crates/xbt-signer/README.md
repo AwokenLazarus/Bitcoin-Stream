@@ -191,6 +191,35 @@ REST listener itself: bind `restlisten` to a private interface or loopback (with
 tunnel) and firewall it to the signer's host. The signer's own `max_sends_per_hour` is the rate limit;
 LND has none per macaroon.
 
+## Files and durability (AGP-055)
+
+One process owns a wallet directory. The files are B2's, byte format included: a directory written
+by either signer opens in the other (`tests/custody_compat.rs`, `vectors/rust_routed_wallet.json`).
+
+Per routed lock (pre-sign + resolve) the signer writes `channels.json` twice (temp file, fsync,
+rename, fsync of the directory: the lock is durable before its pre-signature leaves) and appends one
+line each to `.run/signatures.jsonl`, `.run/routing.json` and `.run/ledger.payments.jsonl`, and two
+to `.run/audit.jsonl`: 9 fsyncs and 2 renames. `channel_keys.json` is rewritten only when a key is
+added or dropped.
+
+- `.run/routing.json` (routed spend, the 24 h routing budget) and `.run/ledger.payments.jsonl` (the
+  policy ledger's payments) are append-only logs (`src/applog.rs`): a header line
+  `{"kind":...,"v":1}`, then one JSON object per line, each fsynced. A last line without its newline
+  is a crash mid-append and is cut at start; any other line that does not parse stops the signer
+  from starting (it never reads as a shorter log). A log is compacted (temp file, fsync, rename)
+  once it holds over twice the rows still in use plus 1,024: spend rows are in use for 7 days,
+  payments for the policy's longest window plus a day. `.run/audit.jsonl` keeps every commit.
+- `.run/ledger.json` holds the pending approvals and `"payments_log": "ledger.payments.jsonl"`; it
+  has no `payments` key. A settled or failed Lightning booking is a line
+  `{"amend": txid, "amount_sats": n | null}` in the payments log. Files from before AGP-055 are
+  converted at the first start.
+- A resolved lock is remembered in its channel record (`resolved`, the last 16, key
+  `lock:<chan>:<cum>`) and booked once per key in both logs; a start books any that a crash left
+  unbooked. In the ledger a routed lock's `txid` is that key.
+- `src/fsx.rs` has the durable steps (write, fsync, rename, truncate, directory fsync) every file
+  goes through, and `fsx::probe`, which counts them per thread and lets a test make any one the last
+  thing the process does (`tests/lock_persist.rs`). Nothing in the signer arms it.
+
 ## Not ported
 
 Each of these answers that it is unavailable:

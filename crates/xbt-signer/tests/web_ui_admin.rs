@@ -220,7 +220,7 @@ fn the_signed_rotation_and_the_backup_export() {
     let r = rig.call("backup_export", json!({"expiry": exp, "signature": sig, "backup_pass": "correct horse battery"}));
     assert_eq!(r["ok"], true, "{r}");
     let doc: Value = serde_json::from_str(r["backup_json"].as_str().unwrap()).unwrap();
-    for f in ["policy.json", ".run/hot.json", ".run/hot_utxos.json", ".run/ledger.json", ".run/signatures.jsonl"] {
+    for f in ["policy.json", ".run/hot.json", ".run/hot_utxos.json", ".run/ledger.json", ".run/ledger.payments.jsonl", ".run/signatures.jsonl"] {
         assert!(doc["files"].get(f).is_some(), "backup holds {f}: {:?}", doc["files"].as_object().unwrap().keys().collect::<Vec<_>>());
     }
     let key = std::fs::read(rig.dir.path().join("keys/hot.key")).unwrap();

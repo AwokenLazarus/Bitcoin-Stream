@@ -182,6 +182,28 @@ def links_up():
          lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == len(ln("lf1", "listchannels")["channels"]))
 
 
+def ledger_payments(run_dir):
+    """The wallet's committed payments, read from its files as written (AGP-055): the append-only log
+    named by ledger.json, a payment per line after the header, and {"amend": txid, "amount_sats": n|null}
+    lines that change or drop the last row of that txid."""
+    with open(f"{run_dir}/ledger.json") as f:
+        doc = json.load(f)
+    assert "payments" not in doc, "ledger.json no longer carries payments"
+    rows = []
+    with open(f"{run_dir}/{doc['payments_log']}") as f:
+        for line in f.read().splitlines()[1:]:
+            r = json.loads(line)
+            if "amend" not in r:
+                rows.append(r)
+                continue
+            i = max(i for i, p in enumerate(rows) if p["txid"] == r["amend"])
+            if r["amount_sats"] is None:
+                del rows[i]
+            else:
+                rows[i]["amount_sats"] = r["amount_sats"]
+    return rows
+
+
 def payments(svc):
     return {p["payment_hash"]: p for p in ln(svc, "listpayments", "--include_incomplete").get("payments", [])}
 
@@ -383,8 +405,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     REPORT["scenarios"]["S8_audit_counts"] = kinds
     check("S8 audit log: 2 settled, refusals and decisions recorded",
           kinds.get("ln_settled") == 2 and kinds.get("ln_refused", 0) >= 2 and kinds.get("decision", 0) >= 3, kinds)
-    with open(f"{RUN}/wallet/.run/ledger.json") as f:
-        led = json.load(f)["payments"]
+    led = ledger_payments(f"{RUN}/wallet/.run")
     net = sum(p["amount_sats"] for p in led if p["dest"] == dest)
     check("S8 the ledger holds exactly what was charged", net == charged1 + charged5, {"ledger": net, "charged": charged1 + charged5})
     q = rpc_sock(sock, "ln_status")
@@ -615,8 +636,7 @@ def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
               and r.get("status") == "SUCCEEDED", r)
     finally:
         bg.kill()
-    with open(f"{RUN}/wallet-hold/.run/ledger.json") as f:
-        led = sum(x["amount_sats"] for x in json.load(f)["payments"])
+    led = sum(x["amount_sats"] for x in ledger_payments(f"{RUN}/wallet-hold/.run"))
     check("S15 the hold wallet's ledger is exact: 2,000 + 3,000 (direct peer, no fee)", led == 5000, led)
 
 

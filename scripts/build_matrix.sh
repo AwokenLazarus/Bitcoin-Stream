@@ -4,6 +4,7 @@
 # Records sizes, glibc floor, and selftest status in dist/MATRIX.md.
 # Soak: cargo -j2 under CPUQuota=200% / MemoryMax=4G / nice 19. No sudo, no binfmt.
 set -euo pipefail
+lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 

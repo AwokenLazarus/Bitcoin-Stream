@@ -7,7 +7,8 @@
 //! pass pays what is due and ch1 is closed cooperatively.
 //!
 //! xbt402-rollover-load --hub URL --shard URL --rpc-port R --cookie PATH [--seconds 60] [--rate 15]
-//!                      [--progress FILE]
+//!                      [--progress FILE] [--capacity SAT]
+//! `--capacity` is ch1's capacity (default 400,000 sat; AGP-057: the cmp-priced runs lock ~16,500 sat a call).
 //! `--progress` is rewritten every second with {t, paid, refused, refusals} (the driver acts on it).
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,7 +62,7 @@ fn main() {
     let addr = rpc.wallet("w").call("getnewaddress", json!([])).expect("address").as_str().unwrap().to_string();
     let node = rpc.clone();
     let mut cfg = RoutePayerConfig::new(&network);
-    cfg.capacity = 400_000;
+    cfg.capacity = arg("--capacity").map(|s| s.parse().expect("--capacity")).unwrap_or(400_000);
     let pay = Arc::new(RoutePayer::new(&arg("--hub").expect("--hub"), cfg, Arc::new(LocalSigner::new()),
                                        Arc::new(MiningWallet(rpc.clone(), addr)), Box::new(UreqTransport::default()),
                                        Box::new(move || node.block_count())));

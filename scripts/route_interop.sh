@@ -8,7 +8,7 @@
 #   1b. (AGP-034) the Rust payer with its keys in the Rust B2 signer (xbt-signer, RemoteSigner behind RoutePayer,
 #      the signer's routing policy on every lock) -> Rust hub -> Rust providers, and -> Python hub -> Python providers;
 #   1c. (AGP-044) the same payer on a route ledger, SIGKILLed mid-stream and restarted from it (RSSR), same checks;
-#   2. the all-Rust AGP-021 demo (xbt402-route-demo): 4 providers (two under one payTo), rollover,
+#   2. the all-Rust AGP-021 demo (xbt402-route-demo): 4 providers (two provider processes under one payTo), rollover,
 #      a provider that never reveals, a hub that withholds receipts then everything; cmp-lead's
 #      constraints 1-7 and exact amounts on chain.
 # Ports 33100-33299 (AGP-026/034/044): node 33101/33102, matrix 33110-33182, demo 33190-33194, signer runs
@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-050}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-059}
 PB=${XBT_RS_ROUTE_PORT_BASE:-33100}
 # the RSS and RSSR runs sit at PB+RSS+10*j (j = 0..3); ROUTE_RSS_OFFSET=3 keeps every port below PB+100
 RSS=${ROUTE_RSS_OFFSET:-100}

@@ -77,6 +77,7 @@ fn provider(chain: &Arc<MemChain>, net: &Arc<MemNet>, dir: &TempDir, origin: &st
     cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 500, max_expiry_blocks: 8_640, close_margin: 36, ..FundingPolicy::default() };
     cfg.settle_multiple = kw.settle_multiple;
     cfg.height_ttl = Duration::ZERO;
+    cfg.settle_lock_multiple = 0; // the settle floor (AGP-056) has its own tests: hub_multi_process.rs
     cfg.route_close_fee_payer = kw.route_fee_payer;
     let name = origin.replace("http://", "").replace('.', "_");
     let ledger = Ledger::open(&dir.0.join(format!("prov-{name}.jsonl"))).unwrap();
@@ -90,7 +91,7 @@ fn provider(chain: &Arc<MemChain>, net: &Arc<MemNet>, dir: &TempDir, origin: &st
 
 fn hub_cfg() -> HubConfig {
     HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
-                                 "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "close_margin": 36,
+                                 "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0, "close_margin": 36,
                                  "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap()
 }
 
@@ -609,18 +610,18 @@ fn c4_signed_quotes_end_to_end() {
 }
 
 #[test]
-fn c7_one_payee_key_for_two_origins_one_ch2() {
-    // AGP-044: one live ch2 per payTo. One operator key behind two origins (CMP-023: one paid
-    // provider per operator) gets ONE hub-funded ch2; both origins route over it.
+fn c7_one_payee_key_for_two_origins_a_ch2_each() {
+    // AGP-056: one operator key behind two origins. Each origin is a provider process the hub pays on
+    // its own ch2 (AGP-044 routed both over one, which only one process's ledger held).
     let w = world(1, PKw::default());
     let op = sk(0xA0A0);
-    let a = provider(&w.chain, &w.net, &w.dir, "http://dev-a.test", op, &PKw::default());
-    w.net.add("http://dev-b.test", a.clone());
+    provider(&w.chain, &w.net, &w.dir, "http://dev-a.test", op, &PKw::default());
+    provider(&w.chain, &w.net, &w.dir, "http://dev-b.test", op, &PKw::default());
     let cap0 = w.hub.committed_sat();
     let oa = w.hub.connect("http://dev-a.test", None, None).unwrap();
     let ob = w.hub.connect("http://DEV-B.test:80/", None, None).unwrap(); // canonicalized
-    assert_eq!(oa.params.channel_id(), ob.params.channel_id());
-    assert_eq!(w.hub.committed_sat(), cap0 + oa.params.capacity);
+    assert_ne!(oa.params.channel_id(), ob.params.channel_id());
+    assert_eq!(w.hub.committed_sat(), cap0 + oa.params.capacity + ob.params.capacity);
     w.chain.confirm_all();
     w.hub.watch_tick();
     let sa = w.pay.shard("http://dev-a.test/v1/chunk", "POST").unwrap();
@@ -631,8 +632,8 @@ fn c7_one_payee_key_for_two_origins_one_ch2() {
         assert_eq!(w.pay.lock(sh).unwrap().unwrap()["status"], "paid");
     }
     let oc = w.hub.out_channels();
-    assert!(!oc.contains_key("http://dev-b.test"));
-    assert_eq!(oc["http://dev-a.test"].routed, sa.snapshot().locked_sat + sb.snapshot().locked_sat);
+    assert_eq!(oc["http://dev-a.test"].routed, sa.snapshot().locked_sat);
+    assert_eq!(oc["http://dev-b.test"].routed, sb.snapshot().locked_sat);
 }
 
 // --- withholding ---------------------------------------------------------------------------------------

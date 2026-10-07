@@ -14,6 +14,9 @@ use serde_json::{Map, Value};
 use crate::channel::ChannelParams;
 use crate::error::{ChannelError, Result};
 
+/// `extra` key of the reservations of metered calls in flight: `{"<seq>": msat}` (AGP-059).
+const RESV: &str = "resv";
+
 /// One channel as the provider sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelState {
@@ -52,6 +55,42 @@ impl ChannelState {
             suspended: false,
             close_error: String::new(),
         }
+    }
+
+    /// AGP-059: record that `spent_msat` holds `msat` reserved for the metered call `seq`, whose
+    /// charge is not known yet (`extra.resv`). The call's settlement releases it; one still recorded
+    /// when a provider starts was never charged (a crash mid-call) and is refunded.
+    pub fn reserve(&mut self, seq: u64, msat: u64) {
+        let mut resv = self.extra.get(RESV).and_then(Value::as_object).cloned().unwrap_or_default();
+        resv.insert(seq.to_string(), msat.into());
+        self.extra.insert(RESV.into(), Value::Object(resv));
+    }
+
+    /// Forget the reservation of call `seq`: the msat it held (0 if none was recorded).
+    pub fn release(&mut self, seq: u64) -> u64 {
+        let Some(mut resv) = self.extra.get(RESV).and_then(Value::as_object).cloned() else { return 0 };
+        let msat = resv.remove(&seq.to_string()).and_then(|v| v.as_u64()).unwrap_or(0);
+        if resv.is_empty() {
+            self.extra.remove(RESV);
+        } else {
+            self.extra.insert(RESV.into(), Value::Object(resv));
+        }
+        msat
+    }
+
+    /// Msat of `spent_msat` that are reservations of calls not settled yet.
+    pub fn reserved_msat(&self) -> u64 {
+        self.extra.get(RESV).and_then(Value::as_object).into_iter().flatten()
+            .fold(0u64, |a, (_, v)| a.saturating_add(v.as_u64().unwrap_or(0)))
+    }
+
+    /// Refund every recorded reservation (provider start): `spent_msat` is what was charged again.
+    /// Returns the msat refunded.
+    pub fn refund_reservations(&mut self) -> u64 {
+        let msat = self.reserved_msat();
+        self.spent_msat = self.spent_msat.saturating_sub(msat);
+        self.extra.remove(RESV);
+        msat
     }
 
     pub fn to_json(&self) -> Value {

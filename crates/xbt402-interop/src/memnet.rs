@@ -298,6 +298,75 @@ impl Wallet for MemChain {
     }
 }
 
+/// The hub's own node while it lags the provider's (AGP-056): with `lag(true)`, every tx broadcast
+/// since is still on its way over P2P, so this view shows neither it nor what it spends (the
+/// [`MemChain`] behind, the provider's node, has it). Blocks reach it at once.
+pub struct LagChain {
+    pub chain: Arc<MemChain>,
+    known: Mutex<Option<HashSet<String>>>,
+}
+
+impl LagChain {
+    pub fn new(chain: Arc<MemChain>) -> Arc<Self> {
+        Arc::new(Self { chain, known: Mutex::new(None) })
+    }
+
+    pub fn lag(&self, on: bool) {
+        let known = on.then(|| self.chain.st().raw.keys().cloned().collect());
+        *self.known.lock().unwrap() = known;
+    }
+
+    fn hidden(&self, txid: &str) -> bool {
+        let known = self.known.lock().unwrap();
+        let Some(k) = known.as_ref() else { return false };
+        let st = self.chain.st();
+        st.raw.contains_key(txid) && !k.contains(txid) && st.utxos.iter().any(|(o, u)| o.0 == txid && u.confirmations == 0)
+    }
+}
+
+impl ChainBackend for LagChain {
+    fn block_count(&self) -> Result<u32> {
+        self.chain.block_count()
+    }
+
+    fn get_tx_out(&self, txid: &str, vout: u32, mempool: bool) -> Result<Option<UtxoInfo>> {
+        if self.hidden(txid) {
+            return Ok(None);
+        }
+        let spender = self.chain.st().spent.get(&(txid.to_string(), vout)).cloned();
+        if mempool && spender.is_some_and(|s| self.hidden(&s)) {
+            return Ok(self.chain.st().utxos.get(&(txid.to_string(), vout)).cloned());
+        }
+        self.chain.get_tx_out(txid, vout, mempool)
+    }
+
+    fn send_raw_transaction(&self, hex: &str) -> Result<String> {
+        self.chain.send_raw_transaction(hex)
+    }
+
+    fn has_transaction(&self, txid: &str) -> Result<bool> {
+        Ok(!self.hidden(txid) && self.chain.has_transaction(txid)?)
+    }
+}
+
+impl SpendScan for LagChain {
+    fn find_spend(&self, txid: &str, vout: u32, from: u32) -> Result<Option<Tx>> {
+        Ok(self.chain.find_spend(txid, vout, from)?.filter(|t| !self.hidden(&t.txid())))
+    }
+
+    fn scan_spk(&self, spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
+        self.chain.scan_spk(spk)
+    }
+
+    fn fee_rate(&self, target: u32) -> Result<Option<f64>> {
+        self.chain.fee_rate(target)
+    }
+
+    fn in_mempool(&self, txid: &str) -> Result<bool> {
+        Ok(!self.hidden(txid) && self.chain.in_mempool(txid)?)
+    }
+}
+
 /// A shared chain as a boxed wallet.
 pub struct ChainWallet(pub Arc<MemChain>);
 

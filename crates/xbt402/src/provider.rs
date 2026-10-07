@@ -89,6 +89,11 @@ pub struct ProviderConfig {
     /// up to this cum while it stays unconfirmed. None: two settlements' worth (2 × settle_multiple ×
     /// close_fee); 0: never (the hub opens it at minConf).
     pub rollover_zero_conf_max: Option<u64>,
+    /// AGP-056: a hub rolls a ch2 over at `settle_lock_multiple` × the largest lock when that is above
+    /// our threshold (locks larger than settle_multiple × close_fee), so the default zero-conf cap
+    /// follows it: at least 2 × this × the largest lock the parent's line took. An explicit
+    /// `rollover_zero_conf_max` is used as it is.
+    pub settle_lock_multiple: u64,
     /// AGP-054: a path makes each routed session's meter (seq, calls, accrued) durable before its
     /// ROUTE-STATE leaves, written ahead while the handler runs (`RouteOffer::precharge`). None: off.
     pub route_wal: Option<std::path::PathBuf>,
@@ -112,13 +117,25 @@ impl ProviderConfig {
             route_close_fee_payer: FeePayer::Payee,
             rollover_grace: 36,
             rollover_zero_conf_max: None,
+            settle_lock_multiple: 4,
             route_wal: None,
         }
     }
 
-    /// The effective zero-conf rollover cap (AGP-053).
+    /// The effective zero-conf rollover cap (AGP-053), whatever the locks.
     pub fn zero_conf_max(&self) -> u64 {
         self.rollover_zero_conf_max.unwrap_or_else(|| self.settle_multiple.saturating_mul(2).saturating_mul(self.close_fee))
+    }
+
+    /// The most a rollover child takes while unconfirmed when the largest lock its parent's line took
+    /// is `max_lock`: `rollover_zero_conf_max`, and by default (AGP-056) at least 2 ×
+    /// `settle_lock_multiple` × that lock, so a provider paid in locks larger than its settle
+    /// threshold is not capped below one lock.
+    pub fn zero_conf_max_for(&self, max_lock: u64) -> u64 {
+        match self.rollover_zero_conf_max {
+            Some(m) => m,
+            None => self.zero_conf_max().max(self.settle_lock_multiple.saturating_mul(2).saturating_mul(max_lock)),
+        }
     }
 }
 
@@ -147,6 +164,50 @@ pub struct Provider {
     pub(crate) routes: crate::route_seller::RouteSeller,
     /// AGP-032: other schemes offered beside the channel binding (xbt-work).
     schemes: Vec<Arc<dyn crate::scheme::ProviderScheme>>,
+    /// AGP-059: direct calls between their reservation and their settlement, per channel.
+    in_call: Mutex<HashMap<String, u32>>,
+    /// AGP-059: (channel, msat) of the reservations refunded when this provider started.
+    recovered: Vec<(String, u64)>,
+}
+
+/// A direct call between its reservation and its settlement (AGP-059). Dropped unsettled (the
+/// handler or the charge panicked), it refunds the reservation: nothing was charged.
+struct InCall<'a> {
+    prov: &'a Provider,
+    cid: String,
+    seq: u64,
+    msat: u64,
+    settled: bool,
+}
+
+impl<'a> InCall<'a> {
+    fn new(prov: &'a Provider, cid: &str, seq: u64, msat: u64) -> Self {
+        *lock(&prov.in_call).entry(cid.to_string()).or_insert(0) += 1;
+        Self { prov, cid: cid.to_string(), seq, msat, settled: false }
+    }
+}
+
+impl Drop for InCall<'_> {
+    fn drop(&mut self) {
+        {
+            let mut n = lock(&self.prov.in_call);
+            if let Some(c) = n.get_mut(&self.cid) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    n.remove(&self.cid);
+                }
+            }
+        }
+        if self.settled {
+            return;
+        }
+        let mut l = lock(&self.prov.ledger);
+        if let Some(mut st) = l.channels.get(&self.cid).cloned() {
+            st.release(self.seq);
+            st.spent_msat = st.spent_msat.saturating_sub(self.msat);
+            let _ = self.prov.save_state(&mut l, &st);
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -181,6 +242,19 @@ impl Provider {
         if cfg.max_body < 1 {
             return fail("bad_config", "max_body must be >= 1");
         }
+        let mut ledger = ledger;
+        // AGP-059: a reservation still recorded was never settled (a crash mid-call): not charged
+        let mut recovered = Vec::new();
+        for (cid, st) in ledger.channels.iter_mut() {
+            let msat = st.refund_reservations();
+            if msat > 0 {
+                recovered.push((cid.clone(), msat));
+            }
+        }
+        if !recovered.is_empty() {
+            let ids: Vec<&str> = recovered.iter().map(|(c, _)| c.as_str()).collect();
+            ledger.save(&ids)?;
+        }
         let routes = crate::route_seller::RouteSeller::new(&ledger, pay_to_secret, &cfg.network, cfg.settle_multiple,
                                                            cfg.route_wal.as_deref());
         Ok(Self {
@@ -198,6 +272,8 @@ impl Provider {
             charge: None,
             routes,
             schemes: vec![],
+            in_call: Mutex::new(HashMap::new()),
+            recovered,
         })
     }
 
@@ -218,6 +294,12 @@ impl Provider {
     /// The compressed payTo key (hex).
     pub fn pay_to(&self) -> &str {
         &self.pay_to
+    }
+
+    /// The reservations refunded when this provider started (AGP-059): `(channel, msat)` of metered
+    /// calls that were in flight when the last process stopped. They were never charged.
+    pub fn recovered_reservations(&self) -> &[(String, u64)] {
+        &self.recovered
     }
 
     /// The ledger, locked (the hub's ch1 book and the routing endpoints work under it).
@@ -466,13 +548,25 @@ impl Provider {
                         let pol = FundingPolicy { zero_conf_max: p.capacity, ..self.cfg.policy.clone() };
                         (check_funding(self.chain.as_ref(), &p, &pol)?, Some(zc))
                     }
+                    // AGP-057: not a child we take unconfirmed. A block that came while we looked makes
+                    // it neither: the funding read above had no confirmation yet, and the parent is now
+                    // spent in that block. Look at the funding once more (still unconfirmed: the same refusal)
+                    None if !hub.is_empty() => (check_funding(self.chain.as_ref(), &p, &self.cfg.policy)?, None),
                     None => return Err(e),
                 },
                 Err(e) => return Err(e),
             };
             let mut st = ChannelState::new(p.clone());
             if !hub.is_empty() {
-                st.extra.insert("hub".into(), hub.into());
+                st.extra.insert("hub".into(), hub.as_str().into());
+                // a rollover child carries its line's largest lock on (AGP-056: the next child's cap)
+                let big = l.channels.values()
+                    .filter(|s| s.extra.get("rollover_to").and_then(Value::as_str) == Some(cid.as_str())
+                            && s.extra.get("hub").and_then(Value::as_str) == Some(hub.as_str()))
+                    .map(|s| py_u64(s.extra.get("max_lock")).unwrap_or(0)).max().unwrap_or(0);
+                if big > 0 {
+                    st.extra.insert("max_lock".into(), big.into());
+                }
             }
             if let Some(zc) = &zc {
                 st.extra.insert("zero_conf".into(), zc.clone());
@@ -517,6 +611,7 @@ impl Provider {
         if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
             return Ok(None);
         }
+        let cap = self.cfg.zero_conf_max_for(py_u64(parent.extra.get("max_lock")).unwrap_or(0));
         Ok(Some(json!({"parent": pp.channel_id(), "need": need, "maxCum": cap, "until": until, "confirmed": false})))
     }
 
@@ -602,6 +697,61 @@ impl Provider {
             o.extend(rep);
         }
         Ok(out)
+    }
+
+    /// Close one channel now with the best signed state (AGP-059), exactly as the watcher does at the
+    /// close margin: the write-ahead close intent, the broadcast, the record, the hash-lock claim of a
+    /// conditional close. Returns the cooperative close's answer (`chan`, `txid`, `cum`, `unpaidMsat`,
+    /// and `payeeFee`/`payeeNet` under payee-pays).
+    ///
+    /// Refused, with nothing changed: `unknown_channel`; `channel_closed` (already closed or rolled
+    /// over); `lock_pending` (a routed lock is open on it); `hub_channel` (a hub-funded ch2: its hub
+    /// rolls it over or closes it, and the margin close still protects it); `call_in_flight` (a paid
+    /// call is being served: the best state does not cover it yet); `no_state` (nothing signed).
+    pub fn close_channel(&self, chan: &str) -> Result<Value> {
+        let cid = canonical_chan(chan)?;
+        let mut l = lock(&self.ledger);
+        let mut st = l.channels.get(&cid).cloned().ok_or_else(|| ChannelError::code("unknown_channel"))?;
+        if !st.closed_txid.is_empty() {
+            return fail("channel_closed", format!("closed by {}", st.closed_txid));
+        }
+        if truthy(st.extra.get("route_lock")) || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+            return fail("lock_pending", "a routed lock is open on this channel");
+        }
+        if st.extra.get("hub").is_some_and(|h| truthy(Some(h))) {
+            return fail("hub_channel", "a hub-funded channel is rolled over or closed by its hub");
+        }
+        if lock(&self.in_call).get(&cid).copied().unwrap_or(0) > 0 {
+            return fail("call_in_flight", "a paid call is being served on this channel");
+        }
+        if st.best_sig.is_empty() && st.cond_sig.is_empty() {
+            return fail("no_state", "the payer has signed no state to close with");
+        }
+        let r = match self.adopt_intent(&mut l, &mut st) {
+            Ok(true) => Ok(st.closed_txid.clone()),
+            Ok(false) => self.close_locked(&mut l, &mut st),
+            Err(e) => Err(e),
+        };
+        l.channels.insert(cid.clone(), st.clone());
+        let txid = r?;
+        let mut out = json!({"chan": cid, "txid": txid});
+        if let (Some(o), Value::Object(rep)) = (out.as_object_mut(), self.close_report(&st)?) {
+            o.extend(rep);
+        }
+        Ok(out)
+    }
+
+    /// A close this provider sent and never recorded (M8: the intent is written ahead): record it.
+    /// True when the channel is now closed by it.
+    fn adopt_intent(&self, l: &mut Ledger, st: &mut ChannelState) -> Result<bool> {
+        let Some(intent) = st.extra.get("close_intent").cloned().filter(|i| truthy(Some(i))) else { return Ok(false) };
+        let hx = intent.get("hex").and_then(Value::as_str).unwrap_or("").to_string();
+        let txid = intent.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
+        if !self.tx_known(&txid, &Tx::parse_hex(&hx)?) {
+            return Ok(false);
+        }
+        self.closed(l, st, &hx, &txid, truthy(intent.get("cond")))?;
+        Ok(true)
     }
 
     // hash-locked conditional state (M6) --------------------------------------------------
@@ -783,18 +933,12 @@ impl Provider {
             }
             return Ok(());
         }
-        if let Some(intent) = st.extra.get("close_intent").cloned().filter(|i| truthy(Some(i))) {
-            let hx = intent.get("hex").and_then(Value::as_str).unwrap_or("").to_string();
-            let txid = intent.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
-            let cond = truthy(intent.get("cond"));
-            if self.tx_known(&txid, &Tx::parse_hex(&hx)?) {
-                self.closed(l, st, &hx, &txid, cond)?;
-                out.push(st.closed_txid.clone());
-                if cond {
-                    self.claim(st)?;
-                }
-                return Ok(());
+        if self.adopt_intent(l, st)? {
+            out.push(st.closed_txid.clone());
+            if truthy(st.extra.get("cond_close")) {
+                self.claim(st)?;
             }
+            return Ok(());
         }
         let utxo = self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?;
         st.suspended = utxo.map(|u| u.confirmations < self.cfg.policy.conf_for(p.capacity)).unwrap_or(true);
@@ -1144,7 +1288,8 @@ impl Provider {
         };
         let _ = acc;
         let hashlock = truthy(pl.get("hashlock"));
-        let (cid, price, cond_sale) = {
+        let metered = self.charge.is_some();
+        let (cid, price, cond_sale, mut call) = {
             let mut l = lock(&self.ledger);
             let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
             let Some(cid) = cid else { return self.payment_required(url, price, "unknown_channel", None) };
@@ -1223,11 +1368,18 @@ impl Provider {
             if st.spent_msat as u128 + price as u128 * 1000 > st.params.max_amount() as u128 * 1000 {
                 return refuse(&mut l, &st, "channel_exhausted", price);
             }
-            st.spent_msat = st.spent_msat.saturating_add(price.saturating_mul(1000));   // reserve the max; refunded below if metered lower
+            let reserved = price.saturating_mul(1000);
+            st.spent_msat = st.spent_msat.saturating_add(reserved);   // reserve the max; refunded below if metered lower
+            if metered {
+                // AGP-059: the charge is not known yet. Recorded, so a restart refunds a call that
+                // never settled; an unmetered call's reservation is its exact charge already
+                st.reserve(st.seq, reserved);
+            }
             if let Err(e) = self.save_state(&mut l, &st) {
                 return HttpResponse::json(500, &json!({"error": e.code, "detail": e.to_string()}));
             }
-            (cid, price, cond_sale)
+            let call = InCall::new(self, &cid, st.seq, reserved);
+            (cid, price, cond_sale, call)
         };
         let mut resp = (self.handler)(method, path, body);
         if resp.headers.iter().any(|(k, v)| k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0'])) {
@@ -1250,14 +1402,22 @@ impl Provider {
         let (receipt, secret, payer) = {
             let mut l = lock(&self.ledger);
             let Some(mut st) = l.channels.get(&cid).cloned() else { return HttpResponse::text(500, "channel vanished") };
+            call.settled = true;
+            st.release(call.seq);
             st.spent_msat = st.spent_msat.saturating_sub((price - charged).saturating_mul(1000));
             if resp.status >= 500 {
                 // don't bill failed calls
                 st.spent_msat = st.spent_msat.saturating_sub(charged.saturating_mul(1000));
                 charged = 0;
             }
-            if charged != price {
-                let _ = self.save_state(&mut l, &st);
+            if metered || charged != price {
+                // a metered call's charge is durable before its answer leaves: the row on disk held
+                // the reservation, which a restart refunds (AGP-059)
+                if let Err(e) = self.save_state(&mut l, &st) {
+                    st.spent_msat = st.spent_msat.saturating_sub(charged.saturating_mul(1000));
+                    l.channels.insert(cid.clone(), st);
+                    return HttpResponse::json(500, &json!({"error": e.code, "detail": e.to_string()}));
+                }
             } else {
                 l.channels.insert(cid.clone(), st.clone());
             }
