@@ -44,4 +44,4 @@ cross-implementation ones also need the Python reference implementations, which 
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. Code, data and libraries from others, with their licences: `THIRD_PARTY_NOTICES.md`.
