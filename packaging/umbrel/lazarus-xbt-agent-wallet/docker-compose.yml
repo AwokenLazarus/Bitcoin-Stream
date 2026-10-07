@@ -1,0 +1,102 @@
+# XBT Agent Wallet (AGP-040). Unpublished: side-load only, images loaded locally (never pulled).
+# The data dir is ${APP_DATA_DIR}/data, laid out as docs/CONTAINER.md §1: one sub-dir per component, each
+# owned by its own uid. `init` (xbt-init, the only root container: no network, three capabilities) gives
+# the bind mount those owners and provisions the node credentials, the UI password (${APP_PASSWORD}) and the
+# MCP token before anything else starts. Every service mounts only its own sub-dir and the socket dirs it
+# needs, runs read-only as its own non-root user, with no capabilities. The witness has no network at all.
+version: "3.7"
+
+x-service: &service
+  restart: on-failure
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lazarus-xbt-agent-wallet_ui_1
+      APP_PORT: 8480
+
+  init:
+    image: xbt-init:0.1.0
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui
+      XBT_INIT_NODE_RPC_USER: ${APP_XBT_KNOTS_RPC_USER}
+      XBT_INIT_NODE_RPC_PASS: ${APP_XBT_KNOTS_RPC_PASS}
+      XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+
+  witness:
+    <<: *service
+    image: xbt-anchor-witness:0.1.0
+    network_mode: none
+    stop_grace_period: 30s
+    volumes:
+      - ${APP_DATA_DIR}/data/witness:/data/witness
+      - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor
+
+  signer:
+    <<: *service
+    image: xbt-signer:0.1.0
+    stop_grace_period: 1m
+    environment:
+      XBT_NODE_RPC_HOST: ${APP_XBT_KNOTS_NODE_HOST}
+      XBT_NODE_RPC_PORT: ${APP_XBT_KNOTS_RPC_PORT}
+      XBT_CHAIN: ${APP_XBT_KNOTS_CHAIN}
+    volumes:
+      - ${APP_DATA_DIR}/data/signer:/data/signer
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
+      - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
+
+  mcp:
+    <<: *service
+    image: xbt-wallet-mcp:0.1.0
+    stop_grace_period: 30s
+    environment:
+      # an over-threshold payment waits this long for the owner's approval in the UI
+      XBT_MCP_APPROVAL_WAIT_S: "300"
+    ports:
+      # agents on the LAN (and in other apps on this box, at lazarus-xbt-agent-wallet_mcp_1:33510);
+      # always behind the bearer token from the Agents page
+      - "33510:33510"
+    volumes:
+      - ${APP_DATA_DIR}/data/mcp:/data/mcp
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the bearer token is the UI's file (0640, group xbt-wallet-ui): read on every request, never written here
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui:ro
+
+  ui:
+    <<: *service
+    image: xbt-wallet-ui:0.1.0
+    stop_grace_period: 15s
+    environment:
+      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
+      XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
+      XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33510/mcp
+      XBT_UI_HUB_URL: http://lazarus-xbt402-hub_hub_1:9480
+    volumes:
+      - ${APP_DATA_DIR}/data/ui:/data/ui
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page (AGP-042)
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui

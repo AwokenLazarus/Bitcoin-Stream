@@ -1,0 +1,81 @@
+# rail=ln overlay on lightning-fork-lab (a5cadc5): publish only what the regtest needs, on loopback, and
+# cap every container's CPU. Ports: AGP-049's range 34700-34799 (AGP-048 used 34681/34691/34693).
+#   knots-b2b RPC   127.0.0.1:34781  (the signer's own node)
+#   lf1 REST        127.0.0.1:34791  (the agent's Lightning Fork node; wtclient on, AGP-049)
+#   lnd-sha REST    127.0.0.1:34793  (a stock lnd on the SHA-256 regtest: the wrong-chain backend)
+# lf2 also runs a watchtower (AGP-049 S14). lf1/lf2's commands repeat the lab's, plus those flags.
+services:
+  knots-b2b:
+    cpus: 2
+    ports: ["127.0.0.1:34781:18443"]
+  bitcoind-sha:
+    cpus: 1
+  lf1:
+    cpus: 2
+    ports: ["127.0.0.1:34791:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots-b2b:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots-b2b:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf1:9735
+      - --tlsextradomain=lf1
+      - --alias=lf1
+      - --debuglevel=info,PEER=debug,CRTR=debug,FNDG=debug
+      - --protocol.simple-taproot-chans
+      - --accept-keysend
+      - --wtclient.active
+  lf2:
+    cpus: 2
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.rpcpolling
+      - --bitcoind.blockpollinginterval=2s
+      - --bitcoind.txpollinginterval=2s
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf2:9735
+      - --tlsextradomain=lf2
+      - --alias=lf2
+      - --debuglevel=info,PEER=debug,FNDG=debug
+      - --protocol.simple-taproot-chans
+      - --accept-keysend
+      - --watchtower.active
+      - --watchtower.listen=0.0.0.0:9911
+      - --watchtower.externalip=lf2:9911
+  lnd-sha:
+    cpus: 1
+    ports: ["127.0.0.1:34793:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind-sha:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind-sha:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind-sha:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lnd-sha:9735
+      - --tlsextradomain=lnd-sha
+      - --alias=lnd-sha
+      - --debuglevel=info

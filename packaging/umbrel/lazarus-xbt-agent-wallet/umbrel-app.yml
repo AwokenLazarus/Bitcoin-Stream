@@ -1,0 +1,38 @@
+manifestVersion: 1.1
+id: lazarus-xbt-agent-wallet
+category: finance
+name: XBT Agent Wallet
+version: "0.1.0"
+tagline: A spending-limited XBT wallet for your AI agents, with a policy you sign
+description: >-
+  Give your AI agents a wallet they can pay with, and keep the keys and the rules to yourself. Agents
+  connect to the wallet's MCP server and pay for services over xbt402 (payment channels on the XBT
+  chain). They can only pay the services your policy allows, within its budgets. Anything above your
+  threshold waits for you to approve it here, signed with a key that stays in your browser.
+
+
+  The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper
+  record of every signature. The web UI sets the policy, approves payments, shows balances, channels,
+  refunds and the signature log, and gives you the MCP address and token for your agents (Agents page).
+
+
+  Needs the XBT Node app. Unpublished and side-load only; the images stay on this box.
+developer: Lazarus
+website: https://lazarus-xbt.xyz
+repo: https://github.com/AwokenLazarus/Bitcoin
+support: https://github.com/AwokenLazarus/Bitcoin/issues
+port: 8480
+gallery:
+  - 1.png
+  - 2.png
+  - 3.png
+releaseNotes: >-
+  0.1.0: first local package (AGP-040) of the signer, the anchor witness, the MCP server and the web UI.
+dependencies:
+  - lazarus-xbt-knots
+path: ""
+defaultUsername: ""
+deterministicPassword: true
+submitter: Lazarus
+submission: unpublished-local
+icon: ""

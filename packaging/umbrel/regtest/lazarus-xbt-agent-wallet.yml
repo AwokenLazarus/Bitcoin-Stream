@@ -1,0 +1,23 @@
+# Test ports on loopback only (34000-34099): MCP 34010, UI 34030 (the driver's app_proxy stand-in is 34080).
+# Faster readiness and watch intervals for the test; nothing else differs from the app.
+services:
+  signer:
+    restart: "no"
+    environment:
+      XBT_READY_INTERVAL: "2"
+      B2_WATCH_INTERVAL: "2"
+      B2_SIGNER_TIMEOUT: "240"
+  mcp:
+    restart: "no"
+    environment:
+      XBT_READY_INTERVAL: "2"
+      B2_SIGNER_TIMEOUT: "240"
+      XBT_MCP_APPROVAL_WAIT_S: "0"
+    ports: !override
+      - "127.0.0.1:${UMBREL_TEST_MCP_PORT}:33510"
+  witness:
+    restart: "no"
+  ui:
+    restart: "no"
+    ports:
+      - "127.0.0.1:${UMBREL_TEST_UI_PORT}:8480"

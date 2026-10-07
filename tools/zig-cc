@@ -1,0 +1,119 @@
+#!/bin/bash
+# Cross C compiler and rustc linker via zig (no system toolchain, no sudo).
+# zig is the ziglang wheel: XBT_ZIG_PY or ~/.local/share/ziglang-venv/bin/python
+#
+# Target selection (first match):
+#   1. XBT_ZIG_TARGET
+#   2. --xbt-zig-target=<zig-triple> (stripped; cargo rustflags pass this to the linker)
+#   3. TARGET (cc-rs) mapped from a rustc triple
+#   4. basename of $0 (zig-cc-aarch64 keeps the AGP-025 name)
+#   5. a rustc triple found in an -L / -o path
+set -eu
+PY=${XBT_ZIG_PY:-$HOME/.local/share/ziglang-venv/bin/python}
+
+map_rust_to_zig() {
+  case "$1" in
+    x86_64-unknown-linux-gnu)           echo x86_64-linux-gnu.2.28 ;;
+    x86_64-unknown-linux-musl)          echo x86_64-linux-musl ;;
+    aarch64-unknown-linux-gnu)          echo aarch64-linux-gnu.2.28 ;;
+    aarch64-unknown-linux-musl)         echo aarch64-linux-musl ;;
+    armv7-unknown-linux-gnueabihf)      echo arm-linux-gnueabihf.2.28 ;;
+    armv7-unknown-linux-musleabihf)     echo arm-linux-musleabihf ;;
+    riscv64gc-unknown-linux-gnu)        echo riscv64-linux-gnu.2.28 ;;
+    x86_64-apple-darwin)                echo x86_64-macos ;;
+    aarch64-apple-darwin)               echo aarch64-macos ;;
+    x86_64-pc-windows-gnu)              echo x86_64-windows-gnu ;;
+    *)                                  echo "" ;;
+  esac
+}
+
+infer_from_path() {
+  case "$1" in
+    *x86_64-unknown-linux-musl*)          echo x86_64-linux-musl ;;
+    *aarch64-unknown-linux-musl*)         echo aarch64-linux-musl ;;
+    *aarch64-unknown-linux-gnu*)          echo aarch64-linux-gnu.2.28 ;;
+    *armv7-unknown-linux-gnueabihf*)      echo arm-linux-gnueabihf.2.28 ;;
+    *armv7-unknown-linux-musleabihf*)     echo arm-linux-musleabihf ;;
+    *riscv64gc-unknown-linux-gnu*)        echo riscv64-linux-gnu.2.28 ;;
+    *x86_64-apple-darwin*)                echo x86_64-macos ;;
+    *aarch64-apple-darwin*)               echo aarch64-macos ;;
+    *x86_64-pc-windows-gnu*)              echo x86_64-windows-gnu ;;
+    *x86_64-unknown-linux-gnu*)           echo x86_64-linux-gnu.2.28 ;;
+    *)                                    echo "" ;;
+  esac
+}
+
+zig_target=${XBT_ZIG_TARGET:-}
+filtered=()
+
+for a in "$@"; do
+  case "$a" in
+    --xbt-zig-target=*)
+      zig_target=${a#--xbt-zig-target=}
+      continue
+      ;;
+    --target=*|-target=*)
+      rust_t=${a#*=}
+      if [ -z "$zig_target" ]; then
+        mapped=$(map_rust_to_zig "$rust_t")
+        if [ -n "$mapped" ]; then zig_target=$mapped; fi
+      fi
+      continue
+      ;;
+    -Wl,--as-needed|-Wl,-Bdynamic|-Wl,-Bstatic) continue ;;
+    -Wl,--fix-cortex-a53-843419|-fuse-ld=*|-B*gcc-ld) continue ;;
+    -Wl,-pie|-Wl,--no-dynamic-linker) continue ;;
+    -Wl,-plugin-opt=*|-plugin-opt=*) continue ;;
+    -fno-use-linker-plugin) continue ;;
+    # rustc windows-gnu pulls mingw CRT that zig already provides
+    -lgcc|-lmingwex|-lmingw32|-lmsvcrt|-l:libpthread.a|-lpthread) continue ;;
+    # macOS: iconv lives in libSystem; zig's libc stubs do not ship a separate libiconv
+    -liconv) continue ;;
+    -lgcc_eh|-lgcc_s)
+      filtered+=(-lunwind)
+      continue
+      ;;
+    *)
+      filtered+=("$a")
+      if [ -z "$zig_target" ]; then
+        mapped=$(infer_from_path "$a")
+        if [ -n "$mapped" ]; then zig_target=$mapped; fi
+      fi
+      ;;
+  esac
+done
+
+if [ -z "$zig_target" ] && [ -n "${TARGET:-}" ]; then
+  zig_target=$(map_rust_to_zig "$TARGET")
+fi
+
+if [ -z "$zig_target" ]; then
+  case "$(basename "$0")" in
+    zig-cc-aarch64) zig_target=aarch64-linux-gnu.2.28 ;;
+  esac
+fi
+
+if [ -z "$zig_target" ]; then
+  echo "zig-cc: cannot infer zig target (set XBT_ZIG_TARGET)" >&2
+  exit 2
+fi
+
+# If rustc still passed its musl CRT (older rustc / missing link-self-contained=no),
+# drop those objects and -static-pie so zig supplies a single CRT.
+rewritten=()
+for a in "${filtered[@]}"; do
+  case "$a" in
+    *self-contained/rcrt1.o*|*self-contained/Scrt1.o*|*self-contained/crt1.o*|*self-contained/crti.o*|*self-contained/crtn.o*|*self-contained/crtbeginS.o*|*self-contained/crtendS.o*)
+      continue
+      ;;
+    -static-pie)
+      rewritten+=(-static)
+      ;;
+    *)
+      rewritten+=("$a")
+      ;;
+  esac
+done
+filtered=("${rewritten[@]}")
+
+exec "$PY" -m ziglang cc -target "$zig_target" "${filtered[@]}"

@@ -1,0 +1,5 @@
+services:
+  hub:
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:${UMBREL_TEST_HUB_PORT}:9480"

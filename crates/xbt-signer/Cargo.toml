@@ -1,0 +1,31 @@
+[package]
+name = "xbt-signer"
+description = "B2 agent-wallet signer in Rust: keys never in the client, policy engine, sealed keys, signature log, refund custody (AGP-027)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt-primitives.workspace = true
+xbt402 = { workspace = true, features = ["http-client"] }
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+ureq.workspace = true
+getrandom = "0.2"
+aes-gcm = "0.10.3"
+scrypt = { version = "0.11", default-features = false }
+ed25519-dalek = "2.1"
+indexmap = "2"
+xbt-svc.workspace = true
+# AGP-048: invoice signatures (recovery) and the LND REST client's pinned TLS certificate
+secp256k1 = { workspace = true, features = ["recovery"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+tempfile = "3"
+xbt402 = { workspace = true, features = ["http-client", "http-server"] }

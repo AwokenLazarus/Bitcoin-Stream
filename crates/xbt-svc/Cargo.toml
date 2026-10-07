@@ -1,0 +1,15 @@
+[package]
+name = "xbt-svc"
+description = "Container-ready service plumbing for the XBT binaries (AGP-038): one relocatable data dir, a pluggable secret source, readiness files and probes, reverse-proxy URL handling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+getrandom = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,32 @@
+manifestVersion: 1.1
+id: lazarus-xbt-knots
+category: bitcoin
+name: XBT Node (stand-in)
+version: "29.4.2-agp040.1"
+tagline: A pruned XBT (BLAKE2b) Knots node for the XBT apps on this box
+description: >-
+  A pruned Bitcoin Knots 29.4.2 node on the XBT (BLAKE2b) chain, with exclusive BLAKE2b peers. The XBT
+  Agent Wallet and the xbt402 Hub use it through their dependency on this app.
+
+
+  This is a stand-in until xbt-compute's node-host app (CMP-098, image knots-xbt) exists. That app will
+  export the same variables (APP_XBT_KNOTS_*), so the apps that depend on this one do not change.
+  Opening the app shows the node's chain status (Knots' read-only REST endpoint).
+
+
+  Unpublished and side-load only. Its image (xbt-a3-knots:29.4.2) stays local.
+developer: Lazarus
+website: https://lazarus-xbt.xyz
+repo: https://github.com/AwokenLazarus/Bitcoin
+support: https://github.com/AwokenLazarus/Bitcoin/issues
+port: 8342
+path: "/rest/chaininfo.json"
+gallery: []
+releaseNotes: >-
+  Local stand-in for the XBT node dependency (AGP-040). Replaced by xbt-compute's node-host app (CMP-098).
+dependencies: []
+defaultUsername: ""
+defaultPassword: ""
+submitter: Lazarus
+submission: unpublished-local
+icon: ""

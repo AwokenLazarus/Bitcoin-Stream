@@ -1,0 +1,33 @@
+# XBT Node (stand-in): a pruned Knots 29.4.2 on the XBT (BLAKE2b) chain. Unpublished; the image stays local.
+# app_proxy shows Knots' read-only REST chain status; RPC is reached by the dependent apps on the box network.
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lazarus-xbt-knots_node_1
+      APP_PORT: 8332
+
+  node:
+    image: xbt-a3-knots:29.4.2
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    stop_grace_period: 2m
+    entrypoint: ["bitcoind"]
+    command:
+      - -datadir=/data
+      - -conf=/etc/xbt/xbt.conf
+      - -rpcuser=${APP_XBT_KNOTS_RPC_USER}
+      - -rpcpassword=${APP_XBT_KNOTS_RPC_PASS}
+    volumes:
+      - ${APP_DATA_DIR}/data/knots:/data
+      - ${APP_DATA_DIR}/conf:/etc/xbt:ro
+    ports:
+      - "8343:8333"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-datadir=/data", "-rpcuser=${APP_XBT_KNOTS_RPC_USER}", "-rpcpassword=${APP_XBT_KNOTS_RPC_PASS}", "getblockchaininfo"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 30s

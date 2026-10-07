@@ -1,0 +1,30 @@
+[package]
+name = "xbt-wallet-ui"
+description = "The agent wallet's web UI for boxes with no terminal (Umbrel, StartOS): policy, human approvals, channels, refunds, signature log, anchor status (AGP-039)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Server-rendered HTML over the signer's socket. No xbt-signer dependency on purpose: the UI never
+# links the key-handling code, and stays small (tiny_http, serde_json, scrypt for the login hash, ed25519-dalek for the offline `sign` helper).
+[dependencies]
+serde_json.workspace = true
+hex.workspace = true
+tiny_http.workspace = true
+getrandom = "0.2"
+scrypt = { version = "0.11", default-features = false }
+sha2.workspace = true
+# AGP-042: the atomic, never-world-readable write of the rotated MCP token (serde_json + getrandom only)
+xbt-svc.workspace = true
+# only for `xbt-wallet-ui sign` (a human signing on another device); the server never signs
+ed25519-dalek = "2.1"
+
+[dev-dependencies]
+tempfile = "3"
+ureq.workspace = true
+xbt-signer.workspace = true
+xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+xbt402 = { workspace = true, features = ["http-client", "http-server"] }
+xbt-primitives.workspace = true

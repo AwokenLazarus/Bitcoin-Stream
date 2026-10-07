@@ -1,0 +1,17 @@
+# The header/PoW cross-check against the pool's own Rust (lazarus-protocol, ~/Bitcoin/lazarus/protocol).
+# A standalone crate, not a workspace member (AGP-035): its path dependency outside this repo would
+# otherwise stop a clean checkout (and every crate that depends on xbt-rs by git) from loading the
+# workspace at all. Run: cargo test -j2 --manifest-path tools/lazarus-crosscheck/Cargo.toml
+[package]
+name = "xbt-lazarus-crosscheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+xbt-primitives = { path = "../../crates/xbt-primitives" }
+serde_json = "1.0"
+hex = "0.4.3"
+lazarus-protocol = { path = "../../../../Bitcoin/lazarus/protocol" }

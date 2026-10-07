@@ -1,0 +1,21 @@
+[package]
+name = "xbt-wallet-mcp"
+description = "The agent wallet's MCP server (B2's ten tools) as one Rust binary: stdio + streamable HTTP, keys only in the B2 signer (AGP-030)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt402 = { workspace = true, features = ["http-client"] }
+xbt-signer.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tiny_http.workspace = true
+getrandom = "0.2"
+xbt-svc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+ureq.workspace = true

@@ -1,0 +1,16 @@
+# The node on the test chain; RPC only on the test network.
+services:
+  node:
+    restart: "no"
+    command:
+      - -datadir=/data
+      - -conf=/etc/xbt-test/knots-regtest.conf
+      - -rpcuser=${APP_XBT_KNOTS_RPC_USER}
+      - -rpcpassword=${APP_XBT_KNOTS_RPC_PASS}
+    volumes:
+      - ${UMBREL_TEST_CONF}:/etc/xbt-test:ro
+    ports: !reset []
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-datadir=/data", "-rpcport=8332", "-rpcuser=${APP_XBT_KNOTS_RPC_USER}", "-rpcpassword=${APP_XBT_KNOTS_RPC_PASS}", "getblockchaininfo"]
+      interval: 3s
+      start_period: 5s

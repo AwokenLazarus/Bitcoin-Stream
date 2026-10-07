@@ -1,0 +1,108 @@
+{
+  "pub": "d4f96fe9e6d3ffa6dc115dbcc3bccf15874988adcc19615b411cdef93751f386",
+  "results": [
+    {
+      "name": "first run asks for the setup code",
+      "ok": true
+    },
+    {
+      "name": "password set, on the setup page",
+      "ok": true,
+      "detail": "http://127.0.0.1:35007/setup"
+    },
+    {
+      "name": "a 64-hex backup is shown",
+      "ok": true,
+      "detail": "c890e09399fd27e75339c6b4a7f7108a6fef4f4099abc5b6a3d318a07b47dab3"
+    },
+    {
+      "name": "the key is stored encrypted in the browser, not in the clear",
+      "ok": true,
+      "detail": "{\"v\":1,\"kdf\":\"pbkdf2-sha512\",\"iter\":60000,\"salt\":\"330a3316b5baebd9da698fc72fcb0718\",\"ct\":\"cb18e7f170533de2b8d24dfcf4bbbb22d4b4ab421c80d24984dd137884a5f22e\",\"mac\":\"11f6c306e78da625860bf59e70013f92\",\"pub\":\"d4f96fe9e6d3ffa6dc115dbcc3bccf15874988adcc19615b411cdef93751f386\"}"
+    },
+    {
+      "name": "the public key is enrolled",
+      "ok": true,
+      "detail": "Approval key enrolled."
+    },
+    {
+      "name": "the page knows this browser holds the enrolled key",
+      "ok": true
+    },
+    {
+      "name": "a wrong PIN is refused in the browser",
+      "ok": true
+    },
+    {
+      "name": "approved in the UI",
+      "ok": true,
+      "detail": "Approved. The agent's call to http://127.0.0.1:33210/agp015/echo will be paid (at most 1000 sats) when it arrives; approvals expire at 2026-09-28 23:37:17 UTC."
+    },
+    {
+      "name": "the review shows the text to sign",
+      "ok": true
+    },
+    {
+      "name": "the signed policy is applied",
+      "ok": true,
+      "detail": "Policy applied. These take effect when the signer restarts: anchor_interval_s, open_wait_s."
+    },
+    {
+      "name": "text shown != text signed is refused",
+      "ok": true
+    },
+    {
+      "name": "/ renders",
+      "ok": true
+    },
+    {
+      "name": "/ has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "/channels renders",
+      "ok": true
+    },
+    {
+      "name": "/channels has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "/signatures renders",
+      "ok": true
+    },
+    {
+      "name": "/signatures has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "/keys renders",
+      "ok": true
+    },
+    {
+      "name": "/keys has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "/hub renders",
+      "ok": true
+    },
+    {
+      "name": "/hub has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "/setup renders",
+      "ok": true
+    },
+    {
+      "name": "/setup has no horizontal page scroll on a phone",
+      "ok": true
+    },
+    {
+      "name": "no script errors or CSP violations",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

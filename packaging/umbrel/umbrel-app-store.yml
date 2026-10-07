@@ -1,0 +1,4 @@
+# Local, unpublished Umbrel community app store (the id SOV-005 uses, so both bundles share one store).
+# Side-load only. Submitting to the Umbrel App Store or a public community store needs Mike.
+id: "lazarus"
+name: "Lazarus (local)"

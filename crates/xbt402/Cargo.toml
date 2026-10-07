@@ -1,0 +1,38 @@
+[package]
+name = "xbt402"
+description = "xbt402: HTTP 402 payments over XBT Spillman channels (x402 v2 batch-settlement XBT binding; xbt-channel alias), v1.1 + v1.2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# blocking HTTP client transport (ureq) for the payer
+http-client = ["dep:ureq"]
+# tiny_http server around Provider::serve
+http-server = ["dep:tiny_http", "dep:xbt-svc"]
+# bitcoind JSON-RPC ChainBackend and Wallet (ureq)
+rpc = ["dep:ureq"]
+
+[dependencies]
+xbt-primitives.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+getrandom = "0.2"
+indexmap = "2"
+ureq = { workspace = true, optional = true }
+tiny_http = { workspace = true, optional = true }
+# container plumbing for the xbt402-hub binary (AGP-038): data dir, secrets, health, proxy URLs
+xbt-svc = { workspace = true, optional = true }
+
+# the hub service (B1 `python -m xbt402.hub --config hub.json`); the library needs none of these
+[[bin]]
+name = "xbt402-hub"
+required-features = ["rpc", "http-client", "http-server"]

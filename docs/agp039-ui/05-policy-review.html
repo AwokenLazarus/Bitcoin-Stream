@@ -1,0 +1,58 @@
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><link rel="icon" href="data:,"><title>Policy · XBT Agent Wallet</title><link rel="stylesheet" href="./ui.css?v=e755dd63c916"></head><body><header><div class="brand">XBT Agent Wallet</div><nav><a href="./">Overview</a><a href="./approvals">Approvals <span id="pending-badge" class="badge" hidden=""></span></a><a href="./policy" aria-current="page">Policy</a><a href="./channels">Channels</a><a href="./signatures">Signatures</a><a href="./keys">Keys</a><a href="./hub">Hub</a><a href="./setup">Setup</a><form method="post" action="./logout" class="inline"><input type="hidden" name="csrf" value="af4ae5d242a34d29e2041f296f1db077177f31c36eabc8c19d09aaaebc3a112d"><button class="link">Log out</button></form></nav></header><main><h1>Policy</h1><p>Check the change, then sign it with your approval key. The signer writes exactly the text below.</p><div class="scroll"><table><thead><tr><th>Setting</th><th>Now</th><th>New</th><th></th></tr></thead><tbody><tr><td><code>anchor_interval_s</code></td><td><code>5</code></td><td><code>300</code></td><td><span class="tag warn">after restart</span></td></tr><tr><td><code>anchor_required</code></td><td><code>null</code></td><td><code>false</code></td><td><span class="tag warn">after restart</span></td></tr><tr><td><code>approval_ttl_s</code></td><td><code>null</code></td><td><code>900</code></td><td></td></tr><tr><td><code>close_fee_max_sats</code></td><td><code>null</code></td><td><code>2000</code></td><td><span class="tag warn">after restart</span></td></tr><tr><td><code>counterparties</code></td><td><code>null</code></td><td><code>{}</code></td><td></td></tr><tr><td><code>daily_budget_sats</code></td><td><code>6000</code></td><td><code>200000</code></td><td></td></tr><tr><td><code>hot_balance_cap_sats</code></td><td><code>15000</code></td><td><code>1500000</code></td><td></td></tr><tr><td><code>human_threshold_sats</code></td><td><code>1000</code></td><td><code>50000</code></td><td></td></tr><tr><td><code>max_per_tx_sats</code></td><td><code>1000</code></td><td><code>100000</code></td><td></td></tr><tr><td><code>open_retry_s</code></td><td><code>0</code></td><td><code>60</code></td><td></td></tr><tr><td><code>open_wait_s</code></td><td><code>0</code></td><td><code>45</code></td><td><span class="tag warn">after restart</span></td></tr><tr><td><code>routing</code></td><td><code>null</code></td><td><code>{}</code></td><td></td></tr><tr><td><code>split_window_s</code></td><td><code>0</code></td><td><code>600</code></td><td></td></tr><tr><td><code>treasury_csv</code></td><td><code>null</code></td><td><code>4320</code></td><td><span class="tag warn">after restart</span></td></tr><tr><td><code>velocity_max</code></td><td><code>20</code></td><td><code>60</code></td><td></td></tr><tr><td><code>weekly_budget_sats</code></td><td><code>6000</code></td><td><code>500000</code></td><td></td></tr></tbody></table></div><form method="post" action="./policy-apply" data-sign="policy" data-human="d4f96fe9e6d3ffa6dc115dbcc3bccf15874988adcc19615b411cdef93751f386" class="signed"><input type="hidden" name="csrf" value="af4ae5d242a34d29e2041f296f1db077177f31c36eabc8c19d09aaaebc3a112d"><input type="hidden" name="text" value="{
+  &quot;allowlist&quot;: [
+    &quot;http://127.0.0.1:33210&quot;
+  ],
+  &quot;anchor_interval_s&quot;: 300,
+  &quot;anchor_required&quot;: false,
+  &quot;approval_ttl_s&quot;: 900,
+  &quot;channel_expiry_blocks&quot;: 1008,
+  &quot;close_fee_max_sats&quot;: 2000,
+  &quot;counterparties&quot;: {},
+  &quot;daily_budget_sats&quot;: 200000,
+  &quot;hot_balance_cap_sats&quot;: 1500000,
+  &quot;human_pubkey&quot;: &quot;d4f96fe9e6d3ffa6dc115dbcc3bccf15874988adcc19615b411cdef93751f386&quot;,
+  &quot;human_threshold_sats&quot;: 50000,
+  &quot;max_per_tx_sats&quot;: 100000,
+  &quot;open_retry_s&quot;: 60,
+  &quot;open_wait_s&quot;: 45,
+  &quot;per_counterparty_cap_sats&quot;: 9400,
+  &quot;refund_enabled&quot;: true,
+  &quot;refund_margin_blocks&quot;: 6,
+  &quot;regtest_mine&quot;: false,
+  &quot;routing&quot;: {},
+  &quot;split_window_s&quot;: 600,
+  &quot;treasury_csv&quot;: 4320,
+  &quot;velocity_max&quot;: 60,
+  &quot;velocity_window_s&quot;: 3600,
+  &quot;weekly_budget_sats&quot;: 500000
+}
+"><input type="hidden" name="prev_sha256" value="fd662ed7f63c4b8c28b0bee6496642622a90b79736e574cdfdd67f0d68e91f0d"><input type="hidden" name="expiry" value="1790638341"><details open=""><summary>The policy you sign</summary><pre class="signed-text">{
+  "allowlist": [
+    "http://127.0.0.1:33210"
+  ],
+  "anchor_interval_s": 300,
+  "anchor_required": false,
+  "approval_ttl_s": 900,
+  "channel_expiry_blocks": 1008,
+  "close_fee_max_sats": 2000,
+  "counterparties": {},
+  "daily_budget_sats": 200000,
+  "hot_balance_cap_sats": 1500000,
+  "human_pubkey": "d4f96fe9e6d3ffa6dc115dbcc3bccf15874988adcc19615b411cdef93751f386",
+  "human_threshold_sats": 50000,
+  "max_per_tx_sats": 100000,
+  "open_retry_s": 60,
+  "open_wait_s": 45,
+  "per_counterparty_cap_sats": 9400,
+  "refund_enabled": true,
+  "refund_margin_blocks": 6,
+  "regtest_mine": false,
+  "routing": {},
+  "split_window_s": 600,
+  "treasury_csv": 4320,
+  "velocity_max": 60,
+  "velocity_window_s": 3600,
+  "weekly_budget_sats": 500000
+}
+</pre></details><input type="hidden" name="signature" value=""><div class="row"><input class="pin" type="password" autocomplete="off" inputmode="text" placeholder="Key PIN" aria-label="Key PIN"><button type="submit">Sign and apply</button></div><p class="sign-msg" aria-live="polite"></p><details><summary>Sign on another device</summary><p>Sign these bytes (hex) with your ed25519 approval key, e.g. <code>xbt-wallet-ui sign --key KEYFILE --message-hex HEX</code>, and paste the signature:</p><pre class="hex">7862742d6167656e7477616c6c65742d706f6c6963792d76310a666436363265643766363363346238633238623062656536343936363432363232613930623739373336653537346364666464363766306436386539316630640a313739303633383334310a7b0a202022616c6c6f776c697374223a205b0a2020202022687474703a2f2f3132372e302e302e313a3333323130220a20205d2c0a202022616e63686f725f696e74657276616c5f73223a203330302c0a202022616e63686f725f7265717569726564223a2066616c73652c0a202022617070726f76616c5f74746c5f73223a203930302c0a2020226368616e6e656c5f6578706972795f626c6f636b73223a20313030382c0a202022636c6f73655f6665655f6d61785f73617473223a20323030302c0a202022636f756e74657270617274696573223a207b7d2c0a2020226461696c795f6275646765745f73617473223a203230303030302c0a202022686f745f62616c616e63655f6361705f73617473223a20313530303030302c0a20202268756d616e5f7075626b6579223a202264346639366665396536643366666136646331313564626363336263636631353837343938386164636331393631356234313163646566393337353166333836222c0a20202268756d616e5f7468726573686f6c645f73617473223a2035303030302c0a2020226d61785f7065725f74785f73617473223a203130303030302c0a2020226f70656e5f72657472795f73223a2036302c0a2020226f70656e5f776169745f73223a2034352c0a2020227065725f636f756e74657270617274795f6361705f73617473223a20393430302c0a202022726566756e645f656e61626c6564223a20747275652c0a202022726566756e645f6d617267696e5f626c6f636b73223a20362c0a202022726567746573745f6d696e65223a2066616c73652c0a202022726f7574696e67223a207b7d2c0a20202273706c69745f77696e646f775f73223a203630302c0a20202274726561737572795f637376223a20343332302c0a20202276656c6f636974795f6d6178223a2036302c0a20202276656c6f636974795f77696e646f775f73223a20333630302c0a2020227765656b6c795f6275646765745f73617473223a203530303030300a7d0a</pre><textarea name="signature_ext" rows="2" placeholder="128 hex characters"></textarea></details></form><p><a href="./policy">Cancel</a></p></main><footer>Keys stay in the signer; your approval key stays in your browser.</footer><script src="./ui.js?v=128c0dabad90"></script>
+</body></html>

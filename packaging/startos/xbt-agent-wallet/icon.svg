@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="XBT Agent Wallet">
+  <rect width="64" height="64" rx="14" fill="#1b1f2a"/>
+  <rect x="10" y="18" width="44" height="30" rx="5" fill="none" stroke="#f2a900" stroke-width="3"/>
+  <path d="M10 26h44" stroke="#f2a900" stroke-width="3"/>
+  <circle cx="44" cy="38" r="4" fill="#f2a900"/>
+  <path d="M20 34l8 8M28 34l-8 8" stroke="#e8e8e8" stroke-width="3" stroke-linecap="round"/>
+</svg>

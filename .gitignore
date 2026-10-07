@@ -1,0 +1,10 @@
+/target
+/tools/lazarus-crosscheck/target
+*.tmp
+/run
+/dist/logs
+/dist/oci/*.tar
+/dist/oci/ctx
+/dist/startos
+__pycache__/
+/dist/umbrel

@@ -1,0 +1,22 @@
+[package]
+name = "xbt-work-relay"
+description = "The xbt-work blinded receipt relay (spec §11.1) as a service: a keyless store of constant-size sealed blobs, GET by 256-bit lookup, no listing, no-store, rate-limited per client, pushes on a separate listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt-svc.workspace = true
+tiny_http.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+xbt-work.workspace = true
+xbt402 = { workspace = true, features = ["http-client"] }
+tempfile = "3"
+
+[[bin]]
+name = "xbt-work-relay"
+path = "src/bin/xbt-work-relay.rs"

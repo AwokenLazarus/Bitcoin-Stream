@@ -1,0 +1,57 @@
+# xbt402 Hub (AGP-040), optional. Unpublished: side-load only, images loaded locally (never pulled).
+# `init` (xbt-init: root, no network, three capabilities) gives ${APP_DATA_DIR}/data/hub to the hub's uid and
+# writes the node credentials; the hub generates its payTo key there on first run.
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lazarus-xbt402-hub_hub_1
+      APP_PORT: 9480
+
+  init:
+    image: xbt-init:0.1.0
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XBT_INIT_COMPONENTS: hub
+      XBT_INIT_NODE_RPC_USER: ${APP_XBT_KNOTS_RPC_USER}
+      XBT_INIT_NODE_RPC_PASS: ${APP_XBT_KNOTS_RPC_PASS}
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+
+  hub:
+    image: xbt402-hub:0.1.0
+    restart: on-failure
+    stop_grace_period: 1m
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      XBT_NODE_RPC_HOST: ${APP_XBT_KNOTS_NODE_HOST}
+      XBT_NODE_RPC_PORT: ${APP_XBT_KNOTS_RPC_PORT}
+      # the 402's resource.url follows the address a client used (LAN, Tor, app_proxy)
+      XBT_TRUST_FORWARDED: "1"
+      # umbrelOS gives every app, including this second one, a hidden service via app_proxy
+      XBT_HUB_ONION: ${APP_HIDDEN_SERVICE}
+    ports:
+      - "9480:9480"
+    volumes:
+      - ${APP_DATA_DIR}/data/hub:/data/hub

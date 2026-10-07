@@ -1,0 +1,4 @@
+#!/bin/sh
+# AGP-025 name: aarch64-unknown-linux-gnu via zig. Delegates to tools/zig-cc.
+export XBT_ZIG_TARGET=${XBT_ZIG_TARGET:-aarch64-linux-gnu.2.28}
+exec "$(cd "$(dirname "$0")" && pwd)/zig-cc" "$@"

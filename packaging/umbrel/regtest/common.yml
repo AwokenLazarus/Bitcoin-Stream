@@ -1,0 +1,12 @@
+# Off-Umbrel overlay shared by every app (AGP-040 regtest). umbrelOS injects app_proxy and puts every app on
+# umbrel_main_network; here the network is the test's own (UMBREL_TEST_NET) and app_proxy is the test
+# driver's reverse proxy on the host (it sets X-Forwarded-* as app_proxy does), so the service is not run.
+networks:
+  default:
+    name: ${UMBREL_TEST_NET}
+    external: true
+
+services:
+  app_proxy:
+    image: debian:bookworm-slim
+    profiles: ["umbrel-only"]

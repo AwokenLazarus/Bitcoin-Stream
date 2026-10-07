@@ -1,0 +1,33 @@
+manifestVersion: 1.1
+id: lazarus-xbt402-hub
+category: finance
+name: xbt402 Hub
+version: "0.1.0"
+tagline: Route xbt402 payments for other agents' wallets, and earn the routing fee
+description: >-
+  An optional xbt402 routing hub: agents' wallets pay services through it over payment channels on the
+  XBT chain, and the hub earns its fee. It is a paid public service on port 9480; its payment is its
+  authentication.   Opening the app shows its readiness (node reachable and synced, its payTo, providers). The hub
+  creates the node wallet named "hub" on start and shows a receive address on the wallet UI's Hub
+  page (and on /readyz). Send XBT there; no terminal. On Umbrel it also reports its Tor onion
+  (umbrelOS gives every app, including this one, a hidden service).
+
+
+  Needs the XBT Node app. Unpublished and side-load only; the images stay on this box.
+developer: Lazarus
+website: https://lazarus-xbt.xyz
+repo: https://github.com/AwokenLazarus/Bitcoin
+support: https://github.com/AwokenLazarus/Bitcoin/issues
+port: 9481
+path: "/readyz"
+gallery: []
+releaseNotes: >-
+  0.1.0: first local package of xbt402-hub (AGP-040). AGP-042: creates wallet hub, receive
+  address in the wallet UI, Tor onion from APP_HIDDEN_SERVICE.
+dependencies:
+  - lazarus-xbt-knots
+defaultUsername: ""
+defaultPassword: ""
+submitter: Lazarus
+submission: unpublished-local
+icon: ""

@@ -1,0 +1,2 @@
+Test-only TLS fixtures (not secrets): a throwaway CA (its key discarded) and a localhost/127.0.0.1
+server certificate signed by it, for the sim server's ssl:// tests and the interop TLS proxy.

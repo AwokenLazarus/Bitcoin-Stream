@@ -1,0 +1,39 @@
+[package]
+name = "xbt-work"
+description = "xbt-work: pay-with-work (x402 v2 scheme xbt-work v1 draft) - receipts, invoices and pricing, the provider rail beside xbt-channel, the payer, the blinded relay client, coinbase audit with window statements and NTA deferral lines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# the interop binaries (xbt-work-vectors, xbt-work-provider, xbt-work-payer): HTTP and the node RPC
+tools = ["xbt402/http-client", "xbt402/http-server", "xbt402/rpc"]
+
+[dependencies]
+xbt-primitives.workspace = true
+xbt402.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+ruint.workspace = true
+indexmap = "2"
+getrandom = "0.2"
+# pure Rust, no platform-specific code: every AGP-031 target (and wasm) builds them
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+
+[[bin]]
+name = "xbt-work-vectors"
+required-features = ["tools"]
+
+[[bin]]
+name = "xbt-work-provider"
+required-features = ["tools"]
+
+[[bin]]
+name = "xbt-work-payer"
+required-features = ["tools"]

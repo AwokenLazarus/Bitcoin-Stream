@@ -1,0 +1,61 @@
+# Cross builds use zig as the C compiler (libsecp256k1) and the rustc linker.
+# No system cross toolchain, no sudo. See tools/zig-cc.
+# GNU/Linux glibc floor is 2.28 (oldest glibc zig is asked for).
+#
+# Native x86_64-unknown-linux-gnu keeps the host cc so the self-test can run here.
+
+[target.x86_64-unknown-linux-musl]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-self-contained=no", "-C", "target-feature=+crt-static", "-C", "link-arg=--xbt-zig-target=x86_64-linux-musl"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=aarch64-linux-gnu.2.28"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-self-contained=no", "-C", "target-feature=+crt-static", "-C", "link-arg=--xbt-zig-target=aarch64-linux-musl"]
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=arm-linux-gnueabihf.2.28"]
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-self-contained=no", "-C", "target-feature=+crt-static", "-C", "link-arg=--xbt-zig-target=arm-linux-musleabihf"]
+
+[target.riscv64gc-unknown-linux-gnu]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=riscv64-linux-gnu.2.28"]
+
+[target.x86_64-apple-darwin]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=x86_64-macos"]
+
+[target.aarch64-apple-darwin]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=aarch64-macos"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "tools/zig-cc"
+rustflags = ["-C", "link-arg=--xbt-zig-target=x86_64-windows-gnu"]
+
+[env]
+CC_x86_64_unknown_linux_musl = { value = "tools/zig-cc", relative = true }
+AR_x86_64_unknown_linux_musl = { value = "tools/zig-ar", relative = true }
+CC_aarch64_unknown_linux_gnu = { value = "tools/zig-cc", relative = true }
+AR_aarch64_unknown_linux_gnu = { value = "tools/zig-ar", relative = true }
+CC_aarch64_unknown_linux_musl = { value = "tools/zig-cc", relative = true }
+AR_aarch64_unknown_linux_musl = { value = "tools/zig-ar", relative = true }
+CC_armv7_unknown_linux_gnueabihf = { value = "tools/zig-cc", relative = true }
+AR_armv7_unknown_linux_gnueabihf = { value = "tools/zig-ar", relative = true }
+CC_armv7_unknown_linux_musleabihf = { value = "tools/zig-cc", relative = true }
+AR_armv7_unknown_linux_musleabihf = { value = "tools/zig-ar", relative = true }
+CC_riscv64gc_unknown_linux_gnu = { value = "tools/zig-cc", relative = true }
+AR_riscv64gc_unknown_linux_gnu = { value = "tools/zig-ar", relative = true }
+CC_x86_64_apple_darwin = { value = "tools/zig-cc", relative = true }
+AR_x86_64_apple_darwin = { value = "tools/zig-ar", relative = true }
+CC_aarch64_apple_darwin = { value = "tools/zig-cc", relative = true }
+AR_aarch64_apple_darwin = { value = "tools/zig-ar", relative = true }
+CC_x86_64_pc_windows_gnu = { value = "tools/zig-cc", relative = true }
+AR_x86_64_pc_windows_gnu = { value = "tools/zig-ar", relative = true }

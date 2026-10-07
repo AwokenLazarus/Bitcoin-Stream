@@ -1,0 +1,813 @@
+{
+ "about": "xbt-work v1 draft test vectors. Keys are derived from public seeds: never use them.",
+ "prime": {
+  "seed": "905fc19b8c60214bf400202539bbb5265e8ed09a06f75f371c4d1e212b8dd30a",
+  "pubkey": "825bb60ed2d63203c1d523304c613c879f1a0f229e36ad98b593b2cf200be48c",
+  "primeId": 70
+ },
+ "otherKey": {
+  "seed": "3b04c3f31eff4c9c9b972838b8b2d596e42775c3b3f16a4abd09b98d2f908994",
+  "pubkey": "50fb636114f3043611bc17787e13a1b61df1d755d98728eddb0aebd503580a5c"
+ },
+ "invoices": [
+  {
+   "random": "a9491d13a4ff67c9d7e86f34b02afe47",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.pw-vfer2e5e75t4tv7in42lakx6i4.rig1",
+   "usernameAlt": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~vfer2e5e75t4tv7in42lakx6i4.rig1"
+  },
+  {
+   "random": "5903c22dec49398940db65192fb05816",
+   "invoice": "leb4elpmje4ysqg3mums7mcycy",
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.pw-leb4elpmje4ysqg3mums7mcycy.rig1",
+   "usernameAlt": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~leb4elpmje4ysqg3mums7mcycy.rig1"
+  }
+ ],
+ "usernames": [
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.pw-vfer2e5e75t4tv7in42lakx6i4.rig1",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "worker": "rig1"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.pw-vfer2e5e75t4tv7in42lakx6i4",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "worker": ""
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~vfer2e5e75t4tv7in42lakx6i4.rig1",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "worker": "rig1"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~vfer2e5e75t4tv7in42lakx6i4",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "worker": ""
+  },
+  {
+   "username": "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4.pw-vfer2e5e75t4tv7in42lakx6i4.RIG",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "worker": "RIG"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.rig1",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": null,
+   "worker": "rig1"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": null,
+   "worker": ""
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.rig1.pw-vfer2e5e75t4tv7in42lakx6i4",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": null,
+   "worker": "rig1.pw-vfer2e5e75t4tv7in42lakx6i4"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~short.rig1",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": null,
+   "worker": "rig1"
+  },
+  {
+   "username": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.pw-vfer2e5e75t4tv7in42lakx6i4|9|9",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": null,
+   "worker": ""
+  },
+  {
+   "username": "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4~leb4elpmje4ysqg3mums7mcycy.x.y  ",
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "leb4elpmje4ysqg3mums7mcycy",
+   "worker": "x.y"
+  }
+ ],
+ "receipts": [
+  {
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 0,
+     "cum_work": 0,
+     "shares": 0,
+     "first_height": 0,
+     "last_height": 0,
+     "difficulty": 0
+    }
+   },
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|0|0|0|0|0|0",
+   "sig": "076521b8635f74e6ea78c4eacc9519031b6fd4501efa1b9c7df4d3855ad20febe3f25f4cad778b1d7e11d49435ca249ed3f62befe65c68f19cb9142a36d2380b"
+  },
+  {
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   },
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|3|12|3|101|102|4",
+   "sig": "8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e"
+  },
+  {
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 7,
+     "cum_work": 28,
+     "shares": 7,
+     "first_height": 101,
+     "last_height": 104,
+     "difficulty": 4
+    }
+   },
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|7|28|7|101|104|4",
+   "sig": "5fb5ac7abfca0e307a8843870956ac78f66c5d0011a1474fae7645155482df245f722b1d798aa1c4abdd07a7c1961b7758c939c71a333669b99b2cd62e21da01"
+  },
+  {
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "leb4elpmje4ysqg3mums7mcycy",
+    "receipt": {
+     "seq": 1,
+     "cum_work": 16384,
+     "shares": 1,
+     "first_height": 975000,
+     "last_height": 975000,
+     "difficulty": 16384
+    }
+   },
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|leb4elpmje4ysqg3mums7mcycy|1|16384|1|975000|975000|16384",
+   "sig": "6e37b58f7b148c04bca07ab09a10155546ff08673ca27026c7667ad0f2c4a712c0cba479073a935610554041b01f5d84c069544564352c35c8375c2fd1f42104"
+  },
+  {
+   "doc": {
+    "prime_id": 4294967295,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "leb4elpmje4ysqg3mums7mcycy",
+    "receipt": {
+     "seq": 18446744073709551615,
+     "cum_work": 18446744073709551615,
+     "shares": 18446744073709551615,
+     "first_height": 4294967295,
+     "last_height": 4294967295,
+     "difficulty": 18446744073709551615
+    }
+   },
+   "message": "xbt-work-receipt/1|4294967295|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|leb4elpmje4ysqg3mums7mcycy|18446744073709551615|18446744073709551615|18446744073709551615|4294967295|4294967295|18446744073709551615",
+   "sig": "b4b4eacf2fa613cc0b59dd0bbf752c95d89577b9187196f3cb5e3ecd05a207ba8586d1926a034730180ff880b6a48036088f7c3b7a892108ce9c8b685632c00c"
+  }
+ ],
+ "receiptVerification": [
+  {
+   "why": "valid",
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|3|12|3|101|102|4",
+   "sig": "8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e",
+   "pubkey": "825bb60ed2d63203c1d523304c613c879f1a0f229e36ad98b593b2cf200be48c",
+   "valid": true
+  },
+  {
+   "why": "cum_work edited after signing",
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|3|13|3|101|102|4",
+   "sig": "8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e",
+   "pubkey": "825bb60ed2d63203c1d523304c613c879f1a0f229e36ad98b593b2cf200be48c",
+   "valid": false
+  },
+  {
+   "why": "signed by another key",
+   "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|3|12|3|101|102|4",
+   "sig": "9185f709223894cffd965371531516b7ec88cbfebe1ff24e3aa294d86d30bfbff9f2e697d5a9b312020dfe3159e6b87417df9ef3e0e0cb5506d9f803a8d63c02",
+   "pubkey": "825bb60ed2d63203c1d523304c613c879f1a0f229e36ad98b593b2cf200be48c",
+   "valid": false
+  }
+ ],
+ "malformedReceipts": [
+  {
+   "why": "seq as a float",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3.0,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "seq negative",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": -1,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "seq with a leading zero",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": "03",
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "seq as a boolean",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": true,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "cum_work above 2^64-1",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 18446744073709551616,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "last_height above 2^32-1",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 4294967296,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "`|` smuggled into difficulty",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": "4|0|0"
+    }
+   }
+  },
+  {
+   "why": "invoice too short",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "inv1234",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "invoice carries `|`",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4|999|999999",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  },
+  {
+   "why": "identity carries `|`",
+   "doc": {
+    "prime_id": 70,
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|x",
+    "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+    "receipt": {
+     "seq": 3,
+     "cum_work": 12,
+     "shares": 3,
+     "first_height": 101,
+     "last_height": 102,
+     "difficulty": 4
+    }
+   }
+  }
+ ],
+ "fieldInjection": {
+  "queriedInvoice": "vfer2e5e75t4tv7in42lakx6i4|999|999999|1|1|1|1",
+  "signedLine": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|999|999999|1|1|1|1|0|0|0|0|0|0",
+  "sig": "6b367aac96fa1aa1233646fa6068e165db97fc9ffa759c9e16205ded007d6ecd606d044cfc530a8fb07c7baee3733bd17f507105917c45568eb4bbb28bb4e20b",
+  "presentedDoc": {
+   "prime_id": 70,
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "receipt": {
+    "seq": 999,
+    "cum_work": 999999,
+    "shares": 1,
+    "first_height": 1,
+    "last_height": 1,
+    "difficulty": "1|0|0|0|0|0|0"
+   }
+  },
+  "rule": "The Prime MUST refuse to sign (queried invoice fails the grammar); the provider MUST refuse the presented document (difficulty is not an integer). Only a verifier that rebuilds the line from unchecked strings reads the signature as valid."
+ },
+ "creditSequence": {
+  "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+  "steps": [
+   {
+    "present": "r(seq 3)",
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+     "receipt": {
+      "seq": 3,
+      "cum_work": 12,
+      "shares": 3,
+      "first_height": 101,
+      "last_height": 102,
+      "difficulty": 4
+     }
+    },
+    "sig": "8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e",
+    "credited": 12
+   },
+   {
+    "present": "r(seq 7)",
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+     "receipt": {
+      "seq": 7,
+      "cum_work": 28,
+      "shares": 7,
+      "first_height": 101,
+      "last_height": 104,
+      "difficulty": 4
+     }
+    },
+    "sig": "5fb5ac7abfca0e307a8843870956ac78f66c5d0011a1474fae7645155482df245f722b1d798aa1c4abdd07a7c1961b7758c939c71a333669b99b2cd62e21da01",
+    "credited": 16
+   },
+   {
+    "present": "replay r(seq 3)",
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+     "receipt": {
+      "seq": 3,
+      "cum_work": 12,
+      "shares": 3,
+      "first_height": 101,
+      "last_height": 102,
+      "difficulty": 4
+     }
+    },
+    "sig": "8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e",
+    "credited": 0
+   },
+   {
+    "present": "replay r(seq 7)",
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+     "receipt": {
+      "seq": 7,
+      "cum_work": 28,
+      "shares": 7,
+      "first_height": 101,
+      "last_height": 104,
+      "difficulty": 4
+     }
+    },
+    "sig": "5fb5ac7abfca0e307a8843870956ac78f66c5d0011a1474fae7645155482df245f722b1d798aa1c4abdd07a7c1961b7758c939c71a333669b99b2cd62e21da01",
+    "credited": 0
+   },
+   {
+    "present": "same seq 7, cum_work 56",
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+     "receipt": {
+      "seq": 7,
+      "cum_work": 56,
+      "shares": 7,
+      "first_height": 101,
+      "last_height": 104,
+      "difficulty": 4
+     }
+    },
+    "sig": "96b9d89df4262ad2babd1013828621c3171d92c02b6954387ee7c93e4312c5a5269c00bbcef373593f98e78a75a770dd3518c666f84012fa46c0604ad3854306",
+    "result": "equivocation"
+   }
+  ],
+  "fraudProof": {
+   "why": "equivocation: two receipts, one seq",
+   "a": {
+    "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|7|28|7|101|104|4",
+    "sig": "5fb5ac7abfca0e307a8843870956ac78f66c5d0011a1474fae7645155482df245f722b1d798aa1c4abdd07a7c1961b7758c939c71a333669b99b2cd62e21da01"
+   },
+   "b": {
+    "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|7|56|7|101|104|4",
+    "sig": "96b9d89df4262ad2babd1013828621c3171d92c02b6954387ee7c93e4312c5a5269c00bbcef373593f98e78a75a770dd3518c666f84012fa46c0604ad3854306"
+   }
+  }
+ },
+ "pricing": [
+  {
+   "priceSats": 150,
+   "bits": "190141c5",
+   "blockValueSats": 312500000,
+   "feeBps": 0,
+   "haircutBps": 1000,
+   "difficulty": "3417025988.410766",
+   "workUnits": 1823,
+   "valueOfWorkUnitsSats": 166
+  },
+  {
+   "priceSats": 150,
+   "bits": "190141c5",
+   "blockValueSats": 312500000,
+   "feeBps": 0,
+   "haircutBps": 0,
+   "difficulty": "3417025988.410766",
+   "workUnits": 1641,
+   "valueOfWorkUnitsSats": 150
+  },
+  {
+   "priceSats": 10000,
+   "bits": "190141c5",
+   "blockValueSats": 312500000,
+   "feeBps": 2500,
+   "haircutBps": 1000,
+   "difficulty": "3417025988.410766",
+   "workUnits": 161993,
+   "valueOfWorkUnitsSats": 11111
+  },
+  {
+   "priceSats": 1,
+   "bits": "190141c5",
+   "blockValueSats": 312500000,
+   "feeBps": 0,
+   "haircutBps": 1000,
+   "difficulty": "3417025988.410766",
+   "workUnits": 13,
+   "valueOfWorkUnitsSats": 1
+  },
+  {
+   "priceSats": 1,
+   "bits": "207fffff",
+   "blockValueSats": 5000000000,
+   "feeBps": 0,
+   "haircutBps": 0,
+   "difficulty": "0.000000",
+   "workUnits": 1,
+   "valueOfWorkUnitsSats": 10737580802480506599
+  },
+  {
+   "priceSats": 500,
+   "bits": "1a0fffff",
+   "blockValueSats": 312500000,
+   "feeBps": 0,
+   "haircutBps": 500,
+   "difficulty": "1048560.999986",
+   "workUnits": 2,
+   "valueOfWorkUnitsSats": 596
+  }
+ ],
+ "auth": [
+  {
+   "authKey": "7c849953f8efbbb87820e8103a1da456ceab94c1c686ff4d9087fa921e7dcb7c",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "n": 1,
+   "seq": 7,
+   "cum_work": 28,
+   "method": "GET",
+   "target": "/v1/share-change?window=7d",
+   "body": "",
+   "req": "c2d714acb894bd4d2b24ea72dee340ec35f5a4abfa0ad0961fca2ff8ebca2be6",
+   "auth": "2ff001db77f58618dc619c3ede94040dde32487ca9b7b30ee703e0a18c365a1f"
+  },
+  {
+   "authKey": "7c849953f8efbbb87820e8103a1da456ceab94c1c686ff4d9087fa921e7dcb7c",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "n": 2,
+   "seq": 7,
+   "cum_work": 28,
+   "method": "GET",
+   "target": "/v1/pools?window=7d",
+   "body": "",
+   "req": "cc0a8a4ca98ff83897b9ad1f911ef4ab5a7c849d2cb848019ac5ba7a50b1a7e1",
+   "auth": "7a8f2d3024ea99c1db7bee437f8998247dcc0459720fbe292bf554221ce24efd"
+  },
+  {
+   "authKey": "7c849953f8efbbb87820e8103a1da456ceab94c1c686ff4d9087fa921e7dcb7c",
+   "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+   "n": 3,
+   "seq": 7,
+   "cum_work": 28,
+   "method": "POST",
+   "target": "/v1/report",
+   "body": "{\"window\":\"7d\"}",
+   "req": "0694a6912324e49ee90e944c88f44e1e413e655b2f4ff3d6897f9325d451e87c",
+   "auth": "fa0b3508c68d4eef0c7ec8093db48e0f988acb337e7d7303ecb66b12adc8f783"
+  }
+ ],
+ "audit": {
+  "receipts": [
+   {
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "leb4elpmje4ysqg3mums7mcycy",
+     "receipt": {
+      "seq": 98,
+      "cum_work": 400000,
+      "shares": 98,
+      "first_height": 1000,
+      "last_height": 1003,
+      "difficulty": 4096
+     }
+    },
+    "sig": "b0630e3dbc7841fb13f8128ff16d178f94bcb1043a1b6a757938cc25f13edb40bec62f7ed91dda862490bcc6d7f591a7b0c5109e77e4ec4309fa4911d35f4207"
+   },
+   {
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "leb4elpmje4ysqg3mums7mcycy",
+     "receipt": {
+      "seq": 245,
+      "cum_work": 1000000,
+      "shares": 245,
+      "first_height": 1000,
+      "last_height": 1010,
+      "difficulty": 4096
+     }
+    },
+    "sig": "5f184a3760da6cd0b10c13621f8d099ee6f2cbc512d278722aa5bafd5f0fb0aefd9c59d074bc2f0359f8b46087f131430ac836d7860e601549b205eeea814805"
+   },
+   {
+    "doc": {
+     "prime_id": 70,
+     "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+     "invoice": "leb4elpmje4ysqg3mums7mcycy",
+     "receipt": {
+      "seq": 294,
+      "cum_work": 1200000,
+      "shares": 294,
+      "first_height": 1000,
+      "last_height": 1012,
+      "difficulty": 4096
+     }
+    },
+    "sig": "239a78ed42b77a468339650ddc48aa160e3bbe53adf8dfb0c04a7f4e0f7bbda85d6b3855c156b6ebcd11a3a2206d354df1ad2d970a23ee42d92feb1296458f02"
+   }
+  ],
+  "intervals": [
+   [
+    1000,
+    1003,
+    400000
+   ],
+   [
+    1003,
+    1010,
+    600000
+   ],
+   [
+    1010,
+    1012,
+    200000
+   ]
+  ],
+  "window": {
+   "message": "xbt-work-window/1|70|1013|7525b7e4ccc246351a3b718c1ecc0a99ee78603a590e61d7f0d0b28ae87aab98|981|8000000|546|0",
+   "sig": "45949c1072dca204fa07cb7d9d4020565ae8f6882df63cf8c3ef044fb3300a0336cd6bd0d009c57e08e5c02d83e524ec607036b06a0b2dea54a6a49cddffd20a"
+  },
+  "coinbaseValueSats": 5000000000,
+  "difficulty": 1000000,
+  "pass": {
+   "paidSats": 750000000,
+   "ok": true,
+   "expectedSats": 750000000
+  },
+  "fraud": {
+   "paidSats": 375000000,
+   "ok": false,
+   "expectedSats": 750000000,
+   "proof": {
+    "kind": "xbt-work-fraud/1",
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "height": 1013,
+    "blockHash": "7525b7e4ccc246351a3b718c1ecc0a99ee78603a590e61d7f0d0b28ae87aab98",
+    "coinbaseValueSats": 5000000000,
+    "paidSats": 375000000,
+    "expectedSats": 750000000,
+    "windowWork": 8000000,
+    "provenWork": 1200000,
+    "window": {
+     "message": "xbt-work-window/1|70|1013|7525b7e4ccc246351a3b718c1ecc0a99ee78603a590e61d7f0d0b28ae87aab98|981|8000000|546|0",
+     "sig": "45949c1072dca204fa07cb7d9d4020565ae8f6882df63cf8c3ef044fb3300a0336cd6bd0d009c57e08e5c02d83e524ec607036b06a0b2dea54a6a49cddffd20a"
+    },
+    "receipts": [
+     {
+      "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|leb4elpmje4ysqg3mums7mcycy|294|1200000|294|1000|1012|4096",
+      "sig": "239a78ed42b77a468339650ddc48aa160e3bbe53adf8dfb0c04a7f4e0f7bbda85d6b3855c156b6ebcd11a3a2206d354df1ad2d970a23ee42d92feb1296458f02"
+     }
+    ]
+   }
+  },
+  "belowFloor": {
+   "minPayout": 750000001,
+   "paidSats": 0,
+   "ok": true
+  }
+ },
+ "auditNtaCarry": {
+  "window": {
+   "message": "xbt-work-window/1|70|1013|35cbdff676afb462105004bc9cdf3cff14b7085da2ffec3d67d15101cd8e8117|981|8000000|546|5000",
+   "sig": "831a611241ff06b8f4b373b169c223d1ab92307371ea8ab4494ec88f6077d93e2123ce5b6bfb067b91aef65d3d9bcc5efd8ae6d567e85d5fdeeb05825d921c0f"
+  },
+  "coinbaseValueSats": 5000000000,
+  "expectedSats": 375000000,
+  "deferral": {
+   "message": "xbt-work-deferral/1|70|1013|35cbdff676afb462105004bc9cdf3cff14b7085da2ffec3d67d15101cd8e8117|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|375000000|unattested",
+   "sig": "fc4ad01c98a53267aa19948d295f288ca4a696d098736757797482988d384d0c2d3c2f08618cef90c75c7b15a5d06f31e9e67d5458ddf06785e9cf21c89c9701"
+  },
+  "carried": {
+   "paidSats": 0,
+   "deferred": [
+    "deferral"
+   ],
+   "ok": true
+  },
+  "noDeferral": {
+   "paidSats": 0,
+   "deferred": [],
+   "ok": false,
+   "proof": {
+    "kind": "xbt-work-fraud/1",
+    "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "height": 1013,
+    "blockHash": "35cbdff676afb462105004bc9cdf3cff14b7085da2ffec3d67d15101cd8e8117",
+    "coinbaseValueSats": 5000000000,
+    "paidSats": 0,
+    "expectedSats": 375000000,
+    "windowWork": 8000000,
+    "provenWork": 1200000,
+    "window": {
+     "message": "xbt-work-window/1|70|1013|35cbdff676afb462105004bc9cdf3cff14b7085da2ffec3d67d15101cd8e8117|981|8000000|546|5000",
+     "sig": "831a611241ff06b8f4b373b169c223d1ab92307371ea8ab4494ec88f6077d93e2123ce5b6bfb067b91aef65d3d9bcc5efd8ae6d567e85d5fdeeb05825d921c0f"
+    },
+    "receipts": [
+     {
+      "message": "xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|leb4elpmje4ysqg3mums7mcycy|294|1200000|294|1000|1012|4096",
+      "sig": "239a78ed42b77a468339650ddc48aa160e3bbe53adf8dfb0c04a7f4e0f7bbda85d6b3855c156b6ebcd11a3a2206d354df1ad2d970a23ee42d92feb1296458f02"
+     }
+    ]
+   }
+  },
+  "deferralForAnotherBlock": {
+   "message": "xbt-work-deferral/1|70|1013|5c91447ddccea0e3c935e4b41ce2d0a8f2535432478df5380507628bbe5e0525|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|375000000|unattested",
+   "sig": "d5ed86ecf1ad98d3212a4795c5e007de8332d283415f009df7eb4c81e5e5705a7b5604f1823ff5df5c543f58992afc0dc26ecd1c4762c61e3baad98bf724be09",
+   "paidSats": 0,
+   "ok": false
+  },
+  "rule": "A block that carries an unattested provider passes the audit on the Prime's signed deferral line; without the line it is a fraud proof; a line for another block counts for nothing."
+ },
+ "nta": {
+  "bip86": {
+   "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+   "path": "m/86'/0'/0'/0/0",
+   "internalSecret": "41f41d69260df4cf277826a9b65a3717e4eeddbeedf637f212ca096576479361",
+   "internalKey": "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
+   "tweak": "2ca01ed85cf6b6526f73d39a1111cd80333bfdc00ce98992859848a90a6f0258",
+   "outputSecret": "eaac016f36e8c18347fbacf05ab7966708fbfce7ce3bf1dc32a09dd0645db038",
+   "outputKey": "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+   "address": "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr",
+   "regtestAddress": "bcrt1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqvg32hk",
+   "rule": "NTA signs with the output key K = P + t*G, t = TaggedHash(\"TapTweak\", x(P)); its secret is d + t, d negated first if d*G has odd y. The internal secret d does not verify."
+  },
+  "bip341KeyPath": {
+   "internalSecret": "6b973d88838f27366ed61c9ad6367663045cb456e28335c109e30717ae0c6baa",
+   "outputSecret": "2405b971772ad26915c8dcdf10f238753a9b837e5f8e6a86fd7c0cce5b7296d9"
+  },
+  "attestation": {
+   "identity": "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr",
+   "payee_script": "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+   "payee_key": "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+   "height": 975001,
+   "nBits": "190141c5",
+   "hashPrevBlock": "06c4cbe1c9d3568b11c49afc861da1d478cd172860d4065364355ce3aeb50399",
+   "preimage": "225120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c99e00e00c54101199903b5aee35c35645306d4602817cd78d4a11d86fc9ac4118b56d3c9e1cbc406",
+   "digest": "34337fa48dc75a86ad5d65b38e894d81737afd15fc2fc3657454d66009f1672c",
+   "sig": "9efdc5a28176c3f77d8503703f76098444e09e108ff767e8467a23ccfb667d4f18e2cca8c1d5ae31052ef0c803701209447835631f285daa4c34e1fc6e7bb063",
+   "attestationOutput": "6a444e5441029efdc5a28176c3f77d8503703f76098444e09e108ff767e8467a23ccfb667d4f18e2cca8c1d5ae31052ef0c803701209447835631f285daa4c34e1fc6e7bb063",
+   "attestBody": {
+    "version": 1,
+    "key": "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+    "height": 975001,
+    "nbits": "190141c5",
+    "prev": "06c4cbe1c9d3568b11c49afc861da1d478cd172860d4065364355ce3aeb50399",
+    "sig": "9efdc5a28176c3f77d8503703f76098444e09e108ff767e8467a23ccfb667d4f18e2cca8c1d5ae31052ef0c803701209447835631f285daa4c34e1fc6e7bb063"
+   },
+   "signedWithInternalSecret": "83baee9fefeaa51dc2cf06144d16ba94ffe246725ef2d579de6d437ae522e85918d874210c4e1b2dbf5b1dbbbeecff05893e986930863ef81fb82ad69e3843d3",
+   "otherTip": {
+    "hashPrevBlock": "cab7d643ec4f803cb14d9a041940a07a4d1289c48b27c73c8e807e6565e75d06",
+    "verifies": false
+   }
+  },
+  "p2wpkhIdentity": {
+   "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+   "scriptPubKey": "0014751e76e8199196d454941c45d1b3a323f1433bd6",
+   "payee": false,
+   "rule": "Not OP_1 <32 bytes>: after activation a coinbase paying it is bad-nta-payee, and it has no key to attest with. A Prime can only carry its share."
+  }
+ },
+ "relay": {
+  "identity": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+  "invoice": "vfer2e5e75t4tv7in42lakx6i4",
+  "lookup": "8dc7e659766d975a766a92b1764be235783fbe181ea8d3089f12f7f4a2c80988",
+  "key": "7425b7f9d2001d957d7f2d2a7c2ecda73b0be70559359420e5c0987f25f6d211",
+  "nonce": "e33c0e78b550ea6615f39a15",
+  "document": "{\"message\":\"xbt-work-receipt/1|70|bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4|vfer2e5e75t4tv7in42lakx6i4|3|12|3|101|102|4\",\"sig\":\"8797e735992e36beffc2be327c94bf67b6c0aaa1cd26ed0da68a37de91ce9baf931de9a8b04029f69ed6eab8dec34f1fcd6869651d9aba3c3ede4f9390a1620e\"}",
+  "blob": "e33c0e78b550ea6615f39a153887c70a0c501a4cf66088590e26228f3daf08ee81eb39172347915c27a58e1a321375a2b4598b3b963239aa8daed6a68677c1916affb391cfbd5ab7e3022eaed6948173eb157c9e1933cf5d772078e357ca7a9b2370b40b38e9ed2b7f5bb229635c2a87d5986c6ef847ad82db8abdcb57ac2580f003aa3b6d424427305771cf376c23214fef5297dd32b589d248a481bfbe552045001e737cb63e41f8dd7b7990da1f4f6b701332244d298c6737d5bcac0967359fecc82811634896a99aa4041c1afd06ae9905d6727a1ae4c6b85fd8c299df93df0b388271823463ef7e7334cfc4afd032c65e25550b18c9ea93583fc806b0866a35fb01ef99d33fc237208138201953fb9bc6d021c617213220cc48bf2fbc126b293ef7339ec4128202df4baf1fc1d2823a474a49190316b79897dd473a6275bba01e6a4788e59a07013bd9e67d6a760c030ffb8d943f6c9f4affbcae8495d77daba0b45b86fc7e962890aeaf3f1a7a034e27148eb5cbec7198635eda4c0e44ceae589a5a9688a5ff23cbf1843a3030e7cbddca3ffa88c7830e6cc8e4c2ed0183da822b5ece7a88d1730dd556c404aa23eb8e30b5be7f5e12d007a7c102c31236da080c32ca273cee46dba70b29e581c8fcf267bcbf7f4916f6b11b360ba63b4c5cc0dbeabfd5748416602f01a31fb3e636386325885d4ca4aefbea5824cb3ee369458a2e603b07f89436239e8a92e6ef73dc14fd6f9265c842e5b83d65ce08614882d573b5c9593a24b21edd096a4b72b1193031b667b2ab3fba0383291044ee37347fe3cb7028e43c609aba3153c3462132fecfa5d6ed06327ec38ed408811333a88f17fb7570bd7405792322a5f5c70ac43debe2e8d210c0c4f69fce4c83c65fa181ea265fec4786b9c92cdf0e0fbdb8984e98fb36c22c8160b32e0d680aacb539ccdb9c69def8c0c49673b532d244cf46ae81f6e1f3c67634214897d31b74caa938358b2f994a4322bc67b72671afc258253cdf784c9475e399b4f3f553521f509f8e634ed27e19c0737ac4a455e8fecb162174e1bfb0c688438c947009ed089fc282ae48cb18c2d31a12987088a24dd1316d64692fc0ce854d92291b74af5cd99df54f0eb3cbc40815ff245c52f1827a7c10e21dbb512fe9b1a62d0e45baf7714f55be372e6ad69fea1ca9a25e0abe8a59838bc7132c8a68d1132ae418a772833a40f0110f6ea1490666a0cd5fdb980a9ed9f87c303762a76d1ec34de1acf232b376d260fe1bc44921ae82cd2fa0d6f878073d93d359841991b62f5b812781844c6ab478667219036859e55b82fdca5a3d2878f7308f857b9f70256dc0591cec98a837cc92e4591bfb4899e0bcfd7df52562c057be66be8885ef26cb5e0f2291e7b1b00598d15d096f1066cbf431b399fb32c679f934b016938d6add2a0bd8ee2131c3a7d7b589a092bfd9a7077e92fe227285daca29fdc130",
+  "pad": 1024
+ }
+}

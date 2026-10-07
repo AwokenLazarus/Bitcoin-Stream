@@ -1,0 +1,16 @@
+[package]
+name = "xbt402-interop"
+description = "Conformance suite, vector emitter and regtest cross-implementation tools for xbt-primitives and xbt402 (not published)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+xbt-primitives.workspace = true
+xbt402 = { workspace = true, features = ["http-client", "http-server", "rpc"] }
+serde_json.workspace = true
+hex.workspace = true
+# the Rust B2 signer behind the Rust RoutePayer (xbt402-route-payer --signer-sock, AGP-034)
+xbt-signer.workspace = true
+

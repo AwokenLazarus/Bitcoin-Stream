@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${XBT_ZIG_PY:-$HOME/.local/share/ziglang-venv/bin/python}" -m ziglang ar "$@"

@@ -1,0 +1,142 @@
+{
+ "blobs": {
+  "keyfile": {
+   "aad": "b2/test",
+   "alg": "aes-256-gcm",
+   "ct": "dbaf54acbd46137ee2a2671d386054919d9876c826ba33630668",
+   "kdf": "keyfile",
+   "nonce": "b4a3ef2c20ac950a511f76fc",
+   "salt": "b14c5ba8c4ae07568b602127b610b78f",
+   "v": 1
+  },
+  "passphrase": {
+   "aad": "b2/test",
+   "alg": "aes-256-gcm",
+   "ct": "666cecc956053087e096eda844e59460d0b922b04f63b33649bf",
+   "kdf": "scrypt",
+   "nonce": "347a1eed49b979a955ec926e",
+   "salt": "aee6a54fdab6d23a3cf1492ad5a27061",
+   "v": 1
+  }
+ },
+ "channels": {
+  "chan": "3333333333333333333333333333333333333333333333333333333333333333:0",
+  "channel_keys.json": {
+   "sealed": {
+    "aad": "b2/channel-keys",
+    "alg": "aes-256-gcm",
+    "ct": "79f86cbe9602ca754543d26a83537d1ff8a9aba5e7a4ff7e179cd9ddf1286dd4c219615636ce2cb3c9cd8e611c46b453bab69354af04faeb89838593597b9fb1d17763801b1d2c47116530a212099793ebac5bc6bd588e50da15fe43217f39266a64a397582816748b5a9b3a226dc111eb241d6e463679fbbc97351275b34d5820a1cbf73e3d4816d396a673f36a740199e88d0740ab8de355c4220444c220e4b3d0f4ed3269e9cabe77b265cd8c85d1abe169",
+    "kdf": "keyfile",
+    "nonce": "a7ad8627d643b9402860dade",
+    "salt": "b3eb2e9cfd442988bc5fca585e915cfa",
+    "v": 1
+   }
+  },
+  "channels.json": {
+   "channels": {
+    "http://127.0.0.1:33210": {
+     "acked_sats": 0,
+     "cap_sats": 9400,
+     "chan": "3333333333333333333333333333333333333333333333333333333333333333:0",
+     "close_change": "",
+     "close_fee": 600,
+     "close_fee_payer": "payer",
+     "close_hex": "",
+     "close_scan_from": 0,
+     "closed_txid": "",
+     "dest": "http://127.0.0.1:33210",
+     "expiry": 7734,
+     "funding_height": 0,
+     "funding_hex": "",
+     "funding_sats": 10000,
+     "funding_txid": "3333333333333333333333333333333333333333333333333333333333333333",
+     "funding_vout": 0,
+     "given_up": [],
+     "last_sig": "3045022100e99e5eaf942bdfa2e87a7cd307c0ca9a4248543629265fe6c952f6ed4076030f02203aa19b8816fca0ebc8531398085eba10ad18f9803b24f350cae452bb03891d6921",
+     "min_conf": 1,
+     "network": "bip122:00000000000000000000000000000000",
+     "open_error": "",
+     "open_height": 6720,
+     "open_url": "http://127.0.0.1:33210/x402/xbt-channel/open",
+     "origin": "http://127.0.0.1:33210",
+     "payee_pub": "0241c17199f9e94006d84936f397aaa3523fe40e62ee6b937b5db52b31ecc4baa8",
+     "payee_spk": "0014419e6c4a781e89548e312bfa9c21d738b31b86e1",
+     "payer_pub": "020789dee922a809e21365f515c10b61bdc44f18eb5cf7e4f71d492ac8be157576",
+     "payer_spk": "00140205d52c7ed8131d126cf4335bc39abf631a3762",
+     "pending_cond": {},
+     "pending_lock": {},
+     "refund_txid": "",
+     "seq": 1,
+     "spent_sats": 500,
+     "state": "open",
+     "used_sats": 546
+    }
+   }
+  },
+  "payer_pub": "020789dee922a809e21365f515c10b61bdc44f18eb5cf7e4f71d492ac8be157576",
+  "state_sig_cum": 546,
+  "state_tx_sighash": "889756594bf40e537c340f23e3b834f712cca46b14ab7c42257362808f73bad5"
+ },
+ "hot": {
+  "current_address": "bcrt1qqgza2tr7mqf36ynv7se4hsu6ha335dmzamfvs8",
+  "hot.json": {
+   "current": {
+    "pub": "0208f4f37e2d8f74e18c1b8fde2374d5f28402fb8ab7fd1cc5b786aa40851a70cb",
+    "sealed": {
+     "aad": "b2/hot-key",
+     "alg": "aes-256-gcm",
+     "ct": "a0e3a52e625fd62ee2460fc2cbb4a8f2c3eb48b2291af8ad286f9a5cf4ee61e85948645d2ee9f1cd8d2156058574282a",
+     "kdf": "keyfile",
+     "nonce": "fd9b83566d657716e90d029f",
+     "salt": "cb4ef4b690910787901dc86cf0f23c2b",
+     "v": 1
+    }
+   },
+   "encrypted": true,
+   "retired": [
+    {
+     "pub": "020ee2d7564bb0d7460bc94cf8f28f3e61d3b673fa5075b8b58cd4f65337f607cb",
+     "retired_at": 1790000000.25,
+     "sealed": {
+      "aad": "b2/hot-key",
+      "alg": "aes-256-gcm",
+      "ct": "95dae3c5fed0848691bb1cb00f874975dd7c3c23d01e536f793b1636b05906e38617abcd297b163250fab54f8b9ef10d",
+      "kdf": "keyfile",
+      "nonce": "7060ad8cef67674a71ea80ba",
+      "salt": "2a81c86f1adf785b5094a349bcbecdaf",
+      "v": 1
+     }
+    }
+   ],
+   "v": 2
+  },
+  "hot_sats": 12700,
+  "hot_utxos.json": {
+   "encrypted": true,
+   "sealed": {
+    "aad": "b2/hot-utxos",
+    "alg": "aes-256-gcm",
+    "ct": "a25e535372111d7c617d0a8364df4a0cadd56881d3ecff186fcd8c4588700e5692180303c7ccf03a9486a1f254f1e50aa5e379530b077e552a54ecb0abe2b514facc5eb540d506a54526276f7bc5924a83e21ef0e7ce3f0407a591497e0d2600f89216d7dca6a2146302389642f081f46ad09b3c116f5d5de5e851bb578f058f1e1dc4f72175f332842f57becaf4be9fc4d718c2a0342716607f02e3d239942fffbaef571b348bc2d5ba91ce70e81d4c959e5368e28b477b345cedceeedf3d448b1411b4db236cb4a0a11f044df615cee1919e7ef99baae4341a9104d7d16772147af3194f96a33954ab85eaaa22dd0b39793e422dd741a202b75c7a5f0af16006be9de07555dd707087e79e6c777e560ca600af50ffec632e0e08379284a158012040094b529ba7f93207b5ce4fc6db03d00d4c6806f0af88d252ece9bc333ee09cfd4773573be3de21f9bbbf95c802341b976fc9ede8ec6d4f1ab1da56541ebd229fcaf57d3dffd572d635972b",
+    "kdf": "keyfile",
+    "nonce": "926e9b6fd0258bb46131e86b",
+    "salt": "ca05a044bfd5d07cf38cad670ea3bf7f",
+    "v": 1
+   },
+   "v": 1
+  },
+  "retired_address": "bcrt1qv0rreawcd5rplh4yfxs7qf02ywzuc037up8r2q"
+ },
+ "keyfile_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+ "log": {
+  "anchors.jsonl": "{\"head\":\"ba15d86fb1cdbed4ac74f3208429e77396aa00d30ceae393baa70cc9bdb49b23\",\"n\":2,\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"reason\":\"signer_start\",\"seq\":1,\"ts\":1790613716.146}\n",
+  "signatures.jsonl": "{\"chan\":\"3333333333333333333333333333333333333333333333333333333333333333:0\",\"cum\":546,\"dest\":\"http://127.0.0.1:33210\",\"kind\":\"channel_state\",\"method\":\"xbt402_pay\",\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"rule\":\"policy:ok\",\"sig_sha256\":\"3a82a2f228264303e7ba1c33d44e99740ce445bb3dcb206dcf23d140c6d59370\",\"sighash\":\"0x21\",\"ts\":1790613716.138}\n{\"amount_sats\":11400,\"chan\":\"\",\"dest\":\"\",\"kind\":\"funding\",\"method\":\"xbt402_pay\",\"prev\":\"836772c7858639f215cd99aaf8aa400f73b80c4bc3d88855beba8f27e4ae90a7\",\"rule\":\"policy:ok\",\"sig_sha256\":\"65e72a9d27c9f0c47ce4d7e11fc38a6430b98cfdfbf2b3f1ec06068771f05f1b\",\"ts\":1790613716.141,\"txid\":\"3333333333333333333333333333333333333333333333333333333333333333\"}\n{\"chan\":\"3333333333333333333333333333333333333333333333333333333333333333:0\",\"cum\":546,\"dest\":\"http://127.0.0.1:33210\",\"kind\":\"close_auth\",\"method\":\"\",\"prev\":\"ba15d86fb1cdbed4ac74f3208429e77396aa00d30ceae393baa70cc9bdb49b23\",\"rule\":\"unattributed\",\"sig_sha256\":\"fc6376c48ba483908177975b803503655458b864223533f5a240a619226ab643\",\"ts\":1790613716.149}\n",
+  "submit": {
+   "head": "ba15d86fb1cdbed4ac74f3208429e77396aa00d30ceae393baa70cc9bdb49b23",
+   "n": 2,
+   "ok": true,
+   "seq": 1,
+   "ts": 1790613716.146
+  }
+ },
+ "passphrase": "b2 passphrase"
+}
