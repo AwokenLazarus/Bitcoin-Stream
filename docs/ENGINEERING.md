@@ -141,6 +141,10 @@ untrusted input: parsers and the provider are fuzzed with hostile bytes and JSON
 
 `scripts/conformance.sh` (2026-09-28):
 
+The vectors come from our own Python references (B1, B2) and from Knots. B1 and B2 are not yet
+published, so the B1/B2 groups show agreement between our two implementations, not conformance to
+an outside implementation. The UnifiedSighash vectors are Knots' own file, byte for byte.
+
 | group | vectors | source | result |
 |---|---|---|---|
 | xbt402 v1.1 + v1.2 (counted as `check_vectors.py` counts them) | 50 | B1 agp-029 `docs/x402/vectors.json` | 50/50 byte-identical |
@@ -485,8 +489,10 @@ paid.
 
 ## Routed billing throughput (AGP-054)
 
-cmp measured routed decode at 0.742 of unpaid (CMP-024): about 4–5 ms of billing per stage per
-token. A profile of the per-call path traced most of it to one step. cmp's `RouteJournal`
+Before this change, cmp measured routed decode at 0.742 of unpaid (CMP-024): about 4–5 ms of billing per stage per
+token. With `RouteWal`, B1's 3-stage benchmark (`scripts/route_perf.py`, 3 × 300 tokens) went from
+0.833 to 0.964 of unpaid (0.973 with no durability at all), and cmp's routed end-to-end gate
+(CMP-027) measured 0.894–0.923. A profile of the per-call path traced most of it to one step. cmp's `RouteJournal`
 fdatasyncs every routed call's meter after the handler, before the answer: 2.5 ms on the lab's
 ext4, 66% of the provider-side cost. The rails' own work is small. ROUTE-STATE signing takes
 0.12 ms and the client's verify 0.03 ms (B1 with coincurve).

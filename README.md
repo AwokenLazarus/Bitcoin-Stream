@@ -7,7 +7,12 @@ running total. The seller settles once, for the last total. Stop at any moment a
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
 > **Status: test networks only.** Everything here runs on XBT regtest and a private test network.
-> It has had an internal security review, not an independent audit. Do not use it with mainnet funds.
+> It has had an internal security review, not an independent audit. An outside review of this code
+> (October 2026) found critical and high-severity issues in the agent wallet's budget accounting,
+> the hub, the pay-with-work audit and the HTTP layer; fixes are in progress and an independent
+> audit follows them. Hub routing (`xbt402-hub`) is experimental. Conformance results in
+> `docs/ENGINEERING.md` are measured against our own Python references, which are not yet
+> published. Do not use it with mainnet funds.
 
 ## What is here
 
