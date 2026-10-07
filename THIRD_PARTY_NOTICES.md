@@ -1,6 +1,6 @@
 # Third-party notices
 
-Bitcoin Stream is MIT licensed (see `LICENSE`). It includes, links against, or builds on the work
+Bitcoin Stream is licensed under MIT or Apache-2.0, at your option (`LICENSE-MIT`, `LICENSE-APACHE`). It includes, links against, or builds on the work
 below. Each keeps its own licence and copyright.
 
 ## Included in this repository
