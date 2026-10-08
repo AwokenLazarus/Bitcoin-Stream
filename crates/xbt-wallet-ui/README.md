@@ -36,6 +36,7 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_SESSION_IDLE_S` / `XBT_UI_SESSION_MAX_S` | 900 / 28800 | session lifetimes |
 | `XBT_UI_SECURE_COOKIE` | auto | `Secure` cookie: `1` always, `0` never, auto when `X-Forwarded-Proto: https` |
 | `XBT_UI_ALLOW_IPS` | all | peers allowed to connect (IPs or prefixes such as `10.21.0.`), e.g. only the box's app proxy |
+| `XBT_UI_ALLOWED_HOSTS` | | AGP-063 W4: extra host names the UI answers to, comma-separated (`wallet.example.com`; `*`: any). Always allowed: IP literals, single-label names (`localhost`, a container name), `*.local`, `*.localhost`, `*.onion`. Another Host is 421 (DNS rebinding); a POST whose `Origin` names another host is 403 (`Origin: null`, which Chrome sends under `no-referrer`, is accepted) |
 | `XBT_UI_SETUP_OPEN` | 0 | `1`: the first-run password setup needs no code (the platform proxy already authenticated the owner) |
 | `XBT_UI_HUB_URL` | | this box's xbt402 hub; its `/healthz`, `/readyz` and `/x402/supported` are shown on the Hub page |
 | `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page, linked from Overview and Hub |
@@ -71,7 +72,8 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
 ## Security model
 
 - **Who can do what.** The UI login (scrypt, N=2^15; throttled at 5 failures a minute) lets someone
-  see the wallet, deny requests, close channels and ask for refunds.
+  see the wallet, close channels and ask for refunds. Denying a live request also needs the human
+  signature (AGP-063).
 
   Anything that raises what the wallet may spend, or moves or exports keys, also needs the human's
   ed25519 signature: approve, the policy, a new human key, a sweep, a rotation, the backup. The
@@ -85,8 +87,11 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
   characters and are refused if they are only digits or a repeated pattern; the page shows a
   strength hint. A wrap stored at the AGP-039 cost (60,000) unlocks once and is re-wrapped at
   210,000. The owner writes down its 64-hex backup once. Only the public key goes to the box
-  (`human_key_enroll`, trust on first use while no key is enrolled; after that, `human_key_rotate`
-  signed by the old key).
+  (`human_key_enroll`; after that, `human_key_rotate` signed by the old key). AGP-063 W4: the first
+  enrolment needs the one-time code the signer prints when no key is enrolled. On Umbrel it is in
+  the app's log (app page, Troubleshoot), on StartOS in the service's Logs, elsewhere on the signer's
+  stderr or in `.run/enroll-code`. Five wrong codes replace it with a new one. Denying a pending
+  request is signed in the page too (`deny_message`), so the agent cannot refuse for the owner.
 
   The message is signed in the page. `ui.js` rebuilds it from the fields shown; for a policy, it
   signs the text shown, and refuses if the displayed text differs.

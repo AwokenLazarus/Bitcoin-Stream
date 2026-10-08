@@ -138,6 +138,9 @@ impl App {
         if !self.peer_allowed(&req.peer) {
             return Resp::text(403, "text/plain", "forbidden");
         }
+        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
+            return Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS");
+        }
         let Some(path) = strip_base(&req.path, &self.cfg.base_path) else { return Resp::text(404, "text/plain", "not found") };
         if path.is_empty() {
             let last = self.cfg.base_path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
@@ -162,6 +165,10 @@ impl App {
         // a POST from another site is refused before anything else (the CSRF token is the second check)
         if post && req.header("sec-fetch-site").eq_ignore_ascii_case("cross-site") {
             return Resp::text(403, "text/plain", "cross-site request refused");
+        }
+        let origin = req.header("origin");
+        if post && !origin.is_empty() && !origin_allowed(origin, &self.cfg.allowed_hosts) {
+            return Resp::text(403, "text/plain", "cross-origin request refused");
         }
         if !self.auth.has_password() {
             return self.setup_password(&req);
@@ -335,7 +342,8 @@ impl App {
                             v.get("txid").or(v.get("chan")).map(|t| format!(" {}", txt(Some(t)))).unwrap_or_default())
                 }
             }),
-            "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason")})), &|_| "Denied.".into()),
+            "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason"), "expiry": i("expiry"), "signature": sig()})),
+                            &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => back("./policy", self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
@@ -343,7 +351,7 @@ impl App {
                 let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
                 if pr.is_empty() { "Policy applied; it is in force now.".into() } else { format!("Policy applied. These take effect when the signer restarts: {pr}.") }
             }),
-            "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey")})), &|_| "Approval key enrolled.".into()),
+            "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey"), "code": g("code")})), &|_| "Approval key enrolled.".into()),
             "/human-key-rotate" => back("./keys", self.call("human_key_rotate", json!({"pubkey": g("pubkey"), "expiry": i("expiry"), "signature": sig()})),
                                         &|_| "The new approval key is enrolled; the old one no longer approves anything.".into()),
             "/sweep" => back("./keys", self.call("sweep_hot", json!({"to": g("to"), "amount_sats": i("amount_sats"), "expiry": i("expiry"), "signature": sig()})),
@@ -490,13 +498,16 @@ impl App {
                 "pending" => {
                     let hidden = [("token", token.clone()), ("dest", dest.clone()), ("amount_sats", amount.to_string()), ("expiry", exp.to_string())];
                     b.push_str(&self.signed_form(ctx, "./approve", "approve", &human, &hidden, "", "Approve", Ext::Bytes(msg::approve(&token, &dest, amount, exp))));
-                    b.push_str(&format!("<form method=\"post\" action=\"./deny\" class=\"deny\">{}<input type=\"hidden\" name=\"token\" value=\"{}\">\
-                        <input name=\"reason\" placeholder=\"Reason (optional)\" maxlength=\"200\"><button class=\"danger\">Deny</button></form>",
-                        Self::csrf_input(ctx), esc(&token)));
+                    let sexp = now() + SIGN_WINDOW_S;
+                    b.push_str(&self.signed_form(ctx, "./deny", "deny", &human, &[("token", token.clone()), ("expiry", sexp.to_string())],
+                        "<input name=\"reason\" placeholder=\"Reason (optional)\" maxlength=\"200\">", "Deny", Ext::Bytes(msg::deny(&token, sexp))));
                 }
-                "approved" => b.push_str(&format!("<p class=\"tag ok\">Approved: paid when the agent's call arrives.</p>\
-                    <form method=\"post\" action=\"./deny\">{}<input type=\"hidden\" name=\"token\" value=\"{}\"><input type=\"hidden\" name=\"reason\" value=\"revoked\">\
-                    <button class=\"danger\">Revoke</button></form>", Self::csrf_input(ctx), esc(&token))),
+                "approved" => {
+                    let sexp = now() + SIGN_WINDOW_S;
+                    b.push_str("<p class=\"tag ok\">Approved: paid when the agent's call arrives.</p>");
+                    b.push_str(&self.signed_form(ctx, "./deny", "deny", &human, &[("token", token.clone()), ("expiry", sexp.to_string()), ("reason", "revoked".into())],
+                        "", "Revoke", Ext::Bytes(msg::deny(&token, sexp))));
+                }
                 _ => b.push_str(&format!("<p class=\"tag\">Expired.</p><form method=\"post\" action=\"./deny\">{}<input type=\"hidden\" name=\"token\" value=\"{}\">\
                     <input type=\"hidden\" name=\"reason\" value=\"expired\"><button>Dismiss</button></form>", Self::csrf_input(ctx), esc(&token))),
             }
@@ -803,6 +814,9 @@ impl App {
     fn keygen_block(&self, ctx: &Ctx, enroll: bool) -> String {
         let enroll_form = if enroll {
             format!("<form method=\"post\" action=\"./human-key-enroll\" id=\"enroll-form\" hidden>{}<input type=\"hidden\" name=\"pubkey\" value=\"\">\
+                     <label>Enrolment code<input name=\"code\" class=\"mono\" autocomplete=\"off\" required placeholder=\"XXXX-XXXX-XXXX\"></label>\
+                     <p class=\"hint\">The signer prints a one-time code in its log while no key is enrolled (Umbrel: the app's log; StartOS: Logs; \
+                     a server: the signer's stderr or <code>.run/enroll-code</code>).</p>\
                      <button>Enrol this public key with the signer</button></form>", Self::csrf_input(ctx))
         } else {
             String::new()
@@ -1110,4 +1124,34 @@ pub fn http_get(url: &str) -> Result<(u16, String), String> {
     let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
     Ok((status, body))
+}
+
+/// AGP-063 W4: a Host this UI answers to. An absent one (no browser sends none), an IP literal, a
+/// single-label name (`localhost`, a container name behind the box's proxy), `*.local`,
+/// `*.localhost`, `*.onion`, or one of `XBT_UI_ALLOWED_HOSTS`. Any other name points a public DNS
+/// name at this box's address: a rebinding page that would read the UI.
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() || allowed.iter().any(|a| a == "*") {
+        return true;
+    }
+    let name = match h.strip_prefix('[') {
+        Some(r) => return r.split(']').next().is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok()),
+        None => h.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map(|(n, _)| n).unwrap_or(&h),
+    };
+    let name = name.trim_end_matches('.');
+    name.parse::<std::net::IpAddr>().is_ok() || !name.contains('.') || [".local", ".localhost", ".onion"].iter().any(|t| name.ends_with(t))
+        || allowed.iter().any(|a| a == name)
+}
+
+/// A POST's `Origin`: its host must be one [`host_allowed`] accepts. `null` counts as absent: this
+/// UI's own pages send it (`Referrer-Policy: no-referrer`), and any page can, so the Host check
+/// is what refuses a rebinding; the CSRF token and SameSite cookie refuse the rest.
+pub fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
+    let o = origin.trim();
+    if o == "null" {
+        return true;
+    }
+    let rest = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"));
+    rest.is_some_and(|r| !r.is_empty() && !r.contains('/') && host_allowed(r, allowed))
 }

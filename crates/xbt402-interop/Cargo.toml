@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 xbt-primitives.workspace = true
-xbt402 = { workspace = true, features = ["http-client", "http-server", "rpc"] }
+xbt402 = { workspace = true, features = ["http-client", "http-server", "rpc", "vector-emitter"] }
 serde_json.workspace = true
 hex.workspace = true
 # the Rust B2 signer behind the Rust RoutePayer (xbt402-route-payer --signer-sock, AGP-034)

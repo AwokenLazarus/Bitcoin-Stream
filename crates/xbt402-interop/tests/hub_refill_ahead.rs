@@ -422,6 +422,11 @@ fn a_child_the_providers_watcher_left_suspended_is_looked_at_before_a_lock_is_re
     w.prov.with_state(&chan, |st| st.suspended = true).unwrap(); // as the racing watcher tick leaves it
     let r = w.lock(); // still unconfirmed: refused, as it must be
     assert_eq!(refusal(&r), ("refused", "route_failed", "provider refused the lock: unconfirmed"), "{r}");
+    // the provider holds that lock's pre-signature, so this ch2 takes no more routes (AGP-064 H2)
+    assert_eq!(refusal(&w.lock()).1, "route_blocked");
+    let w = capped(None);
+    let chan = w.live().params.channel_id();
+    w.prov.with_state(&chan, |st| st.suspended = true).unwrap();
     w.chain.mine(1); // confirmed; no watcher tick anywhere
     std::thread::sleep(Duration::from_millis(350));
     w.paid(1);

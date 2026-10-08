@@ -52,6 +52,11 @@ pub trait StateSigner: Send + Sync {
     fn sign_state_a3(&self, chan: &str, amount: u64) -> Result<Vec<u8>>;
     /// The payer's 0x21 signature for a rollover tx.
     fn sign_rollover(&self, chan: &str, amount: u64, next_spk: &[u8], next_capacity: u64) -> Result<Vec<u8>>;
+    /// [`StateSigner::sign_rollover`] with the next channel's unfunded params, so a signer can check
+    /// the target is a channel of its own (AGP-063 W3). The default signs by script alone.
+    fn sign_rollover_next(&self, chan: &str, amount: u64, next: &ChannelParams, next_capacity: u64) -> Result<Vec<u8>> {
+        self.sign_rollover(chan, amount, &next.spk(), next_capacity)
+    }
     /// The payer's close authorisation over `tagged_hash("xbt402/close", chan)` (DER).
     fn sign_close(&self, chan: &str) -> Result<Vec<u8>>;
     /// The signed CLTV refund tx (hex).

@@ -270,7 +270,13 @@ def provider_args(identity, port):
     return [B["provider"], "--port", str(port), "--rpc-port", str(RPC["b"]), "--cookie", cookie("b"), "--identity", identity,
             "--prime-pubkey", PRIME_PUB, "--prime-id", "70", "--receipt-url", f"{STATS_URL}/receipt", "--relay-url", RELAY_URL,
             "--window-url", f"{STATS_URL}/window", "--nta", "--admin", "--pull-secs", "3",
-            "--cap-invoice", "1", "--cap-total", "1", "--max-carry-sats", str(MAX_CARRY), "--audit-depth", "1"]
+            "--cap-invoice", "1", "--cap-total", "1", "--max-carry-sats", str(MAX_CARRY), "--audit-depth", "1"] + prime_terms()
+
+
+def prime_terms():
+    # AGP-065: the provider and payer hold window statements to the Prime's published terms
+    return ["--prime-window", "8", "--prime-window-min-work", str(WINDOW_MIN_WORK), "--prime-fee-bps", str(FEE_BPS),
+            "--prime-min-payout", "546"]
 
 
 def start_signer():
@@ -622,8 +628,10 @@ def run():
         check(res.get("ok") is True and rep["carry"]["owedSats"] == 0,
               f"C: Rust audit PASS (paid {res.get('paidSats')} >= expected {res.get('expectedSats')}); the carry ledger is released "
               f"(owed {rep['carry']['owedSats']}, released {rep['carry']['releasedSats']})", audit=res)
-        check(rep["credit"]["frozen"] is None and rep["credit"]["heldWork"] == 1 and rep["credit"]["unauditedWork"] == 1,
-              f"C: unfrozen; one held unit credited (cap 1), the C share still held: {rep['credit']}")
+        # AGP-065 (Guida P2): the pass covers the B share, so it is credited outside the caps; the C share,
+        # mined at the block's height, is outside that bound and takes the cap
+        check(rep["credit"]["frozen"] is None and rep["credit"]["heldWork"] == 0 and rep["credit"]["unauditedWork"] == 1,
+              f"C: unfrozen; the audit covers the B share (credited outside the caps), the C share takes the cap of 1: {rep['credit']}")
 
     # ---- D: one more pool block, mined outside the invoice: its audit covers C
     log("== D: a pool block outside the invoice")
@@ -642,7 +650,7 @@ def run():
     calls = max(1, rc["cum_work"] - spent)
     log(f"== pay: {calls} calls with the invoice's remaining receipted work")
     p = subprocess.run([B["payer"], "pay", API_URL, str(calls), "120", "--state", PAYER_STATE, "--rpc-port", str(RPC["a"]),
-                        "--cookie", cookie("a"), "--window-url", f"{STATS_URL}/window", "--provider-admin"],
+                        "--cookie", cookie("a"), "--window-url", f"{STATS_URL}/window", "--provider-admin"] + prime_terms(),
                        capture_output=True, text=True, timeout=600)
     sys.stdout.write(p.stderr)
     open(os.path.join(OUT, "payer.json"), "w").write(p.stdout)

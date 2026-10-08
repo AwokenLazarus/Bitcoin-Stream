@@ -91,6 +91,24 @@ fn xerr(e: WorkError) -> ChannelError {
     ChannelError::new(&e.code, e.msg)
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Check the payer's DATUM gateway configuration (its JSON config file) before mining for an
+/// invoice (AGP-065). The gateway must pass the stratum username to the Prime unchanged
+/// (`datum.pool_pass_full_users`, default true): with it off, the gateway sends
+/// `<mining.pool_address>.<username>`, the Prime credits the gateway's own address, and no receipt
+/// ever names the provider's identity.
+pub fn check_gateway_config(cfg: &Value) -> Result<()> {
+    match cfg.pointer("/datum/pool_pass_full_users") {
+        None | Some(Value::Bool(true)) => Ok(()),
+        Some(Value::Bool(false)) => fail("gateway_config", "datum.pool_pass_full_users is false: the Prime would credit the gateway's pool_address, \
+                                                            not the invoice; set it to true"),
+        Some(_) => fail("gateway_config", "datum.pool_pass_full_users is not a boolean"),
+    }
+}
+
 impl WorkPayer {
     pub fn new(cfg: PayerConfig) -> Result<Self> {
         let p = Self { cfg, sessions: Mutex::new(HashMap::new()) };
@@ -129,11 +147,18 @@ impl WorkPayer {
     }
 
     /// Take an invoice for `origin` from the offer `acc` (POST extra.invoiceUrl), unless a session
-    /// for the same payTo exists.
+    /// for the same payTo exists. A session whose invoice expired with no work on it (after one
+    /// more receipt fetch) is replaced: the provider no longer accepts it (AGP-065).
     pub fn open(&self, t: &dyn Transport, origin: &str, acc: &Value) -> Result<Session> {
         self.check_offer(acc)?;
+        let same = |s: &Session| s.accepted.get("payTo") == acc.get("payTo") && s.accepted.pointer("/extra/primePubkey") == acc.pointer("/extra/primePubkey");
+        let stale = |s: &Session| s.credited() == 0 && s.invoice.get("expiresAt").and_then(Value::as_u64).is_some_and(|e| e < now_secs());
+        if self.session(origin).is_some_and(|s| same(&s) && stale(&s)) {
+            // the expired invoice may still hold work the payer has not fetched yet
+            let _ = self.refresh(t, origin);
+        }
         if let Some(s) = self.lock().get_mut(origin) {
-            if s.accepted.get("payTo") == acc.get("payTo") && s.accepted.pointer("/extra/primePubkey") == acc.pointer("/extra/primePubkey") {
+            if same(s) && !stale(s) {
                 s.accepted = acc.clone();
                 return Ok(s.clone());
             }

@@ -13,8 +13,9 @@ use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::wire::{b64json, unb64json};
 use xbt_primitives::secp256k1::SecretKey;
-use xbt_work::audit::{check_fraud_proof, Deferral, WindowStatement};
+use xbt_work::audit::{check_fraud_proof, AuditBounds, Deferral, PrimeTerms, SignedWindow, WindowStatement};
 use xbt_work::book::CreditCaps;
+use xbt_work::chain::ChainBlock;
 use xbt_work::payer::{PayerConfig, WorkPayer};
 use xbt_work::provider::{Amount, WorkConfig, WorkProvider, WorkScheme};
 use xbt_work::receipt::{PrimeKey, WorkReceipt};
@@ -24,6 +25,17 @@ const NET: &str = "bip122:00000000000000000000000000000001";
 const PROV: &str = "bcrt1q76vavszzsq657n375vk6updhxm0tfay7k28cc3";
 const API: &str = "http://api.test";
 const RELAY: &str = "http://relay.test";
+/// The statements below have window_work 1000: the Prime's regtest floor.
+const TERMS: PrimeTerms = PrimeTerms { window: 8, window_min_work: 1000, window_tolerance_bps: 500, fee_bps: 0, max_min_payout: 546 };
+
+/// The block a statement names, as the provider's node would have it (regtest difficulty).
+fn blk(sw: &SignedWindow, value_sats: u64, paid_sats: u64) -> ChainBlock {
+    ChainBlock { height: sw.stmt.height, hash: sw.stmt.block_hash.clone(), value_sats, paid_sats, bits: 0x207f_ffff, prev_bits: 0x207f_ffff }
+}
+
+fn bounds(sw: &SignedWindow) -> AuditBounds {
+    TERMS.bounds(&blk(sw, 0, 0)).unwrap()
+}
 
 struct Chain;
 
@@ -91,6 +103,7 @@ impl World {
         cfg.relay_url = Some(RELAY.into());
         cfg.amount = Amount::Fixed(10);
         cfg.state_path = state;
+        cfg.terms = TERMS;
         f(&mut cfg);
         let work = Arc::new(WorkProvider::new(cfg).unwrap());
         let w = World { t: T(net), prime, work };
@@ -234,36 +247,36 @@ fn pay_with_work_end_to_end() {
     let stmt = WindowStatement { prime_id: 70, height: 110, block_hash: "cd".repeat(32), window_start: 100, window_work: 1000, min_payout: 546, fee_bps: 0 };
     let sw = w.prime.sign_window(&stmt).unwrap();
     let v = 5_000_000_000u64;
-    let ok = w.work.audit(&sw, &[], v, 300_000_000).unwrap();
+    let ok = w.work.audit(&sw, &[], &blk(&sw, v, 300_000_000)).unwrap();
     assert!(ok.ok);
     assert_eq!((ok.expected_sats, ok.proven_work), (300_000_000, 60));
-    let bad = w.work.audit(&sw, &[], v, 100).unwrap();
+    let bad = w.work.audit(&sw, &[], &blk(&sw, v, 100)).unwrap();
     assert!(!bad.ok);
-    assert!(check_fraud_proof(bad.proof.as_ref().unwrap(), &w.prime.pubkey(), v, 100));
-    assert!(!check_fraud_proof(bad.proof.as_ref().unwrap(), &w.prime.pubkey(), v, 300_000_000));
+    assert!(check_fraud_proof(bad.proof.as_ref().unwrap(), &w.prime.pubkey(), &blk(&sw, v, 100), &bounds(&sw)));
+    assert!(!check_fraud_proof(bad.proof.as_ref().unwrap(), &w.prime.pubkey(), &blk(&sw, v, 300_000_000), &bounds(&sw)));
     // a block right after the last share: the latest receipt's span [101,105] does not end below
     // height 105, so the proof also carries the in-span receipt [101,103] that brackets the window
     let sw5 = w.prime.sign_window(&WindowStatement { height: 105, block_hash: "cf".repeat(32), ..stmt.clone() }).unwrap();
-    let o5 = xbt_work::audit::audit_block(&w.work.book(), &sw5, v, 1, &[]).unwrap();
+    let o5 = xbt_work::audit::audit_block(&w.work.book(), &sw5, &blk(&sw5, v, 1), &bounds(&sw5), &[]).unwrap();
     let rs = o5.proof.as_ref().unwrap()["receipts"].as_array().unwrap().clone();
     assert_eq!(rs.len(), 2);
     assert!(rs[0]["message"].as_str().unwrap().ends_with("|101|103|1"));
-    assert!(check_fraud_proof(o5.proof.as_ref().unwrap(), &w.prime.pubkey(), v, 1));
+    assert!(check_fraud_proof(o5.proof.as_ref().unwrap(), &w.prime.pubkey(), &blk(&sw5, v, 1), &bounds(&sw5)));
     // an unattested provider is carried: the signed deferral line makes it a debt, not a shortfall
     let dl = w.prime.sign_deferral(&Deferral { prime_id: 70, height: 110, block_hash: "cd".repeat(32), identity: PROV.into(), sats: 300_000_000,
                                                 reason: "unattested".into() }).unwrap();
-    let carried = w.work.audit(&sw, std::slice::from_ref(&dl), v, 0).unwrap();
+    let carried = w.work.audit(&sw, std::slice::from_ref(&dl), &blk(&sw, v, 0)).unwrap();
     assert!(carried.ok && carried.deferred_sats == 300_000_000);
     // a forged line (another key) counts for nothing
     let forged = PrimeKey::from_seed(70, &[1u8; 32]).sign_deferral(&dl.d).unwrap();
-    assert!(!w.work.audit(&sw, &[forged], v, 0).unwrap().ok);
+    assert!(!w.work.audit(&sw, &[forged], &blk(&sw, v, 0)).unwrap().ok);
     // a later block releases the carry: paid above expected
     let sw2 = w.prime.sign_window(&WindowStatement { height: 111, block_hash: "ce".repeat(32), ..stmt.clone() }).unwrap();
-    assert!(w.work.audit(&sw2, &[], v, 600_000_000).unwrap().ok);
+    assert!(w.work.audit(&sw2, &[], &blk(&sw2, v, 600_000_000)).unwrap().ok);
     assert_eq!(w.work.carry().owed(), 0);
     // a window statement signed by another key is refused
     let other = PrimeKey::from_seed(70, &[2u8; 32]).sign_window(&stmt).unwrap();
-    assert_eq!(w.work.audit(&other, &[], v, 0).unwrap_err().code, "bad_window_sig");
+    assert_eq!(w.work.audit(&other, &[], &blk(&other, v, 0)).unwrap_err().code, "bad_window_sig");
 }
 
 #[test]
@@ -307,7 +320,7 @@ fn state_survives_a_restart() {
 #[test]
 fn credit_caps_end_to_end() {
     let w = World::new_with(None, |c| {
-        c.caps = CreditCaps { per_invoice: Some(30), total: Some(45) };
+        c.caps = CreditCaps { per_invoice: Some(30), total: Some(45), skipped: 0 };
         c.max_owed_carry_sats = Some(100_000_000);
     });
     let (pa, pb) = (w.payer(), w.payer());
@@ -339,9 +352,11 @@ fn credit_caps_end_to_end() {
     let v = 5_000_000_000u64;
     let stmt = |h: u32, c: &str| WindowStatement { prime_id: 70, height: h, block_hash: c.repeat(32), window_start: 100, window_work: 1000,
                                                   min_payout: 546, fee_bps: 0 };
-    let o = w.work.audit(&w.prime.sign_window(&stmt(104, "a1")).unwrap(), &[], v, 400_000_000).unwrap();
+    let sw = w.prime.sign_window(&stmt(104, "a1")).unwrap();
+    let o = w.work.audit(&sw, &[], &blk(&sw, v, 400_000_000)).unwrap();
     assert!(o.ok && o.proven_work == 80);
-    assert_eq!(w.work.exposure(), (35, 0));
+    // AGP-065: the held 35 lie in spans the pass counted, so they are credited covered
+    assert_eq!(w.work.exposure(), (0, 0));
     assert_eq!(w.work.balance(&ia), Some((50, 30)));
     assert_eq!(ca.request("GET", &format!("{API}/v1/a4"), b"").unwrap().status, 200);
     assert_eq!(cb.request("GET", &format!("{API}/v1/b2"), b"").unwrap().status, 200);
@@ -350,9 +365,9 @@ fn credit_caps_end_to_end() {
     let sw = w.prime.sign_window(&stmt(105, "a2")).unwrap();
     let dl = w.prime.sign_deferral(&Deferral { prime_id: 70, height: 105, block_hash: "a2".repeat(32), identity: PROV.into(), sats: 400_000_000,
                                                 reason: "unattested".into() }).unwrap();
-    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), v, 0).unwrap().ok);
+    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), &blk(&sw, v, 0)).unwrap().ok);
     // auditing it again counts the carry once
-    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), v, 0).unwrap().ok);
+    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), &blk(&sw, v, 0)).unwrap().ok);
     assert_eq!(w.work.carry().owed(), 400_000_000);
     assert_eq!(w.work.report()["credit"]["frozen"], json!("carry_cap"));
     // no new credit while it is owed: A's next receipt is held, the call refused with carry_cap
@@ -361,7 +376,8 @@ fn credit_caps_end_to_end() {
     assert_eq!(ca.request("GET", &format!("{API}/v1/a5"), b"").unwrap().status, 200);  // the last 10 of its 50
     assert_eq!(ca.request("GET", &format!("{API}/v1/a6"), b"").unwrap_err().code, "carry_cap");
     // block 106 pays the share plus the carry: released, credit flows again
-    let o = w.work.audit(&w.prime.sign_window(&stmt(106, "a3")).unwrap(), &[], v, 800_000_000).unwrap();
+    let sw = w.prime.sign_window(&stmt(106, "a3")).unwrap();
+    let o = w.work.audit(&sw, &[], &blk(&sw, v, 800_000_000)).unwrap();
     assert!(o.ok && o.expected_sats == 400_000_000);
     assert_eq!(w.work.carry().owed(), 0);
     assert_eq!(w.work.report()["credit"]["frozen"], Value::Null);
@@ -379,7 +395,8 @@ fn carry_that_keeps_growing_stops_credit() {
         let s = WindowStatement { prime_id: 70, height: h, block_hash: format!("{h:064x}"), window_start: 100, window_work: 1000, min_payout: 546, fee_bps: 0 };
         let dl = w.prime.sign_deferral(&Deferral { prime_id: 70, height: h, block_hash: s.block_hash.clone(), identity: PROV.into(), sats,
                                                     reason: "unattested".into() }).unwrap();
-        assert!(w.work.audit(&w.prime.sign_window(&s).unwrap(), &[dl], v, 0).unwrap().ok);
+        let sw = w.prime.sign_window(&s).unwrap();
+        assert!(w.work.audit(&sw, &[dl], &blk(&sw, v, 0)).unwrap().ok);
     };
     grow(110, 1_000);
     assert_eq!(w.work.report()["credit"]["frozen"], Value::Null);

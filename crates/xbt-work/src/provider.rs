@@ -16,8 +16,17 @@
 //!   [`WorkConfig::carry_growth_blocks`] audited blocks, no new credit is extended until carry is
 //!   released. A call the held work would have paid is refused with `credit_cap`, `carry_cap` or
 //!   `carry_growing` (and the balances in `work`), never with a silent loss: the receipts stay held.
+//! * AGP-065 (Guida P): the audit takes the block from the provider's own node ([`ChainBlock`]) and
+//!   holds the statement to the Prime's pinned [`PrimeTerms`]; window starts must not go backwards
+//!   between audited blocks; a block with no statement is audited too ([`WorkProvider::audit_chain`]);
+//!   a reorg undoes what an orphaned audit released ([`WorkProvider::orphaned`]); payouts are split
+//!   into liquid and locked by the node's coinbase maturity ([`WorkProvider::payouts`]). An unfunded
+//!   invoice past its TTL stays dormant for [`WorkConfig::invoice_grace_secs`] (work mined just
+//!   before expiry is still pulled and credited), issuance is limited per client, and state is
+//!   written outside the state lock, newest snapshot wins.
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,13 +34,14 @@ use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use xbt402::client::Transport;
 use xbt402::json::{dumps, obj};
-use xbt402::provider::HttpResponse;
+use xbt402::provider::{HttpResponse, PEER_HEADER};
 use xbt402::scheme::{ProviderScheme, SchemeCharge};
 use xbt402::wire::settlement_response;
 
-use crate::audit::{audit_block, AuditOutcome, CarryLedger, SignedDeferral, SignedWindow};
+use crate::audit::{audit_block, AuditBounds, AuditOutcome, CarryLedger, PrimeTerms, SignedDeferral, SignedWindow};
 use crate::auth::{auth_tag, request_digest, tag_eq};
 use crate::book::{CreditCaps, ReceiptBook};
+use crate::chain::{ChainBlock, Maturity};
 use crate::error::{fail, Result, WorkError};
 use crate::grammar::{canonical_identity, random_invoice, uint, valid_identity, U64};
 use crate::pricing::Pricing;
@@ -79,6 +89,17 @@ pub struct WorkConfig {
     pub carry_growth_blocks: Option<usize>,
     /// The chain enforces payee attestation (§13.8): the identity must be a key-path P2TR address.
     pub nta: bool,
+    /// The Prime's published pool terms: every window statement is held to them (AGP-065).
+    pub terms: PrimeTerms,
+    /// An unfunded invoice past its TTL stays dormant this long: receipts for it are still pulled
+    /// and accepted, but no new 402 names it and it never counts against `max_unfunded` once a
+    /// newer invoice needs the room (the oldest dormant one goes first).
+    pub invoice_grace_secs: u64,
+    /// Unfunded live invoices one client may hold (the TCP peer, or with `trust_forwarded` the
+    /// last `X-Forwarded-For` hop). None: no per-client limit.
+    pub max_unfunded_per_client: Option<usize>,
+    /// Take the client from the last `X-Forwarded-For` hop (behind a reverse proxy that sets it).
+    pub trust_forwarded: bool,
 }
 
 impl WorkConfig {
@@ -86,9 +107,13 @@ impl WorkConfig {
         Self { network: network.into(), identity: canonical_identity(identity), prime_id, prime_pubkey_hex: prime_pubkey_hex.into(),
                receipt_url: receipt_url.into(), relay_url: None, amount: Amount::Fixed(1), invoice_price_sats: 0,
                invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
-               max_owed_carry_sats: None, carry_growth_blocks: None, nta: false }
+               max_owed_carry_sats: None, carry_growth_blocks: None, nta: false, terms: PrimeTerms::default(), invoice_grace_secs: 3600,
+               max_unfunded_per_client: Some(16), trust_forwarded: false }
     }
 }
+
+/// Audited blocks deeper than this below the newest one are settled ([`ReceiptBook::settle`]).
+pub const SETTLE_DEPTH: u32 = 144;
 
 #[derive(Debug, Clone)]
 struct Invoice {
@@ -98,6 +123,8 @@ struct Invoice {
     spent: u64,
     expires_at: u64,
     retired: bool,
+    /// Who asked for it (the per-client limit; not persisted).
+    client: Option<String>,
 }
 
 struct State {
@@ -117,6 +144,16 @@ pub struct WorkProvider {
     /// The pricing rule in force (`cfg.amount` at start, then each epoch's).
     rule: Mutex<Amount>,
     state: Mutex<State>,
+    /// Bumped by each snapshot: the writer never replaces a newer snapshot with an older one.
+    generation: AtomicU64,
+    /// The generation last written. Lock order: `state`, then `writer`.
+    writer: Mutex<u64>,
+}
+
+/// A window statement for a block, or the Prime's answer that it has none.
+pub enum Statement<'a> {
+    Found(&'a SignedWindow, &'a [SignedDeferral]),
+    Missing,
 }
 
 fn now() -> u64 {
@@ -144,7 +181,9 @@ impl WorkProvider {
         let pubkey = pubkey_from_hex(&cfg.prime_pubkey_hex).map_err(|e| WorkError::new("bad_config", e.0))?;
         let mut book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);
         book.caps = cfg.caps;
-        let wp = Self { pubkey, rule: Mutex::new(cfg.amount.clone()), state: Mutex::new(State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None }), cfg };
+        cfg.terms.bounds(&ChainBlock { height: 0, hash: String::new(), value_sats: 0, paid_sats: 0, bits: 0x1d00ffff, prev_bits: 0x1d00ffff })?;
+        let st = State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None };
+        let wp = Self { pubkey, rule: Mutex::new(cfg.amount.clone()), state: Mutex::new(st), generation: AtomicU64::new(0), writer: Mutex::new(0), cfg };
         wp.load()?;
         wp.carry_rules(&mut wp.lock());
         Ok(wp)
@@ -241,20 +280,43 @@ impl WorkProvider {
 
     /// §4.5: issue an invoice. `too_many_invoices` beyond the bound of unfunded ones.
     pub fn issue_invoice(&self) -> Result<Value> {
+        self.issue_invoice_for(None)
+    }
+
+    /// Issue an invoice to `client` (see [`WorkConfig::max_unfunded_per_client`]).
+    pub fn issue_invoice_for(&self, client: Option<&str>) -> Result<Value> {
         let amount = self.amount(self.cfg.invoice_price_sats)?;
         let (inv, key, exp) = {
             let mut st = self.lock();
             let t = now();
+            let grace = self.cfg.invoice_grace_secs;
             let State { invoices, book, .. } = &mut *st;
-            invoices.retain(|k, v| book.funded(k) || v.expires_at >= t);
-            let unfunded = invoices.keys().filter(|k| !book.funded(k)).count();
-            if unfunded >= self.cfg.max_unfunded {
-                return fail("too_many_invoices", "");
+            invoices.retain(|k, v| book.funded(k) || v.expires_at.saturating_add(grace) >= t);
+            let mut unfunded: Vec<(u64, String)> = invoices.iter().filter(|(k, _)| !book.funded(k)).map(|(k, v)| (v.expires_at, k.clone())).collect();
+            if unfunded.len() >= self.cfg.max_unfunded {
+                // make room from the dormant ones, oldest first; live ones are never evicted
+                unfunded.sort();
+                let excess = unfunded.len() + 1 - self.cfg.max_unfunded.max(1);
+                let dormant: Vec<String> = unfunded.iter().take_while(|(e, _)| *e < t).take(excess).map(|(_, k)| k.clone()).collect();
+                if dormant.len() < excess {
+                    return fail("too_many_invoices", "");
+                }
+                for k in dormant {
+                    invoices.remove(&k);
+                }
+            }
+            if let (Some(c), Some(max)) = (client, self.cfg.max_unfunded_per_client) {
+                let mine = invoices.iter().filter(|(k, v)| v.client.as_deref() == Some(c) && v.expires_at >= t && !book.funded(k)).count();
+                if mine >= max {
+                    return fail("too_many_invoices", "this client holds its limit of unfunded invoices");
+                }
             }
             let inv = random_invoice();
             let (key, exp) = (random32(), t + self.cfg.invoice_ttl_secs);
-            invoices.insert(inv.clone(), Invoice { key, n: 0, spent: 0, expires_at: exp, retired: false });
-            self.save(&st)?;
+            invoices.insert(inv.clone(), Invoice { key, n: 0, spent: 0, expires_at: exp, retired: false, client: client.map(str::to_string) });
+            let snap = self.snapshot(&st);
+            drop(st);
+            self.write(snap)?;
             (inv, key, exp)
         };
         let id = &self.cfg.identity;
@@ -285,11 +347,13 @@ impl WorkProvider {
         Some((st.book.credited.get(invoice).copied().unwrap_or(0), i.spent))
     }
 
-    /// The live invoices (funded, or unfunded and not expired).
+    /// The invoices receipts are pulled for: funded, or unfunded and not past TTL plus grace.
     pub fn invoices(&self) -> Vec<String> {
         let st = self.lock();
         let t = now();
-        let mut v: Vec<String> = st.invoices.iter().filter(|(k, i)| !i.retired && (st.book.credited.contains_key(*k) || st.book.funded(k) || i.expires_at >= t))
+        let grace = self.cfg.invoice_grace_secs;
+        let mut v: Vec<String> = st.invoices.iter()
+            .filter(|(k, i)| !i.retired && (st.book.credited.contains_key(*k) || st.book.funded(k) || i.expires_at.saturating_add(grace) >= t))
             .map(|(k, _)| k.clone()).collect();
         v.sort();
         v
@@ -307,7 +371,9 @@ impl WorkProvider {
             return fail("unknown_invoice", "not an invoice this provider issued");
         }
         let r = st.book.accept(s, &s.receipt.invoice.clone());
-        self.save(&st)?;
+        let snap = self.snapshot(&st);
+        drop(st);
+        self.write(snap)?;
         r
     }
 
@@ -332,35 +398,118 @@ impl WorkProvider {
         out
     }
 
-    /// §10.3 for one pool coinbase: records the verdict (and the carry it defers or releases). Auditing
-    /// a block again (more receipts, the statement's lines fetched again) replaces its earlier verdict
-    /// and carry, so nothing is counted twice. A pass covers every credit with shares below the block
-    /// (§13.1): held work is credited as far as the caps then allow.
-    pub fn audit(&self, sw: &SignedWindow, deferred: &[SignedDeferral], coinbase_value_sats: u64, paid_sats: u64) -> Result<AuditOutcome> {
+    /// The bounds a statement for `block` is held to under the pinned terms.
+    pub fn bounds(&self, block: &ChainBlock) -> Result<AuditBounds> {
+        self.cfg.terms.bounds(block)
+    }
+
+    /// §10.3 for one pool coinbase, `block` as the provider's node has it: records the verdict (and
+    /// the carry it defers or releases). Auditing a block again (more receipts, the statement's
+    /// lines fetched again) replaces its earlier verdict and carry, so nothing is counted twice. A
+    /// pass covers only the credit its bound counted (§13.1, AGP-065): held work is credited as far
+    /// as the caps then allow. A statement whose window start is below that of an audited block
+    /// beneath it (or above one over it) is refused with `window_start_regressed`, recording
+    /// nothing: the block's credit stays held.
+    pub fn audit(&self, sw: &SignedWindow, deferred: &[SignedDeferral], block: &ChainBlock) -> Result<AuditOutcome> {
+        let bounds = self.bounds(block)?;
         let mut st = self.lock();
-        let o = audit_block(&st.book, sw, coinbase_value_sats, paid_sats, deferred)?;
-        st.carry.record(sw.stmt.height, &o);
-        let mut released = 0;
+        let o = audit_block(&st.book, sw, block, &bounds, deferred)?;
+        let (h, ws) = (sw.stmt.height, sw.stmt.window_start);
+        for a in &st.audits {
+            let (Some(ah), Some(aws)) = (a.get("height").and_then(Value::as_u64), a.get("windowStart").and_then(Value::as_u64)) else { continue };
+            if (ah < u64::from(h) && aws > u64::from(ws)) || (ah > u64::from(h) && aws < u64::from(ws)) {
+                return fail("window_start_regressed", format!("window start {ws} at {h}, {aws} at {ah}"));
+            }
+        }
+        st.carry.record(h, &o);
         if !o.ok && st.distrust.is_none() {
-            st.distrust = Some(("wrong_prime".into(), format!("the Prime's coinbase at height {} failed the audit", sw.stmt.height)));
+            st.distrust = Some(("wrong_prime".into(), format!("the Prime's coinbase at height {h} failed the audit")));
         }
         self.carry_rules(&mut st);
-        if o.ok {
-            released = st.book.audited(sw.stmt.height);
-            st.book.release_held();
-        }
-        let mut rec = obj([("height", sw.stmt.height.into()), ("blockHash", sw.stmt.block_hash.clone().into()), ("ok", o.ok.into()),
-                           ("expectedSats", o.expected_sats.into()), ("paidSats", paid_sats.into()), ("deferredSats", o.deferred_sats.into()),
-                           ("provenWork", o.proven_work.into()), ("coveredWork", released.into()),
+        let covered = st.book.audited(h, ws, o.ok);
+        st.book.release_held();
+        let mut rec = obj([("height", h.into()), ("blockHash", block.hash.clone().into()), ("ok", o.ok.into()),
+                           ("expectedSats", o.expected_sats.into()), ("paidSats", block.paid_sats.into()), ("deferredSats", o.deferred_sats.into()),
+                           ("belowMinSats", o.below_min_sats.into()), ("provenWork", o.proven_work.into()), ("coveredWork", covered.into()),
+                           ("windowStart", ws.into()), ("windowWork", o.window_work.into()), ("bounded", o.bounded.into()),
                            ("owedCarrySats", st.carry.owed().into())]);
         if let Some(p) = &o.proof {
             rec["proof"] = p.clone();
         }
-        let (h, hash) = (u64::from(sw.stmt.height), sw.stmt.block_hash.as_str());
-        st.audits.retain(|a| !(a.get("height").and_then(Value::as_u64) == Some(h) && a.get("blockHash").and_then(Value::as_str) == Some(hash)));
-        st.audits.push(rec);
-        self.save(&st)?;
+        self.record(&mut st, rec)?;
         Ok(o)
+    }
+
+    /// Audit `block` whether or not the Prime published a statement for it (Guida P4). A missing
+    /// statement for a coinbase that paid the identity fails the audit (the Prime paid as the pool
+    /// but will not say for what) and distrusts the Prime; for one that paid nothing it records
+    /// nothing and covers nothing, so the credit stays held. Returns None for that case.
+    pub fn audit_chain(&self, block: &ChainBlock, stmt: Statement<'_>) -> Result<Option<AuditOutcome>> {
+        match stmt {
+            Statement::Found(sw, deferred) => self.audit(sw, deferred, block).map(Some),
+            Statement::Missing if block.paid_sats == 0 => Ok(None),
+            Statement::Missing => {
+                let mut st = self.lock();
+                if st.distrust.is_none() {
+                    st.distrust = Some(("missing_statement".into(), format!("the coinbase at height {} paid the identity with no window statement", block.height)));
+                }
+                st.carry.forget(block.height);
+                let rec = obj([("height", block.height.into()), ("blockHash", block.hash.clone().into()), ("ok", false.into()),
+                               ("paidSats", block.paid_sats.into()), ("missingStatement", true.into())]);
+                self.record(&mut st, rec)?;
+                Ok(Some(AuditOutcome { ok: false, expected_sats: 0, paid_sats: block.paid_sats, deferred_sats: 0, below_min_sats: 0, proven_work: 0,
+                                       window_work: 0, fee_bps: 0, min_payout: 0, bounded: false, proof: None }))
+            }
+        }
+    }
+
+    fn record(&self, st: &mut MutexGuard<'_, State>, rec: Value) -> Result<()> {
+        let h = rec.get("height").and_then(Value::as_u64);
+        st.audits.retain(|a| a.get("height").and_then(Value::as_u64) != h);
+        st.audits.push(rec);
+        st.audits.sort_by_key(|a| a.get("height").and_then(Value::as_u64));
+        // settle what lies deeper than any reorg the audit loop expects
+        let newest = st.audits.last().and_then(|a| a.get("height")?.as_u64()).unwrap_or(0);
+        let deep = st.audits.iter().rev().find_map(|a| {
+            let h = a.get("height")?.as_u64()?;
+            (h.saturating_add(u64::from(SETTLE_DEPTH)) <= newest).then_some((h, a.get("windowStart")?.as_u64()?))
+        });
+        if let Some((h, ws)) = deep {
+            st.book.settle(u32::try_from(h).unwrap_or(u32::MAX), u32::try_from(ws).unwrap_or(u32::MAX));
+        }
+        self.save(st)
+    }
+
+    /// The audited blocks: (height, hash), lowest first. The audit loop checks them against its node.
+    pub fn audited_blocks(&self) -> Vec<(u32, String)> {
+        self.lock().audits.iter().filter_map(|a| Some((u32::try_from(a.get("height")?.as_u64()?).ok()?, a.get("blockHash")?.as_str()?.to_string()))).collect()
+    }
+
+    /// The audited block at `height` left the chain (Guida P6): its verdict, carry and the credit it
+    /// covered are undone (the spans it resolved are open again, counting against the caps). Returns
+    /// the credit that is unaudited again, or None when no audit was recorded there.
+    pub fn orphaned(&self, height: u32) -> Result<Option<u64>> {
+        let mut st = self.lock();
+        let before = st.audits.len();
+        st.audits.retain(|a| a.get("height").and_then(Value::as_u64) != Some(u64::from(height)));
+        if st.audits.len() == before {
+            return Ok(None);
+        }
+        st.carry.forget(height);
+        let back = st.book.uncover(height);
+        self.carry_rules(&mut st);
+        self.save(&st)?;
+        Ok(Some(back))
+    }
+
+    /// What the audited coinbases paid the identity at chain height `tip`, split by the node's
+    /// coinbase maturity: (liquid, locked) sats. A locked payout counts as paid for the audit (the
+    /// coinbase paid the identity) but cannot be spent yet: a provider that sells credit against
+    /// its payouts should count only the liquid part as money in hand.
+    pub fn payouts(&self, tip: u32, maturity: &Maturity) -> (u64, u64) {
+        let st = self.lock();
+        st.audits.iter().filter_map(|a| Some((u32::try_from(a.get("height")?.as_u64()?).ok()?, a.get("paidSats")?.as_u64()?)))
+            .fold((0u64, 0u64), |(l, k), (h, p)| if maturity.relay_at(h) <= tip.saturating_add(1) { (l.saturating_add(p), k) } else { (l, k.saturating_add(p)) })
     }
 
     pub fn carry(&self) -> CarryLedger {
@@ -371,8 +520,14 @@ impl WorkProvider {
     pub fn report(&self) -> Value {
         let st = self.lock();
         let caps = |c: Option<u64>| c.map(Value::from).unwrap_or(Value::Null);
+        let t = &self.cfg.terms;
         let credit = obj([("unauditedWork", st.book.unaudited_work(None).into()), ("heldWork", st.book.held_total().into()),
+                          ("skippedWork", st.book.skipped_work().into()),
                           ("capInvoiceWork", caps(st.book.caps.per_invoice)), ("capTotalWork", caps(st.book.caps.total)),
+                          ("forgivenSkippedWork", st.book.caps.skipped.into()),
+                          ("primeTerms", obj([("window", t.window.into()), ("windowMinWork", t.window_min_work.into()),
+                                              ("windowToleranceBps", t.window_tolerance_bps.into()), ("feeBps", t.fee_bps.into()),
+                                              ("maxMinPayout", t.max_min_payout.into())])),
                           ("maxOwedCarrySats", caps(self.cfg.max_owed_carry_sats)),
                           ("frozen", st.book.frozen.clone().map(Value::from).unwrap_or(Value::Null))]);
         obj([("audits", st.audits.clone().into()), ("carry", st.carry.to_json()), ("credit", credit),
@@ -383,27 +538,59 @@ impl WorkProvider {
 
     // --- durable state ------------------------------------------------------------------------
 
+    /// Write the state while holding the state lock (paths that keep using it after the write).
     fn save(&self, st: &State) -> Result<()> {
-        let Some(path) = &self.cfg.state_path else { return Ok(()) };
+        self.write(self.snapshot(st))
+    }
+
+    /// Serialise the state for [`WorkProvider::write`], which may run after the state lock is
+    /// released. Taken only under the state lock, so generations follow the state's order.
+    fn snapshot(&self, st: &State) -> Option<(u64, String)> {
+        self.cfg.state_path.as_ref()?;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Some((generation, dumps(&self.state_doc(st))))
+    }
+
+    /// Write a snapshot unless a newer one was written already. A failed write leaves the
+    /// generation unwritten, so an older snapshot may still land; its caller gets the error.
+    fn write(&self, snap: Option<(u64, String)>) -> Result<()> {
+        let (Some(path), Some((generation, body))) = (&self.cfg.state_path, snap) else { return Ok(()) };
+        let mut last = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if generation <= *last {
+            return Ok(());
+        }
+        crate::fsx::write_private(path, body.as_bytes()).map_err(|e| WorkError::new("state_io", e.to_string()))?;
+        *last = generation;
+        Ok(())
+    }
+
+    fn state_doc(&self, st: &State) -> Value {
         let inv: serde_json::Map<String, Value> = st.invoices.iter().map(|(k, i)| {
             (k.clone(), obj([("key", hex::encode(i.key).into()), ("n", i.n.into()), ("spent", i.spent.into()),
                              ("expiresAt", i.expires_at.into()), ("retired", i.retired.into())]))
         }).collect();
-        let doc = obj([("version", 1.into()), ("identity", self.cfg.identity.clone().into()), ("invoices", Value::Object(inv)),
+        obj([("version", 2.into()), ("identity", self.cfg.identity.clone().into()), ("invoices", Value::Object(inv)),
                        ("book", st.book.to_json()), ("audits", st.audits.clone().into()),
                        ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into()),
                                       ("blocks", st.carry.blocks.iter().map(|(h, e, p, d)| Value::from(vec![Value::from(*h), Value::from(*e), Value::from(*p), Value::from(*d)])).collect::<Vec<_>>().into())])),
-                       ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null))]);
-        crate::fsx::write_private(path, dumps(&doc).as_bytes()).map_err(|e| WorkError::new("state_io", e.to_string()))
+                       ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null))])
     }
 
     fn load(&self) -> Result<()> {
         let Some(path) = &self.cfg.state_path else { return Ok(()) };
-        let Ok(raw) = std::fs::read(path) else { return Ok(()) };
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(WorkError::new("state_io", e.to_string())),
+        };
         let bad = |w: &str| WorkError::new("bad_state", w.to_string());
         let v = xbt402::json::parse_slice(&raw).map_err(|_| bad("not JSON"))?;
         if v.get("identity").and_then(Value::as_str) != Some(self.cfg.identity.as_str()) {
             return Err(bad("state is for another identity"));
+        }
+        // version 1 (AGP-032/043) migrates: the book rebuilds its spans from `unaudited`
+        if !matches!(v.get("version").and_then(Value::as_u64), Some(1 | 2)) {
+            return Err(bad("unknown state version"));
         }
         let mut st = self.lock();
         for (k, i) in v.get("invoices").and_then(Value::as_object).into_iter().flatten() {
@@ -411,7 +598,7 @@ impl WorkProvider {
                 .ok_or_else(|| bad("invoice key"))?;
             let u = |f: &str| i.get(f).and_then(Value::as_u64).ok_or_else(|| bad(f));
             st.invoices.insert(k.clone(), Invoice { key, n: u("n")?, spent: u("spent")?, expires_at: u("expiresAt")?,
-                                                   retired: i.get("retired").and_then(Value::as_bool).unwrap_or(false) });
+                                                   retired: i.get("retired").and_then(Value::as_bool).unwrap_or(false), client: None });
         }
         if let Some(b) = v.get("book") {
             st.book.load(b)?;
@@ -459,9 +646,12 @@ impl WorkProvider {
         let mut st = self.lock();
         let t = now();
         let State { invoices, book, .. } = &mut *st;
-        // 4. issued here, not expired (unfunded), not retired
-        let funded = book.funded(&r.invoice);
-        let Some(inv) = invoices.get_mut(&r.invoice).filter(|i| !i.retired && (funded || i.expires_at >= t)) else {
+        // 4. issued here, not expired (unfunded), not retired; a dormant invoice (past TTL, within
+        // the grace) is live again once a receipt shows work on it
+        let funded = book.funded(&r.invoice) || r.cum_work > 0;
+        let grace = self.cfg.invoice_grace_secs;
+        let Some(inv) = invoices.get_mut(&r.invoice).filter(|i| !i.retired && (i.expires_at >= t || (funded && i.expires_at.saturating_add(grace) >= t)
+                                                                                    || book.funded(&r.invoice))) else {
             return refuse("unknown_invoice");
         };
         // 5. auth over this request and receipt state, n fresh; n is consumed from here on
@@ -474,7 +664,9 @@ impl WorkProvider {
         // a Prime key that equivocated or failed an audit is no longer trusted
         if let Some((code, _)) = &st.distrust {
             let code = code.clone();
-            let _ = self.save(&st);
+            let snap = self.snapshot(&st);
+            drop(st);
+            let _ = self.write(snap);
             return Err((code, None));
         }
         let State { invoices, book, distrust, .. } = &mut *st;
@@ -486,7 +678,9 @@ impl WorkProvider {
                 if e.code == "equivocation" {
                     *distrust = Some(("equivocation".into(), e.msg.clone()));
                 }
-                let _ = self.save(&st);
+                let snap = self.snapshot(&st);
+                drop(st);
+                let _ = self.write(snap);
                 let code = if e.code == "wrong_invoice" { "unknown_invoice".to_string() } else { e.code };
                 return Err((code, None));
             }
@@ -514,15 +708,23 @@ impl WorkProvider {
             } else {
                 "insufficient_work".into()
             };
-            let _ = self.save(&st);
+            let snap = self.snapshot(&st);
+            drop(st);
+            let _ = self.write(snap);
             return Err((code, Some(work)));
         }
         inv.spent += amount;
         let spent = inv.spent;
-        // recorded before the handler runs (§9.2 step 1); a failed write refuses the call
-        if self.save(&st).is_err() {
-            let inv = st.invoices.get_mut(&invoice).expect("checked above");
-            inv.spent -= amount;
+        // recorded before the handler runs (§9.2 step 1), written outside the state lock; a failed
+        // write refuses the call
+        let snap = self.snapshot(&st);
+        drop(st);
+        if self.write(snap).is_err() {
+            let mut st = self.lock();
+            if let Some(inv) = st.invoices.get_mut(&invoice) {
+                inv.spent = inv.spent.saturating_sub(amount);
+            }
+            let _ = self.save(&st);
             return Err(("state_io".into(), None));
         }
         Ok(WorkCharge { invoice, amount, delta, credited, spent, seq, n, req, network: self.cfg.network.clone(), provider: None })
@@ -588,7 +790,7 @@ impl ProviderScheme for WorkScheme {
         self.0.amount(price_sats).ok().map(|a| self.0.requirements_for(a, price_sats))
     }
 
-    fn control(&self, method: &str, path: &str, _headers: &[(String, String)], _body: &[u8]) -> Option<HttpResponse> {
+    fn control(&self, method: &str, path: &str, headers: &[(String, String)], _body: &[u8]) -> Option<HttpResponse> {
         if path.split('?').next() != Some(INVOICE_PATH) {
             return None;
         }
@@ -597,7 +799,10 @@ impl ProviderScheme for WorkScheme {
         if method != "POST" && method != "GET" {
             return Some(HttpResponse::new(405, vec![], b"method not allowed".to_vec()));
         }
-        Some(match self.0.issue_invoice() {
+        let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        let forwarded = header("X-Forwarded-For").and_then(|v| v.rsplit(',').next()).map(str::trim).filter(|v| !v.is_empty());
+        let client = if self.0.cfg.trust_forwarded { forwarded.or(header(PEER_HEADER)) } else { header(PEER_HEADER) };
+        Some(match self.0.issue_invoice_for(client) {
             Ok(doc) => json(200, &doc),
             Err(e) if e.code == "too_many_invoices" => json(429, &obj([("error", "too_many_invoices".into())])),
             Err(e) => json(500, &obj([("error", e.code.into())])),

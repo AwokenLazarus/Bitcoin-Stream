@@ -79,7 +79,7 @@ fn watcher_refunds_at_expiry_only_and_after_rotation_pays_the_new_hot_key() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({}), false);
     let (chan, expiry) = opened(&rig);
-    rig.call("rotate_hot_key", json!({}));
+    rig.rotate_hot_key();
     let new_spk = rig.hot_spk();
     rig.chain.mine_to(expiry - 1);
     assert!(!rig.call("watch_tick", json!({}))["actions"].to_string().contains("refund"));

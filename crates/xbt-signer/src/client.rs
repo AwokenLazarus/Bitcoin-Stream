@@ -113,6 +113,11 @@ impl StateSigner for RemoteSigner {
                                                              "next_capacity": next_capacity}))?, "sig")
     }
 
+    fn sign_rollover_next(&self, chan: &str, amount: u64, next: &ChannelParams, next_capacity: u64) -> xbt402::Result<Vec<u8>> {
+        hex_field(&self.call("xbt402_sign_rollover", json!({"chan": chan, "amount": amount, "next_spk": hex::encode(next.spk()),
+                                                             "next_capacity": next_capacity, "next": next.to_json()}))?, "sig")
+    }
+
     fn sign_close(&self, chan: &str) -> xbt402::Result<Vec<u8>> {
         hex_field(&self.call("xbt402_sign_close", json!({"chan": chan}))?, "sig")
     }
@@ -163,9 +168,16 @@ impl RouteSigner for RemoteSigner {
 }
 
 impl Wallet for RemoteSigner {
-    /// The signer's `fund` (a 0x21 funding from its hot key).
+    /// The signer funds only channels for keys it issued (AGP-063 W3): see [`Wallet::fund_channel`].
     fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
         let v = self.call("fund", json!({"address": address, "sats": sats}))?;
+        Ok((v.get("txid").and_then(Value::as_str).unwrap_or("").to_string(), v.get("vout").and_then(Value::as_u64).unwrap_or(0) as u32))
+    }
+
+    /// The signer's `fund` of the channel for the key it issued for `origin` (a 0x21 funding from
+    /// its hot key); it checks the channel against the seller's verified terms and its policy first.
+    fn fund_channel(&self, origin: &str, params: &ChannelParams, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let v = self.call("fund", json!({"origin": origin, "params": params.to_json(), "address": address, "sats": sats}))?;
         Ok((v.get("txid").and_then(Value::as_str).unwrap_or("").to_string(), v.get("vout").and_then(Value::as_u64).unwrap_or(0) as u32))
     }
 }

@@ -12,6 +12,7 @@
 //! | `XBT_UI_SESSION_IDLE_S` / `XBT_UI_SESSION_MAX_S` | 900 / 28800 | session idle and absolute lifetimes |
 //! | `XBT_UI_SECURE_COOKIE` | `auto` | `1`: always `Secure`; `0`: never; `auto`: when the request came over https (`X-Forwarded-Proto`) |
 //! | `XBT_UI_ALLOW_IPS` | (all) | comma-separated peer IPs or prefixes (`10.21.0.`) allowed to connect, e.g. only the box's app proxy |
+//! | `XBT_UI_ALLOWED_HOSTS` | | extra host names the UI answers to, comma-separated (`wallet.example.com`; `*`: any). Always allowed: IP literals, single-label names (`localhost`, a container name), `*.local`, `*.localhost`, `*.onion` (AGP-063 W4: a DNS rebinding of the box's address is refused) |
 //! | `XBT_UI_SETUP_OPEN` | `0` | `1`: the first-run password setup needs no setup code (a proxy already authenticated the owner) |
 //! | `XBT_UI_HUB_URL` | | this box's own xbt402 hub, shown on the Hub page |
 //! | `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page: a link on the Overview and Hub pages (one dashboard for an operator) |
@@ -33,6 +34,7 @@ pub struct Config {
     pub session_max: Duration,
     pub secure_cookie: Option<bool>,
     pub allow_ips: Vec<String>,
+    pub allowed_hosts: Vec<String>,
     pub setup_open: bool,
     pub hub_url: Option<String>,
     pub cmp_url: Option<String>,
@@ -96,6 +98,7 @@ impl Config {
             session_max: Duration::from_secs(secs("XBT_UI_SESSION_MAX_S", 28_800)),
             secure_cookie,
             allow_ips: env("XBT_UI_ALLOW_IPS").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
+            allowed_hosts: env("XBT_UI_ALLOWED_HOSTS").map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
             setup_open: env("XBT_UI_SETUP_OPEN").as_deref() == Some("1"),
             hub_url: env("XBT_UI_HUB_URL").map(|u| u.trim_end_matches('/').to_string()),
             cmp_url: env("XBT_UI_CMP_URL").filter(|u| u.starts_with("http://") || u.starts_with("https://") || u.starts_with('/')),
@@ -112,7 +115,7 @@ impl Config {
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
-               session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], setup_open: false, hub_url: None, cmp_url: None,
+               session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, hub_url: None, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4 }
     }
 }

@@ -46,6 +46,22 @@ fn is_loopback(addr: &str) -> bool {
     matches!(host.trim_start_matches('[').trim_end_matches(']'), "127.0.0.1" | "localhost" | "::1")
 }
 
+/// AGP-063 X1: without a data dir, the token generated on first run and kept next to the signer
+/// socket (`<run dir>/mcp-http-token`, 0600): the agent's MCP client config reads it from there.
+fn local_token() -> Result<String, String> {
+    let sock = env("B2_SIGNER_SOCK").filter(|s| !s.starts_with("tcp://")).map(PathBuf::from)
+        .unwrap_or_else(|| env("B2_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".run").join("signer.sock"));
+    let p = sock.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")).join("mcp-http-token");
+    if std::fs::symlink_metadata(&p).is_ok() {
+        eprintln!("xbt-wallet-mcp: bearer token from {}", p.display());
+        return read_token_file(&p);
+    }
+    let t = xbt_svc::to_hex(&xbt_svc::random_bytes(32));
+    xbt_svc::replace_secret_file(&p, format!("{t}\n").as_bytes(), 0o600).map_err(|e| format!("{}: {e} (set XBT_MCP_HTTP_TOKEN_FILE)", p.display()))?;
+    eprintln!("xbt-wallet-mcp: bearer token generated in {} (Authorization: Bearer <token>)", p.display());
+    Ok(t)
+}
+
 /// The signer answers `health`, and its readiness file (when there is one) is fresh and ok.
 fn readiness(wallet: Arc<Wallet>, ready_file: Option<PathBuf>) -> ReadyFn {
     Arc::new(move || {
@@ -130,6 +146,9 @@ fn main() {
     let Some(addr) = addr else { return serve_stdio(server) };
     let remote = !is_loopback(&addr);
     let allow_remote = args.iter().any(|a| a == "--http-allow-remote") || env_bool("XBT_MCP_HTTP_ALLOW_REMOTE", data.is_some());
+    if remote && !allow_remote {
+        die(&format!("{addr}: not a loopback address (pass --http-allow-remote with XBT_MCP_HTTP_TOKEN to listen elsewhere)"));
+    }
     // the token: the old env value (dev mode), else the secret; a non-loopback listener always needs one
     let secrets = Secrets::for_component(data.as_ref(), xbt_svc::MCP, mode);
     // AGP-042: the UI's token file (read-only here), when there is one
@@ -159,12 +178,20 @@ fn main() {
                     eprintln!("xbt-wallet-mcp: bearer token from {}", s.origin);
                     Some(s.text().unwrap_or_else(|e| die(&e))).filter(|t| !t.is_empty())
                 }
-                None => None,
+                None if secrets.dir.is_some() => {
+                    let s = secrets.get_or_create("mcp-http-token", || xbt_svc::to_hex(&xbt_svc::random_bytes(32)).into_bytes()).unwrap_or_else(|e| die(&e));
+                    eprintln!("xbt-wallet-mcp: bearer token generated in {}", s.origin);
+                    Some(s.text().unwrap_or_else(|e| die(&e)))
+                }
+                None if remote => None,
+                None => Some(local_token().unwrap_or_else(|e| die(&e))),
             }
         }
     };
+    let allowed_origins = env("XBT_MCP_ALLOWED_ORIGINS").map(|v| v.split(',').map(|o| o.trim().trim_end_matches('/').to_string()).filter(|o| !o.is_empty()).collect())
+        .unwrap_or_default();
     let ready_file = env("XBT_SIGNER_READY_FILE").map(PathBuf::from).or_else(|| data.as_ref().map(DataDir::signer_ready));
-    let cfg = HttpConfig { addr, path, token, token_file, allow_remote, base, ready: Some(readiness(wallet, ready_file)) };
+    let cfg = HttpConfig { addr, path, token, token_file, allow_remote, allowed_origins, base, ready: Some(readiness(wallet, ready_file)) };
     if let Err(e) = serve_http(server, cfg) {
         die(&e);
     }

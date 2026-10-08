@@ -64,7 +64,7 @@ binfmt/qemu).
 Dependencies: `secp256k1` 0.29 (libsecp256k1, the global context), `sha2`, `ripemd`, `blake2`,
 `hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order` (never
 `arbitrary_precision`, AGP-035), `base64`, `thiserror`,
-`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`) and `tiny_http` (`http-server`).
+`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`). The `http-server` feature is std only (AGP-068).
 std only; no_std isn't a goal.
 
 ## API overview
@@ -139,7 +139,7 @@ untrusted input: parsers and the provider are fuzzed with hostile bytes and JSON
 
 ## Conformance statement
 
-`scripts/conformance.sh` (2026-09-28):
+`scripts/conformance.sh` (2026-10-08, AGP-068):
 
 The vectors come from our own Python references (B1, B2) and from Knots. B1 and B2 are not yet
 published, so the B1/B2 groups show agreement between our two implementations, not conformance to
@@ -147,11 +147,11 @@ an outside implementation. The UnifiedSighash vectors are Knots' own file, byte 
 
 | group | vectors | source | result |
 |---|---|---|---|
-| xbt402 v1.1 + v1.2 (counted as `check_vectors.py` counts them) | 50 | B1 agp-029 `docs/x402/vectors.json` | 50/50 byte-identical |
+| xbt402 v1.1 to v1.3 (counted as `check_vectors.py` counts them) | 54 | B1 agp-068 `docs/x402/vectors.json` | 54/54 byte-identical |
 | UnifiedSighash (Knots hf-sighash-opt-in reference) | 166 | B1 `tests/data/unified_sighash.json` | 166/166 |
 | BLAKE2b header v2, every hash stage | 5 | B2 `tests/vectors/block_header_v2.json` | 5/5 |
 | Knots BLAKE2b regtest capture: 24 headers across v1/v2, 3 blocks' merkle roots, a header chain | 28 | B2 `tests/vectors/blake2b_regtest.json` | 28/28 |
-| **total** | **249** | | **249/249** |
+| **total** | **253** | | **253/253** |
 
 It works in both directions:
 
@@ -215,6 +215,10 @@ payer paid, `unpaidMsat` = `spent − cum × 1000`, and a payee-pays answer adds
 `provider_report_fee`.
 
 ## Hub routing (AGP-026)
+
+> **Experimental.** The hub (`RouteHub`, `xbt402-hub`, `RoutePayer`'s routing) is not
+> production-ready: do not route funds you cannot lose. `xbt402-hub` says so when it starts. No flag
+> is needed, so the demos keep running. See "Hub routing safety (AGP-064)".
 
 A port of B1 agp-023 `xbt402/adaptor.py`, `route.py`, `hub.py`, `route_client.py` and the provider's
 routing endpoints (AGP-021 + AGP-023 v1.2), wire-compatible in every direction.
@@ -860,11 +864,367 @@ then cannot bind it (`Address already in use`; it cost three runs their start to
 therefore waits for a process's "ready" line before it polls its port, and starts one that exited
 before that line again.
 
+## Hub routing safety (AGP-064)
+From Chris Guida's external review of the hub: two High findings, H1 and H2, where the hub could pay a
+provider on ch2 without being able to collect from the client on ch1. There was also a test-only
+nonce API in the library. Both were still present on `main` (`c8d607b`), and the tests below
+reproduce each one there. The same changes are in B1 `agp-064-w4`, with the same test names. The
+hub is now marked **experimental** (above, and in `xbt402-hub`'s startup log).
+
+**H1: a ch1 close while a lock is in flight.** `route()` writes ch1's `route_lock`, lets go of
+ch1's ledger, and then forwards to the provider for up to `reveal_timeout`. A cooperative close in
+that gap closed ch1 below the lock, and the provider was still paid on ch2.
+* The provider's `POST /x402/xbt-channel/close` now refuses a close with `lock_pending` while ch1
+  has a routed lock its best state does not cover: the lock in flight, or a written-off lock above
+  `best_cum`. A written-off lock that `best_cum` covers does not block. `close_channel` (AGP-059)
+  uses the same test.
+* The margin close lets a lock in flight finish, but only in the first half of the margin (the
+  lock takes seconds). It never waits for a written-off lock: a skipped margin close would let the
+  payer refund the whole channel at expiry.
+* A lock that completes after ch1 was closed below it (an operator's `close_now`, or a margin close
+  past its wait) is never counted as routed. It is counted in `HubStats::uncollected`, and the
+  event is `lock_uncollected`.
+* A ch1 lock that no route is forwarding and that sits on no ch2 can never complete: the hub
+  stopped between its two write-aheads, or the `withhold "all"` test hook was used. The hub drops
+  it when the client asks to close (`orphan_lock_dropped`), so it does not keep ch1 from closing.
+  This is checked under the provider's busy flag, which `route()` holds from before it writes the
+  lock until its forward ends, so a lock in flight is never dropped.
+
+**H2: written-off locks were superseded.** A lock is written off at `reveal_timeout`, or when the
+provider refuses it. Its ch2 pre-signature may already be out: a slow honest provider can still
+use t, and so can one that answers 400 and keeps the pre-signature. The client's next lock was
+quoted on the old base, so its state did not include the written-off amount, and a t read later off
+the ch2 close collected nothing.
+* **Hold.** If the lock was pending on ch2 when it was written off (the pre-signature may have
+  left), ch1's counters (`routed_sat`, `fee_units`, `fee_paid`) are raised to the lock's `after`.
+  What was added is stored on the lock (`stale_locks[].hold`). Later locks are quoted above it, so
+  a t read off the ch2 close later still collects. A write-off whose pre-signature never left
+  ("ch2 exhausted", a failed pre-sign, a final ch2) holds nothing and is not kept.
+* **Block.** No route over a ch2 with written-off locks (`route_blocked` "a written-off lock on
+  this ch2 is unresolved"), and no rollover of it: `rollover()` refuses with `lock_pending`, and
+  the watcher does not roll it over. The ch2's close shows whether t was used; its refund shows it
+  was not.
+* **Release.** A confirmed refund, or a confirmed provider close that does not reveal the lock's t,
+  proves it unpaid. The hold leaves the base (`lock_released`), and the lockId goes on ch1's
+  `released` list (the last 64). The client is then quoted below its signed state (the dust floor)
+  until what it signed ahead for that lock is used.
+* **`max_lock_sat`.** A written-off lock holds the client's base and blocks its ch2 until that ch2
+  resolves, so a lock should be small next to a ch2. The default is now 20,000 sat (a fifth of the
+  default `ch2_capacity`, was 50,000). `HubConfig::from_json` refuses 0 or more than half of
+  `ch2_capacity` (`bad_config`).
+
+**The client (`RoutePayer`).** A given-up lock now records the counters `before` it as well as
+`after`, whether it was a floor lock, and whether the hub `held` it. Floor locks are recorded too:
+the hub can hold one. `resync` adopts three hub views, each only when it matches a lock the client
+gave up:
+* completed: as before, the hub's best state is that lock (also after a hold);
+* held: the hub's counters are the lock's `after`, ours are its `before`, and its lockId is in
+  `held`;
+* released: our counters minus the released holds equal the hub's.
+A refusal that carries `held` is resynced at once. A held entry is kept until its release or
+completion: the 16-entry list drops the oldest entry that is not held.
+
+**Nonces.** `adaptor::presign_with_nonces` (caller-chosen k and w, for the routing vectors) is
+compiled only under `cfg(test)` or the `vector-emitter` feature, which only `xbt402-interop`
+enables. `presign` uses a private inner function. The routing vectors are byte-identical
+(`conformance.sh` step 4, 79/79). B1's `presign` never took nonces.
+
+**For embedders (cmp).** These are the wire and behaviour changes:
+* `POST /x402/route` refusals with ch1's view (`bad_amount`, and now also the 502 `route_failed`
+  of a held write-off) carry `held: [lockId]` and `released: [lockId]` beside `bestCum`,
+  `routedSat`, `feeUnits` and `feePaid`. Before, the 502 `route_failed` carried only
+  `providerError`. Old clients ignore the new fields.
+* A client close of a ch1 with a routed lock open is refused `lock_pending` (400). Retry it after
+  the lock resolves.
+* After a write-off, that provider's ch2 is `route_blocked` until the ch2 closes or is refunded.
+  The hub's switch to a ch2 funded ahead (AGP-057) can still take over.
+* `RoutePayer`'s persisted ledger: entries in `given_up` gain `before`, `floor` and `held`. Older
+  records load, with `before` taken as `after`.
+* `max_lock_sat` above half of `ch2_capacity` is now a config error. The default is 20,000.
+* `HubStats::uncollected`, and the events `lock_uncollected`, `lock_released`,
+  `orphan_lock_dropped`, `resync_hold` and `resync_release`; `void` gains `held`.
+* `presign_with_nonces` is gone from the default build (enable `vector-emitter` to get it).
+
+Tests: `crates/xbt402-interop/tests/hub_routing_safety.rs` (8; B1
+`tests/security/test_agp064_hub_safety.py`, the same 8 plus the config test). All of them fail on
+`main` and pass here:
+* H1: `h1_close_while_a_lock_is_in_flight_is_refused_either_order` (lock then close, and close
+  then lock), `h1_a_lock_completed_after_ch1_closed_below_it_is_not_counted`,
+  `h1_the_margin_close_lets_a_lock_in_flight_finish`,
+  `h1_a_lock_the_hub_never_forwarded_does_not_keep_ch1_open`;
+* H2, both unfriendly orders: `h2_a_slow_provider_stays_in_the_base_and_a_later_route_sits_above_it`
+  (the answer lost, then t on the close) and
+  `h2_a_refused_lock_stays_in_the_base_and_blocks_routing_and_rollover` (400 with the
+  pre-signature kept: routing and rollover refused, then t on the close);
+  `h2_a_refunded_ch2_gives_the_unpaid_hold_back` and
+  `h2_a_void_whose_pre_signature_never_left_holds_nothing`;
+* `hub::tests::max_lock_sat_defaults_small_and_is_at_most_half_of_ch2_capacity`.
+
+The tests use a wrapper `HttpService` around the provider (it holds the provider's answer at a
+gate, or turns it into a 400), so the shipping code has no new test hooks. Two existing tests
+changed with H2, because a provider's refusal now blocks that ch2:
+`hub_make_before_break::provider_enforces_its_cap_and_margin_itself` and
+`hub_refill_ahead::a_child_the_providers_watcher_left_suspended_is_looked_at_before_a_lock_is_refused`
+(the same two in B1).
+
+**Trade-offs.**
+* An honest slow provider, once written off, can leave the client paying the lock twice: once in
+  the held base, and once by rerouting the same service. The provider's own meter credit is out of
+  the hub's reach.
+* A provider that refuses after taking the pre-signature stops its ch2 for that ch2's lifetime
+  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up would be
+  to close and refill such a ch2 early.
+
+## Agent-wallet budget integrity and privileged methods (AGP-063)
+
+Fixes for Chris Guida's agent-wallet findings W1-W4, X1 and K1, plus the library payer's watermark.
+Each test fails on `main` and passes here (the run is in the task's `result.md`). Most are in
+`crates/xbt-signer/tests/guida_w.rs`; B2's port (branch `agp-063`) has the same names in
+`tests/test_guida_w.py`.
+
+**W1: the wallet books what it signs.** `xbt402_pay` books the **signed delta**: the cumulative amount
+signed after the call, minus what the policy ledger already holds for that channel
+(`ledger_booked_sats`). It never books `charged` from the seller's PAYMENT-RESPONSE. The receipt is
+still checked: the payee's signature, the request digest and channel, a `cum` no higher than the one
+signed, and a `charged` that is neither negative nor above the quote. A bad receipt does not change
+what is booked; the answer reports it as `receipt_error`. The answer also carries `booked_sats`.
+- **When it books.** The `pay` channel rail, `sign_state`, `xbt402_sign_state_a3`, the rollover and
+  `xbt402_sign_conditional` book before they sign, and take the row out again if signing fails.
+  `xbt402_pay` books after the state is persisted and before it is sent; a crash in between is
+  booked by the next call.
+- **No double count.** The ledger txid is `xbt402:<chan>:<cum>`, so a restart books an increase once.
+- **No lower state.** A lower `cum` is `deny/amount`.
+- **No negative rows.** A negative payment or amend row is refused, both when written and when the log
+  is loaded, so a row can never lower a daily, weekly or per-seller total.
+- **Streams.** The stream budget is `max_sats` minus what was booked.
+- **The budget check.** The per-tx limit, the human threshold and approvals still apply to the amount
+  asked (`max_sats`, or `pay`'s `amount_sats`). The daily, weekly, per-seller and split sums apply to
+  what the call can book (`PolicyEngine::evaluate_booking`). On an open channel that is known before the
+  402: `next_cum(max_sats)` minus the booked amount. A call that fits the budget exactly is paid, even
+  when `max_sats` alone would not fit.
+- **The dust floor.** A new channel's first state signs the dust floor (546) when the price is below
+  it. Those 546 sats are booked, and that first state is allowed even when `max_sats` is lower (500 in
+  the runbook). When the floor is more than the amount asked, the budgets are checked again on the whole
+  floor before anything is signed, on both rails (the session's `set_spend_check` hook for
+  `xbt402_pay`). A floor that does not fit is refused with the budget's rule, and the reason names the
+  dust floor. Tests: `w1_the_budget_is_checked_on_the_signed_increase_not_max_sats`,
+  `w1_a_dust_floor_above_the_remaining_budget_is_refused` and
+  `w1_the_dust_floor_on_the_pay_rail_is_held_to_the_budget`.
+- **Old records.** A record from before this field loads as booked through `used_sats` and does not
+  gain the key, so B2 still loads it.
+
+**W2: the seller cannot raise the cap.** An offer whose `minCapacity` is above the owner's per-channel
+cap (the cap plus the payer's close fee, which is what `minCapacity` bounds) is refused with
+`deny/min_capacity` before any funding. The combined W1+W2 test (a huge `minCapacity` and a receipt
+of zero) stops at the owner's cap.
+
+**W3: what a process on the agent socket can still do.** The agent socket is shared with the
+model-facing MCP process, so every method there either stays inside the owner's policy or needs the
+human's ed25519 signature.
+- **`fund`** pays only a channel for a payer key this signer issued (`xbt402_new_key`) to that origin,
+  and only to the seller's verified terms. The verified payTo is the policy's
+  `counterparties[origin].pay_to`, else the seller's `GET <origin>/x402/xbt-channel/terms`, which the
+  signer fetches itself, only for an allowlisted origin or routing hub, and checks for the right
+  network. The channel must also have:
+  - the hot key's change script;
+  - a close fee within `close_fee_max_sats`;
+  - an expiry in (`refund_margin_blocks`, max(`channel_expiry_blocks`, 4032)] blocks;
+  - a capacity within `per_counterparty_cap_sats` plus the payer's fee.
+
+  The funded channel is written ahead as pending, so the watcher refunds it at expiry if no attach
+  follows. Without `origin` and `params` the answer is `deny/fund_unbound`. Other codes:
+  `bad_key`, `pay_to`, `payer_spk`, `close_fee`, `expiry`, `channel_cap`, `bad_address`,
+  `channel_open`, `channel_pending`.
+- **`open_channel`** takes payTo only from the policy; a different `pay_to` parameter is `deny/pay_to`.
+  The dest must be allowlisted, and `cap_sats`, `expiry_blocks` and `close_fee` must stay inside the
+  owner's bounds.
+- **`xbt402_attach`** of a funded channel must match the pending record `fund` wrote. A `/next`
+  channel passes the same checks as `fund`.
+- **`xbt402_sign_rollover`** needs `next`: the unfunded params of the channel's own next channel. Its
+  script must be `next_spk`; it must have the same close fee and fee payer; its capacity must be
+  exactly `rollover_next_capacity(amount)`; and it passes the `fund` checks for `<origin>/next`.
+  A bare `next_spk` is `deny/rollover_unbound`. Only the increase in the signed amount is booked, not
+  the new channel's capacity, because that capacity is the wallet's own refundable channel and
+  booking it as well would count the same sats twice.
+- **`rotate_hot_key`** needs the human signature over `rotate_message(hot_address, expiry)`; it is
+  the same method as `rotate_hot_key_signed`. Codes: `human_key`, `human_sig`, `expired`.
+- **`deny_approval`** of an approval that has not expired needs the human signature over
+  `deny_message(token, expiry)` (domain `xbt-agentwallet-deny-v1`), so the agent cannot refuse for
+  the owner. An expired one can still be dropped without a signature. The UI signs it in the page,
+  like approve.
+
+**W4: the first human key.** While no human key is enrolled, the signer prints a one-time enrolment
+code (`XXXX-XXXX-XXXX`, 60 bits) to stderr and writes it to `.run/enroll-code` (0600).
+- **Enrolling.** `human_key_enroll` needs `code`. Five wrong codes replace it with a new one. Success
+  removes the code and the file.
+- **Where the owner finds it.** On Umbrel it is in the app's log (the app page, then Troubleshoot).
+  On StartOS it is in the service's Logs. Elsewhere it is on the signer's stderr or in
+  `.run/enroll-code`. The UI's enrolment form says so.
+- **Host and Origin.** The UI answers only to IP literals, single-label names (`localhost`, a
+  container name), `*.local`, `*.localhost`, `*.onion`, and the names in `XBT_UI_ALLOWED_HOSTS`;
+  anything else is 421. A POST whose `Origin` is not one of those hosts is 403. `Origin: null` is
+  accepted, because the UI sends `Referrer-Policy: no-referrer` and Chrome then sends `null` on
+  same-origin form posts. The Host check is what stops DNS rebinding.
+
+**X1: the MCP HTTP transport.**
+- **The token is always required.** With a data dir it is the `mcp-http-token` secret, generated on
+  first run. Without one it is `<signer socket dir>/mcp-http-token` (0600), generated on first run
+  and read again on restart. A non-loopback listener with no token is refused at start.
+- **Origin is checked whether or not `--http-allow-remote` is set.** It must be a loopback origin or
+  one of `XBT_MCP_ALLOWED_ORIGINS` (comma-separated). There is no same-origin exception, because a
+  DNS-rebound page has Origin equal to Host.
+- **Local payer mode** checks the signer's allowlist before any request to a URL, so a refused origin
+  is never probed.
+
+**K1: key storage.**
+- **scrypt cost.** A passphrase blob is sealed at scrypt N=2^17 (r=8, p=1, 128 MiB) and records
+  `log_n`. A blob without `log_n` (B2 and older Rust files) opens at 2^15, and only 15..=18 are read.
+  The measurements and the comparison with argon2id are in the task's `result.md`. The default
+  (Umbrel/StartOS) wrapping key is a key file, which has no KDF.
+- **Zeroised secrets.** Wrapping keys, the passphrase, derived keys and the key-file bytes are held in
+  `Zeroizing` buffers.
+- **Key file.** The key file (after symlinks are resolved) must be a regular file with no group or
+  other bits; otherwise the signer refuses to start.
+- **Durable approvals.** `PolicyStore::write` (the approvals document) writes a temp file, fsyncs
+  it, renames it, fsyncs the directory and sets mode 0600.
+- **xbt-svc ownership changes.** `xbt-svc` `own_dir`, `chown_tree` and `put_secret` open each entry
+  with `O_NOFOLLOW` and chown or chmod it through that fd. Children are named through
+  `/proc/self/fd/N`, so an entry swapped for a symlink during the walk is never followed.
+- **Deferred: sealing the hub's ch2 payer keys.** They are still stored as hex in the hub state
+  (AGP-064 is changing `hub.rs` now, and B1's `hub.py` shares the file format).
+
+**The library payer's watermark.** `Payer::sign_state_a3` and `Payer::sign_conditional` refuse an
+amount below the highest one signed (`stale_amount`) and advance it, as `sign_state` already did.
+
+**Wire changes for embedders (cmp, B1 clients, scripts).**
+
+| change | before | now |
+|---|---|---|
+| `fund` | `{address, sats}` | `{origin, params, address?, sats}`; `xbt402::client::Wallet::fund_channel` (`RemoteSigner` sends it) |
+| `xbt402_sign_rollover` | `{chan, amount, next_spk, next_capacity}` | the same plus `next` (the next channel's params); `StateSigner::sign_rollover_next` |
+| `xbt402_pay` answer | `charged_sats` | plus `booked_sats` and, for a bad receipt, `receipt_error` |
+| `xbt402_pay` / `pay` budget | sums held to `max_sats` / `amount_sats` | sums held to the signed increase; a dust floor above the budget is `deny/<budget rule>` |
+| `Session` (Rust) / `Xbt402Session` (B2) | `set_spend_book` | plus `set_spend_check(dest, max_sats, delta)` |
+| `rotate_hot_key` | no params | `{expiry, signature}` |
+| `deny_approval` | `{token, reason}` | plus `{expiry, signature}` while the approval is live |
+| `human_key_enroll` | `{pubkey}` | `{pubkey, code}` |
+| MCP HTTP | token optional on loopback | always a bearer token; Origin is checked; `XBT_MCP_ALLOWED_ORIGINS` |
+| web UI | any Host | Host allow-list (`XBT_UI_ALLOWED_HOSTS`) and an Origin check on POST |
+| keystore blob | no `log_n` | `"log_n": 17` on passphrase blobs |
+
+## Request binding and the HTTP server (AGP-068)
+
+Guida T1–T4. A few slow connections must not stall a provider, and a receipt binds one request and
+the answer that was actually returned. B1 `x402_channel.py` on `agp-068` (`a495430`) does the same, and
+`tests/test_agp068.py` there uses the same test names.
+
+**Wire (v1.3).** `extra.derivation` is `"v3"`, and it is the only version signal: a v1.2 client
+requires `"v2"` and refuses the offer before it funds. The payee key is still
+`xbt-channel/payee/v2`. There is no separate binding flag, because an old client echoes whatever
+terms it was given, so a server-side check of one would never fire.
+
+- `request_digest_v2` is
+  `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`
+  with `f(x) = LE64(len(x)) ‖ x`. Scheme and host are lowercased, the port is decimal or the
+  scheme's default, userinfo and fragment are dropped. A provider reached at another origin, or a
+  `|` moved between target and body, gives another digest. A bare target binds no origin.
+- The client binds `origin + path`, and the server binds the URL it rebuilt from the request.
+- Receipts are `tagged_hash("xbt402/receipt/v2", …)` over the length-prefixed chan, seq, cum,
+  charged, spentMsat, req, status and bodyHash (sha256 of the body sent). The client checks status
+  and bodyHash against the bytes it received (`bad_receipt`). On a conditional call the hash lock
+  stays pending until the receipt checks out, so after a `bad_receipt` `recover_conditional` still
+  reads k from the provider's claim.
+- `seq` is the call's own, and cum and spentMsat come from the call's reservation (less its own
+  refund), not from whatever another call wrote meanwhile. A seq spent on a refusal is saved before
+  the 402 goes out (a 500 if that save fails), so a replay after a restart is still `bad_auth`.
+- The old `sha256(method|path|body)` remains as `request_digest_v1` for xbt-work's published
+  XBT-053 vectors; xbt-work still speaks v1.
+
+**HTTP server (`http-server` feature).** It is now `std::net`:
+
+- header lines are capped at 8 KiB and the header block at 32 KiB (431);
+- at most 64 connections, then 503;
+- the head must arrive within 10 s (408) and the body within 30 s, both as absolute deadlines;
+- only Content-Length bodies (Transfer-Encoding gives 501), and `Expect: 100-continue` is honoured;
+- `Connection: close` on every answer;
+- bodies are read on the connection thread, so a slow body cannot occupy a worker. Jobs go to the
+  workers through a bounded queue, and a panicking handler costs a 500, not a worker.
+
+The URL the digest is checked against is rebuilt from `Host`, the target and `X-Forwarded-Proto`
+(`https` or `http`). Both headers are client-controlled, so trusting them gives an attacker nothing
+it could not already send. Behind TLS, put a reverse proxy in front that overwrites both with the
+URL the payer used. For example, with nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8402;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_request_buffering on;     # the proxy, not this process, absorbs slow bodies
+    client_max_body_size 1m;
+}
+```
+
+**Client (T3).** The payer's `ureq` transport refuses a declared Content-Length over 64 MiB
+(`response_too_large`) and a body shorter or longer than declared (`response_truncated`), instead
+of returning a short buffer. B1's `_read_capped` uses the same codes.
+
+Options weighed for the server (best-performing-stack rule):
+
+| option | slowloris / long headers fixable | new dependency | other cost |
+|---|---|---|---|
+| keep `tiny_http`, wrap it | no: its listener thread reads heads with no deadline or line cap | none | the bug stays |
+| vendor and patch `tiny_http` | yes | none (but a fork to carry) | maintaining a fork |
+| `rouille` | no | yes | built on `tiny_http` |
+| `hyper` | yes | yes, with an async runtime (tokio) | larger binary, a runtime on Pi-class devices |
+| `may_minihttp` | partly | yes | coroutine runtime, heavy use of `unsafe` |
+| **`std::net`, ~360 lines (chosen)** | yes | **none** (`tiny_http` dropped from xbt402) | ours to maintain; tested in `http_limits.rs` |
+
+**Cost.** Pass line declared before measuring: (a) the added per-call hashing (the v2 digest twice
+on the server, v2 receipt framing, bodyHash of a 4 KiB answer) is at most 5% of one ECDSA receipt
+signature; (b) bodyHash on armv7 keeps up with a 100 Mbit/s link (12.5 MB/s).
+`cargo run --release -p xbt402 --example binding_bench` on a Ryzen 9 9950X3D (SHA-NI) gives
+digest v1 100 ns / v2 288 ns, receipt v1 345 ns / v2 445 ns, bodyHash 4 KiB 1.7 µs, ECDSA sign
+16.2 µs, and SHA-256 at 2.5 GB/s:
+
+- framing alone adds 0.48 µs, which is 2.9% of a signature and passes (a);
+- framing plus a 4 KiB bodyHash adds 2.2 µs, which is 13.7% and **fails (a)**;
+- the bodyHash part is one SHA-256 pass over the answer, which T4 requires and the payer repeats to
+  check, and it grows with the answer size.
+
+There was no armv7 box or emulator, so the armv7 figures are estimates. Software SHA-256 on a
+Cortex-A7 at 900 MHz runs at about 25–35 cycles/byte, about 25–35 MB/s, so (b) passes with room to
+spare. Signing on 32-bit libsecp256k1 slows down by roughly the same factor as hashing, so the
+bodyHash share on armv7 is in the same 10–25% range: (a) fails there too for answers of a few KiB
+and up.
+
+**Embedders.**
+
+- cmp, xbt-compute and anyone else who builds the payload themselves must bind
+  `request_digest_v2(method, origin + target, body)` and verify receipts against the answer. A v1.2
+  digest no longer authenticates.
+- B5 and xbt-063 vendor pinned B1/B2 and are unaffected until they re-pin. On re-pin, B5
+  `fwd/server.py` must add status and bodyHash to its receipts and use the v2 digest.
+- The B2 wallet (`agp-068`, `8299cee`) binds the v2 digest, but as before it does not check receipts.
+- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still serve with `tiny_http`, so they keep T1's
+  slowloris exposure until they move to the same server. That is a follow-up, and so is moving
+  xbt-work to v2.
+- `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
+
+Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_server`,
+`slow_heads_do_not_stall_the_server_and_are_cut_off`, `an_endless_header_line_is_refused`,
+`an_oversized_response_is_an_error_not_a_truncated_body`, `a_body_cut_short_is_an_error`) and the
+AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_origin`,
+`concurrent_calls_get_the_numbers_of_their_own_reservation`,
+`a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
+`an_altered_conditional_answer_keeps_the_hash_lock`).
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
-`getrandom`, std threads (no async runtime). The optional HTTP features use `ureq` with rustls/ring
-(no OpenSSL) and `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
+`getrandom`, std threads (no async runtime). The payer HTTP client uses `ureq` with rustls/ring
+(no OpenSSL). The xbt402 server is std (`http-server`, AGP-068). wallet-ui, the work relay and MCP
+still use `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
 passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
 x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).
 Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of
@@ -998,6 +1358,145 @@ through `xbt-primitives` (NTA BIP340).
   paid with the carry, released. D: a pool block outside the invoice covers the rest. Then the payer's 19 checks.
   42/42 on 2026-09-29 (`docs/work-nta-agp043-20260929-032035/`).
 
+## The coinbase audit without trusting the Prime (AGP-065, Guida P1–P6)
+
+Chris Guida reviewed the public snapshot (xbt-rs `ecdbb50`). His point: the §10.3 audit took every
+number from the Prime's own window statement, so a Prime colluding with a payer could receipt work
+nobody mined and then sign a statement that excused the unpaid coinbase. Every finding was still
+present on `main` (`c8d607b`). Each now has a test in `crates/xbt-work/tests/guida_p.rs`; P1–P4 were
+first run against `main` and failed there.
+
+* **P1: the provider pins the Prime's terms.** `WorkConfig::terms` (`audit::PrimeTerms { window,
+  window_min_work, window_tolerance_bps, fee_bps, max_min_payout }`) comes from the provider's config,
+  never from a statement. `PrimeTerms::bounds(&ChainBlock)` turns it into `AuditBounds`:
+  `window_work ≤ ⌈max(target(bits), target(prev_bits)) × (10⁴ + tolerance) / 10⁴⌉`, where
+  `target(b) = max(⌈window × D(b)⌉, window_min_work)` (primed's own rule, `state.rs` 651–654) and `D` is
+  the difficulty of the block's own nBits and of its parent's (the Prime may have built the window
+  under either). `fee_bps` is capped at the advertised fee, and `min_payout` at `max_min_payout`.
+  `audit_block` and `check_fraud_proof` both use `min(statement, bound)` for each value, so a third party
+  holding the same terms convicts from the proof alone. A proof that needed a bound carries it under
+  `"bounds"`; with no bound applied it is the AGP-032 document, byte for byte. A statement whose
+  `window_start` is lower than that of an audited block beneath it is refused (`window_start_regressed`)
+  and the block's credit stays held. A pass where `expected` fell below `min_payout` records the
+  shortfall as owed carry (`belowMinSats`) instead of forgiving it. Tests:
+  `p1_colluding_prime_statements_fail_the_audit` (`window_work = u64::MAX`, `fee_bps = 10000`,
+  `min_payout = u64::MAX`), `p1_an_honest_statement_is_not_bounded`, `p1_window_start_is_monotonic`,
+  `p1_a_below_min_pass_is_owed_carry`, `terms_bound_the_window`. Inside the bounds, the size of the
+  window and who did the rest of its work are still the Prime's word.
+  `docs/xbt-work-share-log-commitment.md` proposes a per-block commitment to the share log that a
+  provider can sample (a spec proposal for XBT-053, not implemented).
+* **Where the Prime validates shares.** The Prime is primed (`AwokenLazarus/Bitcoin`, branch `rnd/agp-011`,
+  `91b2d8b`); no pool code changed. `prime/primed/src/session.rs` `on_pow` (about lines 1340–1575)
+  takes the share's job and coinbase sections, then holds the job's height, parent and nBits to the pool
+  node's tip (stale, wrong-bits and dead-parent shares are refused). `prime/wire/src/verify.rs` `verify`
+  (about 420–600) rebuilds the coinbase (its BIP34 height must be the job's), refuses a coinbase that
+  does not pay the split the Prime issued, rebuilds the BLAKE2b header from the merkle branches and the
+  share's own fields, and checks the hash against the share target. Back in `on_pow`, a pool-wide set
+  allows one credit per hash per height (about 1507–1527); then the TIDES ledger is credited and, for a
+  `.pw-<invoice>` username, so is the receipt (`work_receipts.credit`, about 1563–1566). The audit does
+  not re-check shares: it cannot see them. It bounds what the Prime can claim about them.
+* **P2: a pass releases only what it covered.** The book keeps one `Span` per receipted increase:
+  invoice, `lo..hi`, work, credited, coverage (`Open`, `Covered(h)`, `Skipped(h)`). A passing audit at `H`
+  with window start `ws` covers only open spans with `lo > ws` and `hi < H`, exactly the intervals its
+  bound counted. Spans at or below `ws` are `Skipped`: no later window can count them. Up to
+  `CreditCaps::skipped` of skipped credit is forgiven; beyond that it counts against the total cap for good.
+  Covered spans are credited in full, free of the caps. Tests: `p2_a_pass_releases_only_covered_credit`,
+  `p2_skipped_credit_fills_the_total_cap`, `a_pass_covers_only_the_spans_its_bound_counts`.
+* **P3: the statement must name the node's block.** The audit takes the block from the provider's node
+  (`chain::ChainBlock { height, hash, value_sats, paid_sats, bits, prev_bits }`). A statement for another
+  height or hash fails with `wrong_block` (`p3_statement_height_must_be_the_blocks`: `height = u32::MAX`
+  and `height = window_start + 1`).
+* **P4: a missing statement is never skipped.** `tools::window`: 200 is a statement, 404 (primed's
+  "no window statement", `stats.rs` 434) is `Statement::Missing`, and anything else is an error.
+  `WorkProvider::audit_chain`: a missing statement for a coinbase that paid the identity fails the
+  audit and distrusts the Prime (`missing_statement`); for one that paid nothing it records nothing and
+  the credit stays held. The audit loop stops at a Prime or node error and resumes at that block.
+  Tests: `p4_a_statement_error_is_not_a_missing_statement`, `p4_a_missing_statement_fails_or_holds`.
+* **P5: default caps.** With no cap flag, `xbt-work-provider` caps unaudited credit at 100 calls per invoice
+  and 1,000 calls in total, and forgives at most 100 calls of skipped credit. `--cap-*-calls N` (new)
+  sets a cap in calls at `--price`, and `off` removes a cap. The library's `CreditCaps::default()` is
+  still uncapped (the reference's book, which the vectors pin). Test: `p5_the_binary_ships_non_zero_caps`.
+* **P6: invoices, issuance, state, reorgs.**
+  * An unfunded invoice past its TTL stays dormant for `invoice_grace_secs` (default 3600 s): its
+    receipts are still pulled and a receipt with work still spends on it. Only a newer invoice that
+    needs the room evicts it, oldest first (`p6_an_invoice_with_work_outlives_its_ttl`).
+  * Issuance is limited per client (`max_unfunded_per_client`, default 16, `429 too_many_invoices`). The
+    client is the TCP peer, which the xbt402 HTTP server now passes in `X-Xbt402-Peer`
+    (`xbt402::provider::PEER_HEADER`; a client-sent copy is dropped). Behind a reverse proxy,
+    `--trust-forwarded` takes the last `X-Forwarded-For` hop instead (`p6_issuance_is_limited_per_client`).
+  * The state is snapshotted under the lock with a generation number and written (fsync, rename) outside
+    it. A writer skips a snapshot older than the last one written; a failed write on the payment path
+    rolls the debit back (`p6_concurrent_writes_keep_the_newest_state`).
+  * Earlier receipts (`by_seq`) are persisted as `"receipts"` (state version 2), so a restart still
+    detects an equivocation against them. AGP-043 state migrates on load
+    (`earlier_receipts_survive_a_restart_and_agp043_state_migrates`). A state file that exists but
+    cannot be read is now an error, not an empty book.
+  * Reorgs: before each pass the audit loop compares the audited blocks with its node.
+    `WorkProvider::orphaned(h)` undoes a reorged block's verdict and carry and reopens the spans it
+    covered, so they count against the caps again (`p6_a_reorg_rolls_back_released_credit`). Audits deeper
+    than `SETTLE_DEPTH` (144) settle: their spans and the receipts under their window are pruned.
+* **DATUM usernames.** The Prime can only receipt `.pw-<invoice>` if the gateway passes the miner's
+  username through. That needs `datum.pool_pass_full_users = true`, which is the DATUM gateway's
+  default. With it false and `pool_pass_workers` on, the gateway sends `pool_address.<username>`; with
+  both false, `pool_address` alone (`datum_protocol.c` 2720–2728). Either way the Prime credits the
+  gateway's pool address and no receipt appears. `xbt-work-payer prepare --gateway-config FILE` refuses
+  such a config (`payer::check_gateway_config`, `datum_gateway_must_pass_full_usernames`). If no
+  receipt arrives within 5 minutes, `pay` prints a hint naming the setting. On regtest the first
+  receipt can take longer than that, so the hint is advice, not an error.
+* **M1: locked coinbases.** `chain::Maturity::from_deployments` reads Knots'
+  `getdeploymentinfo.deployments.long_coinbase_maturity` (`coinbase_start_height`, `height`,
+  `height_end`, `maturity`) from the node and is never hard-coded. A node without the deployment means
+  ordinary maturity (100). The choice: a locked payout **counts as paid** in the audit, because the
+  coinbase did pay the identity and the Prime cannot do better. It is reported apart as illiquid.
+  `WorkProvider::payouts(tip, &maturity)` and `GET /admin/xbt-work/report` `payouts` split the audited
+  payouts into `liquidSats` and `lockedSats`. A provider that sells credit against its payouts should
+  count only the liquid part as money in hand, and its caps bound what it extends meanwhile.
+  `relay_at(h)` is when a spend of the coinbase relays (mempool policy applies the long depth to every
+  coinbase); `consensus_at(h)` is the consensus rule (`m1_locked_payouts_are_paid_but_illiquid`,
+  `maturity_from_the_node`).
+
+**For embedders (cmp and anyone linking `xbt-work`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `audit_block(book, sw, V, paid, deferred)` | statement on trust | `audit_block(book, sw, &ChainBlock, &AuditBounds, deferred)`; `AuditBounds::STATEMENT_ONLY` is the old check |
+| `check_fraud_proof(proof, pk)` | | `check_fraud_proof(proof, pk, &ChainBlock, &AuditBounds)` |
+| `WorkProvider::audit(sw, deferred, V, paid)` | | `audit(sw, deferred, &ChainBlock)`, plus `audit_chain(&ChainBlock, Statement)` |
+| `AuditOutcome` | | adds `below_min_sats`, `window_work`, `fee_bps`, `min_payout`, `bounded` |
+| `WorkConfig` | | adds `terms`, `invoice_grace_secs`, `max_unfunded_per_client`, `trust_forwarded` |
+| `CreditCaps` | `per_invoice`, `total` | adds `skipped: u64` (default 0: nothing forgiven) |
+| `tools::window` | any non-200 → `None` | 404 → `None`, other errors → `Err` |
+| provider state file | version 1 | version 2 (`spans`, `settledSkipped`, `receipts`); version 1 loads |
+| fraud proof JSON | | `"bounds"` added only when a bound applied |
+| `xbt-work-provider` | caps off by default | 100/1,000/100 calls; Prime terms flags; reorg check; admin from loopback peers only |
+| xbt402 HTTP server | | sets `X-Xbt402-Peer` to the TCP peer on every request |
+
+The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: the
+same logic lives in XBT-053 (lazarus-xbt), and the spec diff is routed there. The vectors are unchanged
+(`work_conformance.sh`: 91/91 and 124/0, byte-identical).
+
+Results on 2026-10-08: `cargo test --workspace` (464 passed) and `scripts/conformance.sh`;
+`scripts/work_interop.sh` Rust → Rust 20/20 with the provider and payer pinned to primed's regtest terms
+(`--prime-window-min-work 64`), no honest statement bounded
+(`docs/work-interop-agp065-2026-10-08-payer-rust-provider-rust.json`); `scripts/work_nta.sh` 42/42 with
+primed's fee of 5,000 bps pinned (`docs/work-nta-agp065-2026-10-08/`). One NTA check changed with P2: at
+C, block 115's pass covers the B share, which is now credited outside the caps (AGP-043 held it and
+released it by cap), so nothing stays held.
+
+CPU (`examples/audit_cost.rs`; armv7 musl under `qemu-arm-static` as the Pi-class figure, x86_64 native
+beside it; pass lines declared before measuring):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| `PrimeTerms::bounds` (one block) | — | 2.2 µs | 0.1 µs |
+| `audit_block`, 10 / 1,000 spans | ≤ 5 ms | 0.43 / 0.79 ms | 0.03 / 0.07 ms |
+| credit room per paid call, 1,000 spans | ≤ 1 ms | 18 µs | 1.8 µs |
+| `check_fraud_proof`, 1 / 100 invoices | ≤ 20 ms | 0.95 / 40 ms | 0.06 / 2.9 ms |
+
+The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verifications (AGP-032), of
+which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
+makes one pass over the spans; before, it recomputed the caps' room for each open span.
+
 ## Linking xbt-rs from cmp (AGP-035)
 
 xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that
@@ -1011,7 +1510,7 @@ f64, holding an integer beyond i64/u64 as a reserved one-key object `{"$xbt402::
 (`json::big_int`/`big_uint`/`as_big_int`/`int_text`), which `json::dumps`/`dumps_compact`/`canon`
 write back as the bare integer. Floats are parsed with Rust's correctly rounded parser and written
 as Python's `repr`. A document that contains the reserved key itself is refused. Every xbt402 input
-goes through `json::parse`, and every output through `json::dumps`: the 249 + 79 vectors are
+goes through `json::parse`, and every output through `json::dumps`: the 253 + 79 vectors are
 byte-identical both ways and `route_interop` is green. If cmp handles xbt402 JSON itself, it reads
 with `xbt402::json::parse` and writes with `xbt402::json::dumps*`. `serde_json::to_string` would
 print a big integer as the reserved object.

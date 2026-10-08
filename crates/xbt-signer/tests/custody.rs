@@ -107,7 +107,7 @@ fn rotation_sweeps_old_coins_keeps_the_old_key_sealed_and_later_coins_are_swept(
     let old_spk = rig.hot_spk();
     rig.fund_hot(1, 5_000);
     rig.fund_hot(2, 3_000);
-    let r = rig.call("rotate_hot_key", json!({}));
+    let r = rig.rotate_hot_key();
     let sweep = rig.chain.tx(r["sweep"]["txid"].as_str().unwrap());
     assert_eq!(sweep.inputs.len(), 2);
     assert_eq!(sweep.outputs[0].value, 8_000 - 200 - 2 * 100);
@@ -124,7 +124,7 @@ fn rotation_sweeps_old_coins_keeps_the_old_key_sealed_and_later_coins_are_swept(
     assert!(acts.to_string().contains("retired_sweep"), "{acts}");
     assert_eq!(rig.call("hot_address", json!({}))["hot_retired_sats"], 0);
     let kinds: Vec<String> = rig.sigs().iter().map(|x| format!("{}/{}", x["kind"].as_str().unwrap(), x["rule"].as_str().unwrap())).collect();
-    assert!(kinds.contains(&"rotation_sweep/operator:rotate_hot_key".to_string()), "{kinds:?}");
+    assert!(kinds.contains(&"rotation_sweep/human:rotate_signature".to_string()), "{kinds:?}");
     assert!(kinds.contains(&"retired_sweep/watcher:retired_sweep".to_string()), "{kinds:?}");
 }
 

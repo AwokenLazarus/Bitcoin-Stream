@@ -35,9 +35,10 @@ fn the_ui_in_headless_chrome() {
     assert_eq!(r["verdict"], "needs_human");
     let token = r["approval_token"].as_str().unwrap().to_string();
     let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let enroll = std::fs::read_to_string(rig.root.join(".run/enroll-code")).unwrap();
     let out = std::env::var("XBT_UI_SNAPSHOT_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ui-browser").into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
-        .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/browser_test.mjs"), &format!("http://{}", srv.addr), code.trim(), &out])
+        .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/browser_test.mjs"), &format!("http://{}", srv.addr), code.trim(), &out, enroll.trim()])
         .output().unwrap();
     let text = String::from_utf8_lossy(&o.stdout);
     eprintln!("{text}");

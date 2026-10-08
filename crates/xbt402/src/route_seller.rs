@@ -754,7 +754,8 @@ impl RouteSeller {
 
     /// Authenticate a routed call. `Ok((session, None))` to serve, `Ok((session, Some(error)))` or
     /// `Err(error)` (no session) to refuse.
-    pub fn begin_call(&self, path: &str, hdr: &str, method: &str, req_path: &str, body: &[u8]) -> std::result::Result<(String, Option<&'static str>), &'static str> {
+    /// `bind` is the request's URL as [`request_digest_v2`] binds it.
+    pub fn begin_call(&self, path: &str, hdr: &str, method: &str, bind: &str, body: &[u8]) -> std::result::Result<(String, Option<&'static str>), &'static str> {
         let h = unb64json(hdr).map_err(|_| "bad_payload")?;
         let (Some(sid), Some(seq), Some(auth)) = (h.get("session"), py_int(h.get("seq")), h.get("auth")) else { return Err("bad_payload") };
         let (sid, auth) = (py_str(Some(sid)), py_str(Some(auth)));
@@ -768,7 +769,7 @@ impl RouteSeller {
             return Err("bad_auth");
         }
         let seq = u64::try_from(seq).map_err(|_| "bad_auth")?;
-        if !auth_eq(&call_auth(&key, &sid, seq, &request_digest(method, req_path, body)), &auth) {
+        if !auth_eq(&call_auth(&key, &sid, seq, &request_digest_v2(method, bind, body)), &auth) {
             return Err("bad_auth");
         }
         let s = st.sessions.get_mut(&sid).ok_or("unknown_session")?;
@@ -1016,7 +1017,7 @@ impl Provider {
 
     /// POST /x402/xbt-channel/lock: a hub's adaptor-locked state on its ch2 to us, authenticated
     /// like a paid call (the hub's channel HMAC covers the JSON body with the route terms).
-    pub(crate) fn route_lock(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> HttpResponse {
+    pub(crate) fn route_lock(&self, method: &str, bind: &str, headers: &[(String, String)], body: &[u8]) -> HttpResponse {
         let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).unwrap_or("");
         let parsed = (|| -> Option<(Value, Value)> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
@@ -1028,7 +1029,7 @@ impl Provider {
         let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| crate::channel::canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
         let Some(cid) = cid else { return err_json(400, "unknown_channel", "") };
         let mut st = l.channels[&cid].clone();
-        if !self.authentic(&st, &pl, method, path, body) {
+        if !self.authentic(&st, &pl, method, bind, body) {
             return err_json(401, "bad_auth", "");
         }
         st.seq = py_u64(pl.get("seq")).unwrap_or(st.seq);
@@ -1094,7 +1095,7 @@ impl Provider {
             }
             self.required_response(&doc)
         };
-        let sid = match self.routes.begin_call(pk, hdr, method, path, body) {
+        let sid = match self.routes.begin_call(pk, hdr, method, &crate::provider::binding_url(url, path), body) {
             Err(e) => return refuse(e, None),
             Ok((sid, Some(e))) => return refuse(e, Some(&sid)),
             Ok((sid, None)) => sid,

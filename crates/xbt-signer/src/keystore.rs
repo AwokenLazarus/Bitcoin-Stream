@@ -5,12 +5,13 @@
 //!
 //! * `B2_HOT_KEYFILE=/path` — 32 random bytes (raw or 64 hex chars), created 0600 if missing, refused
 //!   inside the signer's run directory;
-//! * `B2_HOT_PASSPHRASE=...` — scrypt(N=2^15, r=8, p=1) with a per-blob salt; removed from the
-//!   environment once read.
+//! * `B2_HOT_PASSPHRASE=...` — scrypt(N=2^17, r=8, p=1) with a per-blob salt; removed from the
+//!   environment once read. AGP-063 K1: the blob records `log_n`; one without it is an older
+//!   blob at N=2^15, opened as before and re-sealed at 2^17 on its next write.
 //!
 //! A sealed blob is `{"v":1,"alg":"aes-256-gcm","kdf":"keyfile"|"scrypt","salt","nonce","ct","aad"}`
-//! (hex fields; `ct` includes the 16-byte tag), exactly as B2 writes it, so either signer opens
-//! the other's files.
+//! plus `"log_n"` for scrypt (hex fields; `ct` includes the 16-byte tag), exactly as B2 writes it,
+//! so either signer opens the other's files. Secrets are zeroized when the store drops.
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -20,13 +21,18 @@ use std::sync::Mutex;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::{err, Result};
 
 pub const ENV_KEYFILE: &str = "B2_HOT_KEYFILE";
 pub const ENV_PASSPHRASE: &str = "B2_HOT_PASSPHRASE";
 pub const ENV_ALLOW_PLAINTEXT: &str = "B2_HOT_ALLOW_PLAINTEXT";
-const SCRYPT_LOG_N: u8 = 15;
+/// New seals (AGP-063 K1: 170 ms on the build host, about 1 s on armv7, 128 MiB). A blob may name
+/// 15..=SCRYPT_LOG_N_MAX; a larger one is refused (it would allocate 128 * 8 * 2^log_n bytes).
+pub const SCRYPT_LOG_N: u8 = 17;
+const SCRYPT_LOG_N_LEGACY: u8 = 15;
+const SCRYPT_LOG_N_MAX: u8 = 18;
 const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 
@@ -38,14 +44,17 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 enum Source {
-    Key([u8; 32]),
-    Passphrase(Vec<u8>),
+    Key(Zeroizing<[u8; 32]>),
+    Passphrase(Zeroizing<Vec<u8>>),
 }
+
+/// Derived wrapping keys by (scrypt log_n, salt).
+type KdfCache = HashMap<(u8, Vec<u8>), Zeroizing<[u8; 32]>>;
 
 /// Seals and opens small secrets.
 pub struct KeyStore {
     src: Source,
-    kdf_cache: Mutex<HashMap<Vec<u8>, [u8; 32]>>,
+    kdf_cache: Mutex<KdfCache>,
 }
 
 impl std::fmt::Debug for KeyStore {
@@ -56,11 +65,11 @@ impl std::fmt::Debug for KeyStore {
 
 impl KeyStore {
     pub fn with_key(key: [u8; 32]) -> Self {
-        Self { src: Source::Key(key), kdf_cache: Mutex::new(HashMap::new()) }
+        Self { src: Source::Key(Zeroizing::new(key)), kdf_cache: Mutex::new(HashMap::new()) }
     }
 
     pub fn with_passphrase(pw: &[u8]) -> Self {
-        Self { src: Source::Passphrase(pw.to_vec()), kdf_cache: Mutex::new(HashMap::new()) }
+        Self { src: Source::Passphrase(Zeroizing::new(pw.to_vec())), kdf_cache: Mutex::new(HashMap::new()) }
     }
 
     /// "keyfile" or "scrypt" (the blob's `kdf`).
@@ -74,7 +83,7 @@ impl KeyStore {
     /// The signer's key source from the environment, or `None` when it names none. The
     /// passphrase is removed from the environment once read (`pop`).
     pub fn from_env(run_dir: Option<&Path>, pop: bool) -> Result<Option<Self>> {
-        let pw = std::env::var(ENV_PASSPHRASE).ok().filter(|p| !p.is_empty());
+        let pw = std::env::var(ENV_PASSPHRASE).ok().filter(|p| !p.is_empty()).map(Zeroizing::new);
         if pop && pw.is_some() {
             std::env::remove_var(ENV_PASSPHRASE);
         }
@@ -93,9 +102,9 @@ impl KeyStore {
 
     /// The wrapping secret itself (the 32-byte key, or the passphrase): only for the human-signed
     /// backup export (AGP-039), which seals it under the backup passphrase before it leaves.
-    pub(crate) fn wrapping_secret(&self) -> Vec<u8> {
+    pub(crate) fn wrapping_secret(&self) -> Zeroizing<Vec<u8>> {
         match &self.src {
-            Source::Key(k) => k.to_vec(),
+            Source::Key(k) => Zeroizing::new(k.to_vec()),
             Source::Passphrase(pw) => pw.clone(),
         }
     }
@@ -104,18 +113,18 @@ impl KeyStore {
         std::env::var(ENV_ALLOW_PLAINTEXT).map(|v| v == "1").unwrap_or(false)
     }
 
-    fn wrap_key(&self, salt: &[u8]) -> Result<[u8; 32]> {
+    fn wrap_key(&self, salt: &[u8], log_n: u8) -> Result<Zeroizing<[u8; 32]>> {
         match &self.src {
-            Source::Key(k) => Ok(*k),
+            Source::Key(k) => Ok(k.clone()),
             Source::Passphrase(pw) => {
                 let mut cache = self.kdf_cache.lock().map_err(|_| err("keystore", "poisoned"))?;
-                if let Some(k) = cache.get(salt) {
-                    return Ok(*k);
+                if let Some(k) = cache.get(&(log_n, salt.to_vec())) {
+                    return Ok(k.clone());
                 }
-                let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32).map_err(|e| err("keystore", e.to_string()))?;
-                let mut out = [0u8; 32];
-                scrypt::scrypt(pw, salt, &params, &mut out).map_err(|e| err("keystore", e.to_string()))?;
-                cache.insert(salt.to_vec(), out);
+                let params = scrypt::Params::new(log_n, SCRYPT_R, SCRYPT_P, 32).map_err(|e| err("keystore", e.to_string()))?;
+                let mut out = Zeroizing::new([0u8; 32]);
+                scrypt::scrypt(pw, salt, &params, &mut *out).map_err(|e| err("keystore", e.to_string()))?;
+                cache.insert((log_n, salt.to_vec()), out.clone());
                 Ok(out)
             }
         }
@@ -126,11 +135,15 @@ impl KeyStore {
     pub fn seal(&self, plaintext: &[u8], aad: &str, salt: Option<&[u8]>) -> Result<Value> {
         let salt = salt.map(<[u8]>::to_vec).unwrap_or_else(|| random_bytes::<16>().to_vec());
         let nonce = random_bytes::<12>();
-        let cipher = Aes256Gcm::new_from_slice(&self.wrap_key(&salt)?).map_err(|_| err("keystore", "key length"))?;
+        let cipher = Aes256Gcm::new_from_slice(&*self.wrap_key(&salt, SCRYPT_LOG_N)?).map_err(|_| err("keystore", "key length"))?;
         let ct = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: aad.as_bytes() })
             .map_err(|_| err("keystore", "encryption failed"))?;
-        Ok(json!({"v": 1, "alg": "aes-256-gcm", "kdf": self.kind(), "salt": hex::encode(&salt), "nonce": hex::encode(nonce),
-                  "ct": hex::encode(ct), "aad": aad}))
+        let mut blob = json!({"v": 1, "alg": "aes-256-gcm", "kdf": self.kind(), "salt": hex::encode(&salt), "nonce": hex::encode(nonce),
+                              "ct": hex::encode(ct), "aad": aad});
+        if matches!(self.src, Source::Passphrase(_)) {
+            blob["log_n"] = SCRYPT_LOG_N.into();
+        }
+        Ok(blob)
     }
 
     /// Open a sealed blob; refuses another format, another `aad`, another kdf, a wrong key or a
@@ -152,7 +165,12 @@ impl KeyStore {
             (Some(s), Some(n), Some(c)) if n.len() == 12 => (s, n, c),
             _ => return Err(err("keystore", "cannot open sealed key: wrong wrapping key or tampered file")),
         };
-        let cipher = Aes256Gcm::new_from_slice(&self.wrap_key(&salt)?).map_err(|_| err("keystore", "key length"))?;
+        let log_n = match blob.get("log_n") {
+            None => SCRYPT_LOG_N_LEGACY,
+            Some(v) => v.as_u64().filter(|n| (SCRYPT_LOG_N_LEGACY as u64..=SCRYPT_LOG_N_MAX as u64).contains(n))
+                .ok_or_else(|| err("keystore", format!("sealed blob log_n must be {SCRYPT_LOG_N_LEGACY}..={SCRYPT_LOG_N_MAX}")))? as u8,
+        };
+        let cipher = Aes256Gcm::new_from_slice(&*self.wrap_key(&salt, log_n)?).map_err(|_| err("keystore", "key length"))?;
         cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: aad.as_bytes() })
             .map_err(|_| err("keystore", "cannot open sealed key: wrong wrapping key or tampered file"))
     }
@@ -177,14 +195,15 @@ pub fn load_or_create_keyfile(path: &Path, run_dir: Option<&Path>) -> Result<[u8
         f.write_all(&random_bytes::<32>()).map_err(|e| err("keystore", e.to_string()))?;
         f.sync_all().ok();
     }
-    let raw = fs::read(&path).map_err(|e| err("keystore", format!("{}: {e}", path.display())))?;
+    check_keyfile(&path)?;
+    let raw = Zeroizing::new(fs::read(&path).map_err(|e| err("keystore", format!("{}: {e}", path.display())))?);
     if raw.len() == 32 {
         let mut k = [0u8; 32];
         k.copy_from_slice(&raw);
         return Ok(k);
     }
-    let txt = String::from_utf8_lossy(&raw).trim().to_string();
-    match hex::decode(&txt) {
+    let txt = Zeroizing::new(String::from_utf8_lossy(&raw).trim().to_string());
+    match hex::decode(&*txt).map(Zeroizing::new) {
         Ok(k) if k.len() == 32 => {
             let mut out = [0u8; 32];
             out.copy_from_slice(&k);
@@ -192,6 +211,24 @@ pub fn load_or_create_keyfile(path: &Path, run_dir: Option<&Path>) -> Result<[u8
         }
         _ => Err(err("keystore", format!("{ENV_KEYFILE} must hold 32 bytes (raw or 64 hex chars)"))),
     }
+}
+
+/// AGP-063 K1: the keyfile (its path already resolved by `absolute`) must be a regular file with
+/// no bits for group or others, as the signer creates it.
+fn check_keyfile(path: &Path) -> Result<()> {
+    let md = fs::metadata(path).map_err(|e| err("keystore", format!("{}: {e}", path.display())))?;
+    if !md.file_type().is_file() {
+        return Err(err("keystore", format!("{ENV_KEYFILE} {} is not a regular file", path.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = md.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(err("keystore", format!("{ENV_KEYFILE} {} is mode {mode:o}: chmod 600 it", path.display())));
+        }
+    }
+    Ok(())
 }
 
 fn expand_home(p: &Path) -> PathBuf {
@@ -260,5 +297,53 @@ mod tests {
         assert_eq!(blob["kdf"], "scrypt");
         assert_eq!(KeyStore::with_passphrase(b"correct horse").open(&blob, "a").unwrap(), b"x");
         assert!(KeyStore::with_passphrase(b"wrong").open(&blob, "a").is_err());
+    }
+
+    /// AGP-063 K1: new passphrase blobs record scrypt N=2^17; a blob without `log_n` (B2 and
+    /// pre-AGP-063 Rust) still opens at 2^15; a `log_n` outside 15..=18 is refused before any work.
+    #[test]
+    fn k1_scrypt_cost_is_recorded_per_blob() {
+        let ks = KeyStore::with_passphrase(b"pw");
+        let blob = ks.seal(b"x", "a", None).unwrap();
+        assert_eq!(blob["log_n"], SCRYPT_LOG_N as u64);
+        assert_eq!(SCRYPT_LOG_N, 17);
+        let mut legacy = blob.clone();
+        legacy.as_object_mut().unwrap().remove("log_n");
+        assert!(KeyStore::with_passphrase(b"pw").open(&legacy, "a").is_err(), "a 2^17 blob read as 2^15 must not open");
+        let salt = hex::decode(blob["salt"].as_str().unwrap()).unwrap();
+        let k15 = ks.wrap_key(&salt, SCRYPT_LOG_N_LEGACY).unwrap();
+        let old = KeyStore::with_key(*k15).seal(b"old", "a", Some(&salt)).unwrap();
+        let mut old = old;
+        old["kdf"] = "scrypt".into();
+        assert_eq!(KeyStore::with_passphrase(b"pw").open(&old, "a").unwrap(), b"old");
+        for bad in [14u64, 19, 30, 255] {
+            let mut b = blob.clone();
+            b["log_n"] = bad.into();
+            assert!(KeyStore::with_passphrase(b"pw").open(&b, "a").unwrap_err().msg.contains("log_n"));
+        }
+        assert!(KeyStore::with_key([1; 32]).seal(b"x", "a", None).unwrap().get("log_n").is_none());
+    }
+
+    /// AGP-063 K1: a keyfile readable by group or others, or one that is not a regular file, is
+    /// refused, also through a symlink (the path is resolved first).
+    #[cfg(unix)]
+    #[test]
+    fn k1_a_keyfile_open_to_others_or_a_symlink_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("k/hot.key");
+        let k = load_or_create_keyfile(&p, None).unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_or_create_keyfile(&p, None).unwrap(), k);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_keyfile(&p, None).unwrap_err().msg.contains("mode 644"));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(load_or_create_keyfile(&p, None).unwrap(), k);
+        let link = d.path().join("link.key");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert_eq!(load_or_create_keyfile(&link, None).unwrap(), k);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load_or_create_keyfile(&link, None).unwrap_err().msg.contains("mode 640"));
+        assert!(load_or_create_keyfile(d.path(), None).unwrap_err().msg.contains("not a regular file"));
     }
 }

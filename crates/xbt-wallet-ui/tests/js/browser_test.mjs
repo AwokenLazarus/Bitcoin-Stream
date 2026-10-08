@@ -2,13 +2,13 @@
 // set the password with the setup code, make the approval key IN THE BROWSER, save its backup, enrol it,
 // approve a waiting xbt402 call by signing in the page, sign a policy change, and check the pages on a
 // phone-sized screen. Screenshots and HTML snapshots go to OUT.
-//   node browser_test.mjs BASE SETUP_CODE OUT
+//   node browser_test.mjs BASE SETUP_CODE OUT ENROLL_CODE
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const [BASE, CODE, OUT] = process.argv.slice(2);
+const [BASE, CODE, OUT, ENROLL] = process.argv.slice(2);
 mkdirSync(OUT, { recursive: true });
 const CHROME = process.env.CHROME || "google-chrome";
 const profile = mkdtempSync(join(tmpdir(), "xbtui-chrome-"));
@@ -103,6 +103,7 @@ try {
   const pub = JSON.parse(stored).pub;
   check("a new wrap uses 210000 PBKDF2 iterations", JSON.parse(stored).iter === 210000, stored);
   await shot("02-setup-key", 1100);
+  await set("#enroll-form [name=code]", ENROLL);
   await submitAndWait("document.getElementById('enroll-form').submit()");
   check("the public key is enrolled", (await flash()).includes("Approval key enrolled"), await flash());
   check("the page knows this browser holds the enrolled key", (await ev("document.getElementById('browser-key').textContent")).includes("holds the enrolled"));

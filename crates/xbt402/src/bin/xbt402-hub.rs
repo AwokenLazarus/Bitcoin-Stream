@@ -347,6 +347,7 @@ fn main() {
                                  base, public: env("XBT_PUBLIC_URL"), trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false) });
     let handles = serve_service(front, &bind, threads).unwrap_or_else(|e| die(format!("bind {bind}: {e}")));
     eprintln!("xbt402 hub {} on {bind} ({network})", hub.pay_to());
+    eprintln!("xbt402 hub: EXPERIMENTAL - routing is not production-ready; do not route funds you cannot lose");
     for h in handles {
         let _ = h.join();
     }

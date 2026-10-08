@@ -4,8 +4,10 @@
 //! the human's ed25519 key, exactly like `approve` and `sweep_hot`: a new policy (`policy_set`), a new
 //! human key (`human_key_rotate`), a hot-key rotation (`rotate_hot_key_signed`) and the backup export
 //! (`backup_export`). The socket is shared with the model-facing process, so a login to the UI is never
-//! what authorises these; the signature is. The other methods read state, or deny (`deny_approval`),
-//! or enrol the first human key while none exists (`human_key_enroll`, trust on first use).
+//! what authorises these; the signature is. AGP-063 W3: refusing an approval (`deny_approval`) and
+//! the plain `rotate_hot_key` need it too. The first human key is enrolled only with the one-time
+//! code this signer writes to its log and `.run/enroll-code` while none is enrolled (W4): a process on
+//! the socket cannot read the console or the run dir, so it cannot enrol its own key first.
 //!
 //! An over-threshold `xbt402_pay` becomes a *grant* when approved: the human signs (token, origin,
 //! max_sats, expiry) and the agent's next `xbt402_pay` of the same URL, method and `max_sats` pays under
@@ -15,7 +17,8 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::approval::{backup_message, human_key_message, policy_message, rotate_message, verify, x2b};
+use crate::approval::{backup_message, deny_message, human_key_message, policy_message, rotate_message, verify, x2b};
+use crate::keystore::{random_bytes, write_private};
 use crate::keystore::KeyStore;
 use crate::policy::{validate_policy, PolicyConfig, RESTART_KEYS};
 use crate::pyjson::{dumps, dumps_indent, py_int, str_or_empty, ts_value};
@@ -28,6 +31,33 @@ use crate::{err, Result};
 pub const POLICY_SIGN_WINDOW_S: i64 = 600;
 /// The shortest backup passphrase the export accepts.
 pub const MIN_BACKUP_PASS: usize = 12;
+/// AGP-063 W4: the enrolment code's file under `.run`, and the wrong codes one code survives.
+pub const ENROLL_CODE_FILE: &str = "enroll-code";
+pub const ENROLL_CODE_TRIES: u32 = 5;
+
+/// The one-time code that enrols the first human key, and the wrong codes tried against it.
+#[derive(Default)]
+pub struct EnrollCode {
+    code: String,
+    failures: u32,
+}
+
+/// 60 random bits as `XXXX-XXXX-XXXX` (Crockford base32: no I, L, O or U to misread).
+fn new_enroll_code() -> String {
+    const A: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let n = u64::from_le_bytes(random_bytes::<8>());
+    let c: Vec<u8> = (0..12).map(|i| A[((n >> (5 * i)) & 31) as usize]).collect();
+    format!("{}-{}-{}", String::from_utf8_lossy(&c[..4]), String::from_utf8_lossy(&c[4..8]), String::from_utf8_lossy(&c[8..]))
+}
+
+fn canon_code(s: &str) -> Vec<u8> {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect::<String>().into_bytes()
+}
+
+/// Equal-length compare without an early exit.
+fn same_code(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 pub fn sha256_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
@@ -152,7 +182,7 @@ impl Signer {
             "policy_set" => self.policy_set(p),
             "human_key_enroll" => self.human_key_enroll(p),
             "human_key_rotate" => self.human_key_rotate(p),
-            "rotate_hot_key_signed" => self.rotate_signed(p),
+            "rotate_hot_key" | "rotate_hot_key_signed" => self.rotate_signed(p),
             "backup_export" => self.backup_export(p),
             "keystore_status" => self.keystore_status(),
             "channel_reports" => Ok(json!({"reports": self.close_reports(), "height": self.height_safe(),
@@ -177,9 +207,18 @@ impl Signer {
         Ok(known.unwrap_or_else(|| json!({"token": token, "state": "unknown"})))
     }
 
+    /// Refuse or revoke an approval: signed by the human (`deny_message`), since a refused grant is
+    /// a payment the human wanted; an approval that has already expired may be dismissed unsigned.
     fn deny_approval(&self, p: &Value) -> Result<Value> {
         let token = str_or_empty(p.get("token"));
         let reason: String = str_or_empty(p.get("reason")).chars().take(200).collect();
+        let Some(a) = self.engine.store.get_approval(&token)? else { return Ok(deny("approval", "unknown or already-used approval token")) };
+        if py_int(a.get("expires")).unwrap_or(0) >= self.now_i() {
+            let expiry = py_int(p.get("expiry")).unwrap_or(0);
+            if let Some(d) = self.check_sig(&deny_message(&token, expiry), p, expiry) {
+                return Ok(d);
+            }
+        }
         let Some(a) = self.engine.store.pop_approval(&token)? else { return Ok(deny("approval", "unknown or already-used approval token")) };
         self.engine.audit.append(json!({"type": "approval_denied", "token": token, "dest": a.get("dest"), "amount_sats": a.get("amount_sats"),
                                         "reason": reason, "ts": ts_value(self.engine.now())}));
@@ -278,9 +317,43 @@ impl Signer {
             return Ok(deny("human_key", "a human key is already enrolled: rotate it with a signature by the current key"));
         }
         let Some(new) = Self::parse_pub(p) else { return Ok(deny("human_key", "pubkey must be a 32-byte ed25519 public key in hex")) };
+        if let Some(d) = self.take_enroll_code(&str_or_empty(p.get("code")))? {
+            return Ok(d);
+        }
         let sha = self.set_human_pubkey_in_policy(&new)?;
         self.engine.audit.append(json!({"type": "human_key_enrolled", "human_pubkey": new, "ts": ts_value(self.engine.now())}));
         Ok(json!({"ok": true, "human_pubkey": new, "policy_sha256": sha}))
+    }
+
+    /// While no human key is enrolled: a fresh one-time code, written to the log and to
+    /// `.run/enroll-code` (0600), where only the box's owner reads it (Umbrel and StartOS: the app's log).
+    pub(crate) fn issue_enroll_code(&self) -> Result<()> {
+        let code = new_enroll_code();
+        write_private(&self.run.join(ENROLL_CODE_FILE), &format!("{code}\n"))?;
+        eprintln!("xbt-signer: no human key is enrolled. One-time enrolment code: {code} (also in {})", self.run.join(ENROLL_CODE_FILE).display());
+        *self.enroll.lock().unwrap_or_else(|p| p.into_inner()) = EnrollCode { code, failures: 0 };
+        Ok(())
+    }
+
+    /// `None` when `given` is the current code (now spent); else the deny. After
+    /// [`ENROLL_CODE_TRIES`] wrong codes a new code replaces it.
+    fn take_enroll_code(&self, given: &str) -> Result<Option<Value>> {
+        let mut g = self.enroll.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.code.is_empty() && same_code(&canon_code(given), &canon_code(&g.code)) {
+            *g = EnrollCode::default();
+            drop(g);
+            let _ = std::fs::remove_file(self.run.join(ENROLL_CODE_FILE));
+            return Ok(None);
+        }
+        g.failures += 1;
+        let renew = g.code.is_empty() || g.failures >= ENROLL_CODE_TRIES;
+        drop(g);
+        self.engine.audit.append(json!({"type": "human_key_enroll_refused", "renewed": renew, "ts": ts_value(self.engine.now())}));
+        if renew {
+            self.issue_enroll_code()?;
+        }
+        Ok(Some(deny("enroll_code", format!("missing or wrong enrolment code: read it in the signer's log or {}{}",
+                                             self.run.join(ENROLL_CODE_FILE).display(), if renew { " (a new code was issued)" } else { "" }))))
     }
 
     fn human_key_rotate(&self, p: &Value) -> Result<Value> {

@@ -244,18 +244,35 @@ impl Pending {
 struct GivenUp {
     cum: u64,
     lock_id: String,
+    /// The counters (routed, fee units, fee paid) before and after the lock.
+    before: (u64, u128, u64),
     after: (u64, u128, u64),
+    /// A dust-floor lock: nothing pre-signed, so nothing for the signer to adopt.
+    floor: bool,
+    /// The hub holds it in ch1's base until its ch2 resolves (AGP-064): our counters are `after`.
+    held: bool,
+}
+
+fn counters_json(c: (u64, u128, u64)) -> Value {
+    json!([c.0, c.1.to_string(), c.2])
+}
+
+fn counters_of(v: Option<&Value>) -> Option<(u64, u128, u64)> {
+    let a = v?.as_array()?;
+    Some((py_u64(a.first())?, u128_of(a.get(1))?, py_u64(a.get(2))?))
 }
 
 impl GivenUp {
     fn to_json(&self) -> Value {
-        json!({"cum": self.cum, "lockId": self.lock_id, "after": [self.after.0, self.after.1.to_string(), self.after.2]})
+        json!({"cum": self.cum, "lockId": self.lock_id, "before": counters_json(self.before), "after": counters_json(self.after),
+               "floor": self.floor, "held": self.held})
     }
 
     fn from_json(v: &Value) -> Option<Self> {
-        let a = v.get("after")?.as_array()?;
-        Some(Self { cum: py_u64(v.get("cum"))?, lock_id: py_str(v.get("lockId")),
-                    after: (py_u64(a.first())?, u128_of(a.get(1))?, py_u64(a.get(2))?) })
+        let after = counters_of(v.get("after"))?;
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(Self { cum: py_u64(v.get("cum"))?, lock_id: py_str(v.get("lockId")), before: counters_of(v.get("before")).unwrap_or(after), after,
+                    floor: flag("floor"), held: flag("held") })
     }
 }
 
@@ -449,7 +466,7 @@ impl RoutePayer {
                     FeePayer::parse(fp.as_str().unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "unknown closeFeePayer"))?;
                 }
                 if ex.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
-                    return fail("bad_offer", "payee key derivation is not v2 (xbt402 v1.1)");
+                    return fail("bad_offer", format!("channel binding is not {DERIVATION:?} (payee key v2, request binding v2)"));
                 }
                 return Ok(acc.clone());
             }
@@ -526,7 +543,7 @@ impl RoutePayer {
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
-        let (txid, vout) = self.wallet.fund(&segwit_address(hrp, &p.spk())?, cap)?;
+        let (txid, vout) = self.wallet.fund_channel(&self.hub_url, &p, &segwit_address(hrp, &p.spk())?, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.signer.attach(&self.hub_url, &p)?;
         self.signer.sign_refund(&p.channel_id())?;
@@ -637,7 +654,7 @@ impl RoutePayer {
             // write-ahead: a restart starts past every seq that may have left
             self.persist(&[(format!("shard {}", sh.url), sh.to_json())])?;
         }
-        let auth = call_auth(&sh.key, &sh.session, seq, &request_digest(method, &sh.path, body));
+        let auth = call_auth(&sh.key, &sh.session, seq, &request_digest_v2(method, &sh.url, body));
         let hdr = b64json(&json!({"session": sh.session, "seq": seq, "auth": auth}));
         let t0 = Instant::now();
         let r = self.http.request(method, &sh.url, body, &[("ROUTE-AUTH".into(), hdr)])?;
@@ -785,34 +802,68 @@ impl RoutePayer {
     fn void(&self, st: &mut PState, p: &Pending, why: &str) {
         if !p.floor {
             let _ = self.signer.void_lock(&Self::chan_of(st));
-            let after = (st.routed + p.d + p.f, p.units, st.fee_paid + p.f);
-            st.given_up.push(GivenUp { cum: p.cum, lock_id: p.lock_id.clone(), after });
-            if st.given_up.len() > 16 {
-                st.given_up.remove(0);
-            }
+        }
+        let before = (st.routed, st.fee_units, st.fee_paid);
+        let after = (st.routed + p.d + p.f, p.units, st.fee_paid + p.f);
+        st.given_up.push(GivenUp { cum: p.cum, lock_id: p.lock_id.clone(), before, after, floor: p.floor, held: false });
+        if st.given_up.len() > 16 {
+            // a held lock is kept until its release or completion: without it a release could not be adopted
+            let i = st.given_up.iter().position(|g| !g.held).unwrap_or(0);
+            st.given_up.remove(i);
         }
         st.stats.voided += 1;
         self.event(json!({"event": "void", "provider": p.shard.origin, "lockId": p.lock_id, "amount": p.d, "why": why}));
     }
 
-    /// The hub completed a lock we had given up (it read t off the provider's ch2 close). Adopt its
-    /// view only if its best state is one of those locks, with the counters it implied.
+    /// Adopt a hub view of ch1 (`{bestCum, routedSat, feeUnits, feePaid, held, released}`) only when
+    /// it is one of our given-up locks, at the counters it implied:
+    /// - completed: the hub read t off the provider's ch2 close; its best state is that lock;
+    /// - held (AGP-064): its ch2 pre-signature may be out, so the hub keeps it in the base until
+    ///   that ch2 resolves; our counters become its `after`, our signed state stays;
+    /// - released: its ch2 resolved unpaid; the hold leaves our counters, so our next locks are
+    ///   quoted below our signed state (the dust floor) until what we paid ahead for it is used.
     fn resync(&self, st: &mut PState, doc: &Value) -> bool {
         let (Some(best), Some(r), Some(u), Some(pd)) = (py_u64(doc.get("bestCum")), py_u64(doc.get("routedSat")), u128_of(doc.get("feeUnits")),
                                                         py_u64(doc.get("feePaid"))) else { return false };
-        let Some(i) = st.given_up.iter().position(|g| g.cum == best && g.after == (r, u, pd)) else { return false };
-        if best <= st.signed {
+        let hub = (r, u, pd);
+        let ours = (st.routed, st.fee_units, st.fee_paid);
+        let listed = |k: &str, id: &str| doc.get(k).and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id)));
+        if best > st.signed {
+            let Some(i) = st.given_up.iter().position(|g| !g.floor && g.cum == best && (g.after == hub || (g.held && hub == ours))) else { return false };
+            // the refused lock goes first: a signer adopts only with no lock pending (B2's book, xbt-signer)
+            let chan = Self::chan_of(st);
+            let _ = self.signer.void_lock(&chan);
+            if self.signer.adopt_lock(&chan, best).is_err() {
+                return false;
+            }
+            (st.routed, st.fee_units, st.fee_paid, st.signed) = (r, u, pd, best);
+            let g = st.given_up.remove(i);
+            self.event(json!({"event": "resync", "lockId": g.lock_id, "cum1": best}));
+            return true;
+        }
+        if best != st.signed || hub == ours {
             return false;
         }
-        // the refused lock goes first: a signer adopts only with no lock pending (B2's book, xbt-signer)
-        let chan = Self::chan_of(st);
-        let _ = self.signer.void_lock(&chan);
-        if self.signer.adopt_lock(&chan, best).is_err() {
-            return false;
+        let gone: Vec<usize> = (0..st.given_up.len()).filter(|&i| st.given_up[i].held && listed("released", &st.given_up[i].lock_id)).collect();
+        if !gone.is_empty() {
+            let mut want = ours;
+            for &i in &gone {
+                let g = &st.given_up[i];
+                want.0 = want.0.saturating_sub(g.after.0.saturating_sub(g.before.0));
+                want.1 = want.1.saturating_sub(g.after.1.saturating_sub(g.before.1));
+                want.2 = want.2.saturating_sub(g.after.2.saturating_sub(g.before.2));
+            }
+            if want == hub {
+                (st.routed, st.fee_units, st.fee_paid) = hub;
+                let ids: Vec<String> = gone.iter().rev().map(|&i| st.given_up.remove(i).lock_id).collect();
+                self.event(json!({"event": "resync_release", "lockIds": ids, "routedSat": r}));
+                return true;
+            }
         }
-        (st.routed, st.fee_units, st.fee_paid, st.signed) = (r, u, pd, best);
-        let g = st.given_up.remove(i);
-        self.event(json!({"event": "resync", "lockId": g.lock_id, "cum1": best}));
+        let Some(g) = st.given_up.iter_mut().find(|g| !g.held && g.before == ours && g.after == hub && listed("held", &g.lock_id)) else { return false };
+        g.held = true;
+        (st.routed, st.fee_units, st.fee_paid) = hub;
+        self.event(json!({"event": "resync_hold", "lockId": g.lock_id, "routedSat": r}));
         true
     }
 
@@ -909,7 +960,7 @@ impl RoutePayer {
         let mut pl = pl.clone();
         pl["seq"] = ch.seq.into();
         let chan = ch.params.channel_id();
-        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest("POST", HUB_ROUTE_PATH, body.as_bytes()))?.into();
+        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), body.as_bytes()))?.into();
         Ok(pl)
     }
 
@@ -1008,6 +1059,10 @@ impl RoutePayer {
                     self.void(&mut st, &p, &format!("hub: {code}"));
                     p.shard
                 });
+                if doc.get("held").is_some() {
+                    // AGP-064: the hub keeps this lock in ch1's base until its ch2 resolves
+                    self.resync(&mut st, &doc);
+                }
                 self.persist_lock_state(&st, shard.as_ref());
                 return Ok(Some(json!({"status": "refused", "error": code, "detail": detail})));
             }

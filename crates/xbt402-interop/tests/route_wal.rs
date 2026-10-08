@@ -20,7 +20,7 @@ use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::route::{call_auth, session_key, state_verify};
 use xbt402::route_seller::RouteOffer;
-use xbt402::wire::{b64json, request_digest, unb64json};
+use xbt402::wire::{b64json, request_digest_v2, unb64json};
 use xbt402_interop::memnet::MemChain;
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
@@ -154,7 +154,7 @@ impl Client {
             self.seq += 1;
             self.seq
         });
-        let auth = call_auth(&self.key, &self.session, seq, &request_digest("POST", PATH, body));
+        let auth = call_auth(&self.key, &self.session, seq, &request_digest_v2("POST", PATH, body));
         vec![("ROUTE-AUTH".into(), b64json(&serde_json::json!({"session": self.session, "seq": seq, "auth": auth})))]
     }
 

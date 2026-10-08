@@ -385,10 +385,17 @@ pub trait AdaptorBackend: Send + Sync {
 pub struct Secp256k1Dleq;
 
 impl Secp256k1Dleq {
-    /// Pre-sign with given nonces `k` and `w` (None if they make r or s' zero). For test vectors
-    /// only: a reused k leaks x.
-    #[doc(hidden)]
+    /// Pre-sign with given nonces `k` and `w` (None if they make r or s' zero).
+    ///
+    /// A reused `k` leaks `x`. This is not part of the library a hub or a wallet links: it exists
+    /// for this crate's tests and for the vector emitter (`feature = "vector-emitter"`, which
+    /// `xbt402-interop` turns on). `xbt402-hub` does not enable that feature.
+    #[cfg(any(test, feature = "vector-emitter"))]
     pub fn presign_with_nonces(&self, x: &SecretKey, z: &[u8; 32], y: &PublicKey, k: &SecretKey, w: &SecretKey) -> Option<PreSig> {
+        self.presign_with_nonces_inner(x, z, y, k, w)
+    }
+
+    fn presign_with_nonces_inner(&self, x: &SecretKey, z: &[u8; 32], y: &PublicKey, k: &SecretKey, w: &SecretKey) -> Option<PreSig> {
         let xp = ecdsa::pubkey(x);
         let r1 = point_of(k);
         let big_r = y.mul_tweak(SECP256K1, &Scalar::from(*k)).ok()?;
@@ -410,7 +417,7 @@ impl Secp256k1Dleq {
 impl AdaptorBackend for Secp256k1Dleq {
     fn presign(&self, x: &SecretKey, z: &[u8; 32], y: &PublicKey) -> Result<PreSig> {
         for _ in 0..64 {
-            if let Some(p) = self.presign_with_nonces(x, z, y, &random_secret(), &random_secret()) {
+            if let Some(p) = self.presign_with_nonces_inner(x, z, y, &random_secret(), &random_secret()) {
                 return Ok(p);
             }
         }

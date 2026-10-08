@@ -49,7 +49,8 @@ rm -rf "${RUN:?}"
 mkdir -p "$RUN/src/b1" "$RUN/src/b2" "$OUT"
 # AGP-055: SIGNER_INTEROP_B2_PIN overrides the B2 pin. Part 3 needs a B2 that reads the append-only
 # payments log (agp-055 or later): the xbt-063 pin b4f2fe5 reads payments from ledger.json, where they no longer are.
-export REHEARSAL_B1_PIN=$(awk '$1=="b1"{print $2}' "$XBT063/rehearsal/PINS")
+# SIGNER_INTEROP_B1_PIN overrides the B1 pin: a B2 from AGP-068 on imports request binding v2 from B1.
+export REHEARSAL_B1_PIN=${SIGNER_INTEROP_B1_PIN:-$(awk '$1=="b1"{print $2}' "$XBT063/rehearsal/PINS")}
 export REHEARSAL_B2_PIN=${SIGNER_INTEROP_B2_PIN:-$(awk '$1=="b2"{print $2}' "$XBT063/rehearsal/PINS")}
 git -C "$HOME/xbt-rnd/b1" archive "$REHEARSAL_B1_PIN" xbt402 scripts | tar -x -C "$RUN/src/b1"
 git -C "$HOME/xbt-rnd/b2" archive "$REHEARSAL_B2_PIN" agentwallet agentwallet-approve | tar -x -C "$RUN/src/b2"

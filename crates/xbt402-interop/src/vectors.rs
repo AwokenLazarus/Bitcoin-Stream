@@ -123,14 +123,27 @@ pub fn gen_auth() -> Value {
     let sig546 = hex::encode(Payer::new(p.clone(), a).expect("payer").sign_state(546).expect("sig"));
     let chan = p.channel_id();
     type Case<'a> = (&'a str, &'a str, &'a [u8], u64, &'a str, Option<&'a str>);
-    let rows: [Case; 3] = [
-        ("GET", "/v1/quote?pair=XBT-USD", b"", 1, "0", None),
-        ("POST", "/v1/infer", br#"{"prompt":"hello"}"#, 2, "546", Some(sig546.as_str())),
-        ("POST", "/v1/a%20b?x=1", b"\x00\x01binary", 7, "1200", None),
+    // v1.3: absolute URLs (canonicalised), the v1 collision pair (one digest under "|", two here), a
+    // bare target (binds no origin) and the empty request a close binds
+    let rows: [Case; 7] = [
+        ("GET", "https://api.example.com/v1/quote?pair=XBT-USD", b"", 1, "0", None),
+        ("POST", "HTTPS://API.Example.com:443/v1/infer", br#"{"prompt":"hello"}"#, 2, "546", Some(sig546.as_str())),
+        ("POST", "http://user@[::1]:08402/v1/a%20b?x=1#frag", b"\x00\x01binary", 7, "1200", None),
+        ("GET", "https://api.example.com/q?a|b", b"", 8, "1200", None),
+        ("GET", "https://api.example.com/q?a", b"b|", 9, "1200", None),
+        ("GET", "/v1/x", b"", 10, "1200", None),
+        ("", "", b"", 11, "1200", None),
     ];
-    let cases: Vec<Value> = rows.iter().map(|(method, path, body, seq, cum, sig)| {
-        let req = request_digest(method, path, body);
-        json!({"method": method, "path": path, "bodyHex": hex::encode(body), "req": req, "chan": chan, "seq": seq, "cum": cum,
+    let cases: Vec<Value> = rows.iter().map(|(method, url, body, seq, cum, sig)| {
+        let req = request_digest_v2(method, url, body);
+        let u = request_url(url);
+        let mut pre = Vec::new();
+        for f in [method.as_bytes(), u.scheme.as_bytes(), u.host.as_bytes(), u.port.as_bytes(), u.target.as_bytes(), body] {
+            pre.extend((f.len() as u64).to_le_bytes());
+            pre.extend(f);
+        }
+        json!({"method": method, "url": url, "scheme": u.scheme, "host": u.host, "port": u.port, "target": u.target,
+               "bodyHex": hex::encode(body), "reqPreimageHex": hex::encode(pre), "req": req, "chan": chan, "seq": seq, "cum": cum,
                "sig": sig.unwrap_or(""), "message": auth_message(&chan, &seq.to_string(), cum, sig.unwrap_or(""), &req),
                "auth": request_auth(&k_payer, &chan, Some(&json!(seq)), Some(&json!(cum)), *sig, &req)})
     }).collect();
@@ -236,7 +249,7 @@ pub fn gen_roundtrip() -> Value {
             pl["sig"] = hex::encode(payer.sign_state(cum).expect("sig")).into();
         }
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
-        pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest(method, path, body)).into();
+        pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest_v2(method, url, body)).into();
         let h = b64json(&payment_payload(&accepted, &pl));
         headers.push(h.clone());
         let r = prov.serve(method, path, &sig_hdr(&h), body, url, None);
@@ -270,7 +283,7 @@ pub fn gen_roundtrip() -> Value {
         pl["sig"] = hex::encode(payer.sign_state(fin).expect("sig")).into();
     }
     let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
-    pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest("", "", b"")).into();
+    pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest_v2("", "", b"")).into();
     let close_req = json!({"chan": chan, "sig": hex::encode(ecdsa::sign(&a, &close_message(&chan))), "payload": pl});
     let close_url = accepted["extra"]["closeUrl"].as_str().unwrap_or("").to_string();
     let r = prov.serve("POST", &close_url, &[], xbt402::json::dumps(&close_req).as_bytes(), "", None);
@@ -310,7 +323,7 @@ pub fn gen_conditional() -> Value {
             pl[k] = v.clone();
         }
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
-        pl["auth"] = request_auth(&kauth, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest("GET", path, b"")).into();
+        pl["auth"] = request_auth(&kauth, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest_v2("GET", &format!("{origin}{path}"), b"")).into();
         let h = b64json(&payment_payload(&accepted, &pl));
         let r = prov.serve("GET", path, &sig_hdr(&h), b"", &format!("{origin}{path}"), None);
         (pl, h, r)
@@ -423,7 +436,7 @@ fn payee_pays_close(prov: &Provider, node: &StubNode, p: &ChannelParams, a: &Sec
             pl["sig"] = hex::encode(payer.sign_state(cum).expect("sig")).into();
         }
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
-        pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest("GET", "/v1/x", b"")).into();
+        pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest_v2("GET", "/v1/x", b"")).into();
         let r = prov.serve("GET", "/v1/x", &sig_hdr(&b64json(&payment_payload(&acc, &pl))), b"", "", None);
         let resp = unb64json(&hdr(&r, "PAYMENT-RESPONSE")).expect("PAYMENT-RESPONSE");
         spent_msat = receipt_of(&resp).expect("receipt")["spentMsat"].as_str().and_then(|s| s.parse().ok()).expect("spentMsat");
@@ -445,15 +458,16 @@ fn payee_pays_close(prov: &Provider, node: &StubNode, p: &ChannelParams, a: &Sec
 pub fn generate() -> Value {
     json!({
         "title": "x402 batch-settlement (XBT channel) test vectors",
-        "version": format!("1.2-draft (payee derivation {DERIVATION}, x402 v2 SettlementResponse and facilitator shapes, closeFeePayer)"),
-        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
+        "version": format!("1.3-draft (payee derivation {DERIVATION}, request binding v2, x402 v2 SettlementResponse and facilitator shapes, closeFeePayer)"),
+        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.3",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",
                   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
                   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
                   "Fields starting with '_' are cross-checks, not wire values.",
-                  "Sections derivation..conditional are v1.1 and unchanged in v1.2 (payer-pays, closeFeePayer absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format."],
+                  "Sections derivation..conditional are v1.1 and unchanged in v1.2 (payer-pays, closeFeePayer absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format.",
+                  "v1.3 (AGP-068): auth req and receipts are length-prefixed (origin, status, bodyHash); extra.derivation is v3, which a v1.2 client refuses before funding."],
         "constants": {"network": NETWORK, "dust": DUST, "closeFeeSat": CLOSE_FEE, "capacity": CAPACITY, "sighashAllUnified": SIGHASH_ALL_UNIFIED,
-                      "derivation": DERIVATION, "tags": [PAYEE_TAG, "xbt402/auth-key", "xbt402/receipt", "xbt402/close", "UnifiedSighash"]},
+                      "derivation": DERIVATION, "tags": [PAYEE_TAG, "xbt402/auth-key", "xbt402/receipt/v2", "xbt402/req/v2", "xbt402/close", "UnifiedSighash"]},
         "derivation": gen_derivation(),
         "auth": gen_auth(),
         "state": gen_states(),

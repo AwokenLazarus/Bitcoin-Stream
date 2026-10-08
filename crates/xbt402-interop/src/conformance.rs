@@ -93,6 +93,22 @@ fn short(v: &Value) -> String {
     s.chars().take(60).collect()
 }
 
+/// RFC 2104 over SHA-256, written out so the check does not share the library's HMAC.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.iter().map(|x| x ^ b).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(msg);
+    let mut outer = pad(0x5c);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+
 fn h(v: &Value) -> Vec<u8> {
     v.as_str().and_then(|s| hex::decode(s).ok()).unwrap_or_default()
 }
@@ -165,6 +181,25 @@ pub fn independent_checks(v: &Value) -> Vec<String> {
     let au = &v["auth"];
     need(au["K"] == au["_K_payee_side"], "auth.cases[0]: payer and payee disagree on K".into());
     need(hex::encode(tagged_hash("xbt402/auth-key", &h(&au["ecdhX"]))) == au["K"].as_str().unwrap_or(""), "auth.cases[0]: K != tagged_hash(x)".into());
+    let cases = au["cases"].as_array().cloned().unwrap_or_default();
+    for (i, c) in cases.iter().enumerate() {
+        // v1.3 request binding, from the split fields alone: LE64(len) ‖ field, tagged "xbt402/req/v2"
+        let mut pre = Vec::new();
+        for f in [c["method"].as_str(), c["scheme"].as_str(), c["host"].as_str(), c["port"].as_str(), c["target"].as_str()] {
+            let f = f.unwrap_or("").as_bytes();
+            pre.extend((f.len() as u64).to_le_bytes());
+            pre.extend(f);
+        }
+        let body = h(&c["bodyHex"]);
+        pre.extend((body.len() as u64).to_le_bytes());
+        pre.extend(&body);
+        need(pre == h(&c["reqPreimageHex"]), format!("auth.cases[{i}]: req preimage is not the length-prefixed fields"));
+        need(hex::encode(tagged_hash("xbt402/req/v2", &pre)) == c["req"].as_str().unwrap_or(""), format!("auth.cases[{i}]: req != tagged_hash(preimage)"));
+        need(hex::encode(hmac_sha256(&h(&au["K"]), c["message"].as_str().unwrap_or("").as_bytes())) == c["auth"].as_str().unwrap_or(""),
+             format!("auth.cases[{i}]: auth != HMAC(K, message)"));
+    }
+    let reqs: std::collections::BTreeSet<&str> = cases.iter().filter_map(|c| c["req"].as_str()).collect();
+    need(reqs.len() == cases.len(), "auth.cases[0]: two requests share a req".into());
     let st = &v["state"];
     let p = ChannelParams::from_json(&st["params"]);
     match p {
@@ -199,6 +234,10 @@ pub fn independent_checks(v: &Value) -> Vec<String> {
         if let Some(r) = s.get("receipt") {
             let resp = &s["settlementResponse"];
             need(ecdsa::verify(&payee_pub, &receipt_message(r), &h(&r["sig"])), format!("{at}: receipt not signed by P"));
+            if s.get("bodyHex").is_some() {
+                need(r["status"] == s["status"] && r["bodyHash"].as_str() == Some(hex::encode(sha256(&h(&s["bodyHex"]))).as_str()),
+                     format!("{at}: receipt status/bodyHash is not the answer's"));
+            }
             need(unb64json(s["PAYMENT-RESPONSE"].as_str().unwrap_or("")).ok().as_ref() == Some(resp), format!("{at}: header != response"));
             let keys: Vec<&str> = resp.as_object().map(|m| m.keys().map(String::as_str).collect()).unwrap_or_default();
             need(keys == ["success", "transaction", "network", "payer", "amount", "extra"] && resp["transaction"] == "" && resp["network"] == rt["network"]
@@ -367,7 +406,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
 
 /// The 50 xbt402 vectors.
 pub fn xbt402_group(path: &Path) -> Group {
-    let mut g = Group { name: "xbt402 (v1.1 + v1.2)".into(), source: path.display().to_string(), total: 0, passed: 0, failures: vec![] };
+    let mut g = Group { name: "xbt402 (v1.1 to v1.3)".into(), source: path.display().to_string(), total: 0, passed: 0, failures: vec![] };
     match read_json(path) {
         Ok(want) => xbt402_check(&want, &g.source),
         Err(e) => {
@@ -379,7 +418,7 @@ pub fn xbt402_group(path: &Path) -> Group {
 
 /// [`xbt402_group`] over an already-loaded vector file.
 pub fn xbt402_check(want: &Value, source: &str) -> Group {
-    let mut g = Group { name: "xbt402 (v1.1 + v1.2)".into(), source: source.into(), total: 0, passed: 0, failures: vec![] };
+    let mut g = Group { name: "xbt402 (v1.1 to v1.3)".into(), source: source.into(), total: 0, passed: 0, failures: vec![] };
     let want = want.clone();
     let all = units(&want);
     g.total = all.len();

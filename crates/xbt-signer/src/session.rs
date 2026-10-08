@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, facilitator_request, receipt_of, request_digest, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
+use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -123,6 +123,14 @@ fn merge(dst: &mut Value, src: Value) {
 
 pub type MineFn = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
+/// Commit a signed increase to the policy ledger before the signature is sent.
+/// `(dest, delta_sats, chan, cum)`.
+pub type SpendBook = Arc<dyn Fn(&str, i64, &str, i64) -> Result<()> + Send + Sync>;
+
+/// The policy's verdict on a signed increase larger than the amount it approved (a channel's
+/// dust floor). `(dest, max_sats, delta_sats)`; `Some(deny)` stops the call before anything is signed.
+pub type SpendCheck = Arc<dyn Fn(&str, i64, i64) -> Result<Option<Value>> + Send + Sync>;
+
 /// One signer-owned client session.
 pub struct Session {
     pub book: Arc<ChannelBook>,
@@ -135,6 +143,8 @@ pub struct Session {
     pub close_fee_max: i64,
     pub refund_margin: i64,
     net: Mutex<Option<String>>,
+    spend_book: Mutex<Option<SpendBook>>,
+    spend_check: Mutex<Option<SpendCheck>>,
 }
 
 impl Session {
@@ -144,7 +154,18 @@ impl Session {
         if mine.is_some() && !node::mining_allowed(chain) {
             return Err(err("chain", format!("a mining hook on {chain:?}: only regtest may mine")));
         }
-        Ok(Self { book, hot, node, transport, chain: chain.into(), mine, open_wait_s, close_fee_max, refund_margin, net: Mutex::new(None) })
+        Ok(Self { book, hot, node, transport, chain: chain.into(), mine, open_wait_s, close_fee_max, refund_margin, net: Mutex::new(None),
+                  spend_book: Mutex::new(None), spend_check: Mutex::new(None) })
+    }
+
+    /// The signer sets this so a signed increase is in the policy ledger before it leaves.
+    pub fn set_spend_book(&self, book: SpendBook) {
+        *self.spend_book.lock().unwrap_or_else(|p| p.into_inner()) = Some(book);
+    }
+
+    /// The signer sets this so a dust floor above `max_sats` is held to the budget too.
+    pub fn set_spend_check(&self, check: SpendCheck) {
+        *self.spend_check.lock().unwrap_or_else(|p| p.into_inner()) = Some(check);
     }
 
     pub fn height(&self) -> Result<u64> {
@@ -174,7 +195,7 @@ impl Session {
         let extra = acc.get("extra").cloned().unwrap_or(json!({}));
         if extra.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
             // checked before funding: a mismatch strands the coins (no provider text: L12)
-            return Err(rt(format!("provider payee-key derivation is not {DERIVATION:?}; refused before funding")));
+            return Err(rt(format!("provider channel binding (extra.derivation) is not {DERIVATION:?}; refused before funding")));
         }
         let close_fee = or_int(extra.get("closeFeeSat"), 600)?;
         if self.close_fee_max > 0 && close_fee > self.close_fee_max {
@@ -189,7 +210,13 @@ impl Session {
         // min/maxCapacity bound the funding output (cap + our close fee), as B1 checks it (AGP-017)
         let min_cap = or_int(extra.get("minCapacity"), 0)?;
         let max_cap = or_int(extra.get("maxCapacity"), cap_sats + payer_fee)?;
-        let cap = cap_sats.max(min_cap - payer_fee);
+        // AGP-063 W2: the seller's minCapacity must not raise the owner's per-channel cap.
+        // minCapacity bounds the funding output (cap + the payer's close fee).
+        let owner_funded = cap_sats.saturating_add(payer_fee);
+        if min_cap > owner_funded {
+            return Err(err("min_capacity", format!("offer minCapacity {min_cap} exceeds this wallet's per-channel cap {owner_funded}")));
+        }
+        let cap = cap_sats;
         if cap + payer_fee > max_cap {
             return Err(rt(format!("channel capacity {} above provider max {max_cap}", cap + payer_fee)));
         }
@@ -238,7 +265,8 @@ impl Session {
     /// Otherwise it stays pending, and the watcher retries or refunds it.
     pub fn complete_open(&self, dest: &str, wait_s: f64) -> Result<Value> {
         let Some(rec) = self.book.get(dest) else { return Ok(json!({})) };
-        if rec.state != "pending" {
+        if rec.state != "pending" || rec.open_url.is_empty() {
+            // no open_url: an external client's channel (signer `fund`); the client posts its open and attaches
             return Ok(rec.public());
         }
         let mut confs = self.funding_confirmations(&rec)?;
@@ -321,7 +349,7 @@ impl Session {
 
     /// H3: bind this payload to (method, path, body). The ECDH key stays in the book.
     fn with_auth(&self, payload: &mut Value, method: &str, url: &str, body: &[u8]) -> Result<()> {
-        let req = request_digest(method, &request_target(url), body);
+        let req = request_digest_v2(method, url, body);
         let chan = py_str(payload.get("chan"));
         let sig = payload.get("sig").and_then(Value::as_str).map(str::to_string);
         payload["auth"] = self.book.request_auth(&chan, payload.get("seq"), payload.get("cum"), sig.as_deref(), &req)?.into();
@@ -334,6 +362,60 @@ impl Session {
         let r = self.http(method, url, body, &[("PAYMENT-SIGNATURE".into(), hdr)])?;
         let receipt = r.header("PAYMENT-RESPONSE").and_then(|h| unb64json(h).ok());
         Ok((r, receipt))
+    }
+
+    /// Sats of this channel already in the policy ledger. `-1` means a pre-AGP-063 record:
+    /// treat `used_sats` as already booked so an upgrade does not book history again.
+    pub fn booked_through(rec: &ChannelRecord) -> i64 {
+        if rec.ledger_booked_sats < 0 { rec.used_sats } else { rec.ledger_booked_sats }
+    }
+
+    /// Commit any signed amount the ledger does not yet hold, then remember that it does.
+    /// The commit is idempotent on `xbt402:{chan}:{cum}`, so a crash between the two steps
+    /// books the same increase once. Returns the sats committed by this call.
+    fn book_unbooked(&self, dest: &str) -> Result<i64> {
+        let Some(rec) = self.book.get(dest) else { return Ok(0) };
+        let delta = rec.used_sats - Self::booked_through(&rec);
+        if delta <= 0 {
+            return Ok(0);
+        }
+        let book = self.spend_book.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            .ok_or_else(|| err("xbt402", "signed increase has no ledger booking"))?;
+        book(dest, delta, &rec.chan, rec.used_sats)?;
+        self.book.mark_ledger_booked(dest, rec.used_sats)?;
+        Ok(delta)
+    }
+
+    /// The seller's receipt: signature and request binding, and a `charged` that is not
+    /// negative and not above the quote. The number itself is never what the wallet books.
+    pub fn check_seller_receipt(rec: &ChannelRecord, resp: &Value, method: &str, url: &str, body: &[u8], answer: (u16, &[u8]), quote: i64) -> Result<i64> {
+        let r = receipt_of(resp).map_err(|e| err("bad_receipt", e.to_string()))?;
+        if py_str(r.get("req")) != request_digest_v2(method, url, body) {
+            return Err(err("bad_receipt", "receipt is for another request"));
+        }
+        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
+            return Err(err("bad_receipt", "receipt is for another answer (status or body differs)"));
+        }
+        if py_str(r.get("chan")) != rec.chan {
+            return Err(err("bad_receipt", "receipt is for another channel"));
+        }
+        let cum = py_int(r.get("cum")).ok_or_else(|| err("bad_receipt", "receipt cum is not an integer"))?;
+        if cum < 0 || cum > rec.used_sats {
+            return Err(err("bad_receipt", "receipt cum is above the amount this wallet signed"));
+        }
+        let sig = hex::decode(py_str(r.get("sig"))).unwrap_or_default();
+        let payee = hex::decode(&rec.payee_pub).map_err(|_| err("bad_receipt", "channel payee_pub is not hex"))?;
+        if !ecdsa::verify(&payee, &receipt_message(r), &sig) {
+            return Err(err("bad_receipt", "receipt not signed by the channel payee key"));
+        }
+        let charged = py_int(r.get("charged")).ok_or_else(|| err("bad_receipt", "charged is not an integer"))?;
+        if charged < 0 {
+            return Err(err("bad_receipt", "negative charged"));
+        }
+        if charged > quote {
+            return Err(err("bad_receipt", format!("charged {charged} exceeds the quoted price {quote}")));
+        }
+        Ok(charged)
     }
 
     /// One call. The provider's body and receipt come back only under `untrusted_provider_response`.
@@ -405,11 +487,30 @@ impl Session {
                                     "ms": ms_since(t1)}));
         }
         let rec = self.book.get(&dest).ok_or_else(|| rt("channel vanished"))?;
-        let (rec, sig) = if !rec.last_sig.is_empty() && rec.used_sats > rec.acked_sats {
+        let ledger_before = Self::booked_through(&rec);
+        let resend = !rec.last_sig.is_empty() && rec.used_sats > rec.acked_sats;
+        // The policy approved max_sats. Only a channel's first states may sign more, up to the dust
+        // floor every state pays; that floor is booked like the rest.
+        let next = if resend { rec.used_sats } else { self.book.next_cum(&dest, price)? };
+        let floor = rec.params()?.min_amount() as i64;
+        if next - ledger_before > max_sats && next > floor {
+            return Ok(json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0,
+                             "reason": format!("the next state signs {next} sat, {} more than the ledger holds; max_sats is {max_sats}",
+                                               next - ledger_before)}));
+        }
+        if next - ledger_before > max_sats {
+            let check = self.spend_check.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(d) = check.map(|c| c(&dest, max_sats, next - ledger_before)).transpose()?.flatten() {
+                return Ok(d);
+            }
+        }
+        let (rec, sig) = if resend {
             self.book.resend_state(&dest)? // same (cum, sig); do not sign a higher one (M3)
         } else {
             self.book.increment(&dest, price)?
         };
+        // AGP-063 W1: book the signed increase before the signature leaves. Never the seller's charged.
+        let booked = self.book_unbooked(&dest)?;
         let mut payload = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string()});
         if !sig.is_empty() {
             payload["sig"] = hex::encode(&sig).into();
@@ -418,23 +519,39 @@ impl Session {
         if receipt.is_some() {
             self.book.ack_state(&dest, Some(rec.used_sats))?;
         }
-        let charged = if r2.status < 400 { charged_of(receipt.as_ref(), price) } else { 0 };
+        // The state is paid and booked whatever the receipt says; a bad receipt is reported, not booked.
+        let mut receipt_error = None;
+        let charged = if r2.status < 400 {
+            let checked = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))
+                .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, (r2.status, &r2.body), price));
+            checked.unwrap_or_else(|e| {
+                receipt_error = Some(e.msg);
+                0
+            })
+        } else {
+            0
+        };
         log_call("call", json!({"url": url, "status": r2.status, "ms": ms_since(t0), "chargedSat": charged, "chan": rec.chan,
                                 "cum": rec.used_sats, "opened": !opened.is_null()}));
         let stored = if r2.body.len() > cap { store_body(&r2.body, &format!("{}-{}", &rec.chan[..rec.chan.len().min(12)], rec.seq)) } else { json!({}) };
-        let mut res = json!({"status": r2.status, "charged_sats": charged, "receipt": receipt, "chan": rec.chan, "cum": rec.used_sats,
+        let mut res = json!({"status": r2.status, "charged_sats": charged, "booked_sats": booked, "receipt": receipt, "chan": rec.chan, "cum": rec.used_sats,
                              "opened": opened, "body": preview(&r2.body, cap)});
+        if let Some(e) = receipt_error {
+            res["receipt_error"] = e.into();
+        }
         merge(&mut res, stored);
         let Ok(doc) = serde_json::from_slice::<Value>(&r2.body) else { return Ok(res) };
         if r2.status == 200 && doc.get("stream").and_then(Value::as_str) == Some("xbt402-merkle-v1") {
             res["receipt_scope"] = "manifest call only; chunk payments are in stream.paid_sats".into();
-            let s = self.stream(&dest, &acc, &doc, max_sats - charged);
+            let s = self.stream(&dest, &acc, &doc, max_sats - booked);
             let sc = s.get("stream_charged").and_then(Value::as_i64).unwrap_or(0);
             merge(&mut res, s);
             if let Value::Object(m) = &mut res {
                 m.remove("stream_charged");
             }
             res["charged_sats"] = (charged + sc).into();
+            let after = self.book.get(&dest).map(|r| Self::booked_through(&r)).unwrap_or(ledger_before);
+            res["booked_sats"] = (after - ledger_before).into();
         }
         Ok(res)
     }
@@ -486,6 +603,7 @@ impl Session {
                 Ok((data, _, _)) => {
                     parts.extend(data);
                     let paid = self.book.increment(dest, price).and_then(|(rec, sig)| {
+                        self.book_unbooked(dest)?;
                         self.verify_post(dest, acc, json!({"chan": rec.chan, "cum": rec.used_sats.to_string(), "sig": hex::encode(sig)}))?;
                         Ok(rec)
                     });
@@ -579,6 +697,7 @@ impl Session {
             .map(|k| (k.to_string(), m.get(*k).cloned().unwrap_or(Value::Null))).collect();
         let pending = json!({"hash": hex::encode(hash), "cipher": hex::encode(&cipher), "manifest": manifest});
         let (rec, sig) = self.book.sign_stream_final(dest, hash, price as u64, csv, pending).map_err(|e| e.msg)?;
+        self.book_unbooked(dest).map_err(|e| e.msg)?;
         let payload = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string(), "hashlock": hex::encode(hash), "sig": hex::encode(&sig)});
         let (r, _) = self.paid("GET", &url, b"", &acc, payload).map_err(|e| e.msg)?;
         if r.status != 200 {
@@ -590,6 +709,7 @@ impl Session {
         let pt = open_final(m, &cipher, &k)?; // the offered ciphertext, never one the response substitutes
         self.book.clear_pending_cond(dest).map_err(|e| e.msg)?;
         let (rec, sig2) = self.book.increment(dest, price).map_err(|e| e.msg)?;
+        self.book_unbooked(dest).map_err(|e| e.msg)?;
         self.verify_post(dest, &acc, json!({"chan": rec.chan, "cum": rec.used_sats.to_string(), "sig": hex::encode(sig2)})).map_err(|e| e.msg)?;
         let ms = ms_since(t);
         log_call("chunk", json!({"i": n - 1, "ms": ms, "chargedSat": price, "chan": rec.chan, "cum": rec.used_sats, "hashlock": hex::encode(hash)}));

@@ -427,6 +427,13 @@ impl Rig {
         call(&self.s, m, p)
     }
 
+    /// The hot-key rotation the human signs (AGP-063 W3: `rotate_hot_key` is never unsigned).
+    pub fn rotate_hot_key(&self) -> Value {
+        let old = self.call("hot_address", json!({}))["hot_address"].as_str().unwrap().to_string();
+        let exp = xbt_signer::pyjson::now_f64() as i64 + 300;
+        self.call("rotate_hot_key", json!({"expiry": exp, "signature": sign_human(&xbt_signer::approval::rotate_message(&old, exp))}))
+    }
+
     pub fn hot_spk(&self) -> String {
         self.call("hot_address", json!({}))["hot_spk"].as_str().unwrap().to_string()
     }

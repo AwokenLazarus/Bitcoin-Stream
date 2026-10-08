@@ -40,7 +40,9 @@ fn runbook_g1_to_g7_and_both_rollbacks() {
     web.sites.lock().unwrap().insert(PROVIDER.into(), prov.clone());
     let witness = serve_witness(&d.path().join("anchor"), &d.path().join("anchor").join("w.sock"), 0o600).unwrap();
     let ac = || Some(AnchorClient::new(&witness.sock_path));
-    let root = root_with(d.path(), &runbook_policy(json!({"anchor_required": true})));
+    // AGP-063: the first state on a channel signs the dust floor (546), not the 500-sat price.
+    // Twelve calls book 6092, which is above the rehearsal weekly budget of 6000.
+    let root = root_with(d.path(), &runbook_policy(json!({"anchor_required": true, "daily_budget_sats": 6500, "weekly_budget_sats": 6500})));
     let s = signer(&root, &chain, &web, ac()).unwrap();
 
     // G1

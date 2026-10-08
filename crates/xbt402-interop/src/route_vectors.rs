@@ -14,7 +14,7 @@ use xbt402::adaptor::{self, PreSig, Sc, Secp256k1Dleq};
 use xbt402::channel::{channel_auth_key, channel_payee_secret, ChannelParams, FeePayer, Payee};
 use xbt402::json::dumps;
 use xbt402::route::*;
-use xbt402::wire::{hub_channel_message, request_auth, request_digest};
+use xbt402::wire::{hub_channel_message, request_auth, request_digest_v2};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::{PublicKey, SecretKey};
@@ -109,7 +109,7 @@ fn route_section() -> Value {
     let signed = state_sign(&prov, &st);
     let skey = session_key(&client, &ecdsa::pubkey(&prov)).expect("key");
     assert_eq!(skey, session_key(&prov, &ecdsa::pubkey(&client)).expect("key"));
-    let req = request_digest("POST", "/v1/chunk", br#"{"tokens":1}"#);
+    let req = request_digest_v2("POST", "https://provider.example/v1/chunk", br#"{"tokens":1}"#);
     let tpt = pubh(&key("route/t")).to_uppercase();
     let chan = format!("{}:1", "22".repeat(32));
     let rok: Vec<Value> = [(100, 9000, 5000, 144, 144), (100, 5000, 5000, 144, 144), (4857, 9000, 5000, 144, 144),
@@ -165,12 +165,12 @@ fn lock_section() -> Value {
     let body1 = dumps(&json!({"route": route}));
     let mut pl1 = json!({"chan": p1.channel_id(), "seq": 5, "cum": cum1.to_string(), "adaptor": pre1.to_json(), "point": pt(&t1)});
     let k1 = channel_auth_key(&client, &p1.payee_pub).expect("key");
-    pl1["auth"] = request_auth(&k1, &p1.channel_id(), pl1.get("seq"), pl1.get("cum"), None, &request_digest("POST", HUB_ROUTE_PATH, body1.as_bytes())).into();
+    pl1["auth"] = request_auth(&k1, &p1.channel_id(), pl1.get("seq"), pl1.get("cum"), None, &request_digest_v2("POST", &format!("https://hub.example{HUB_ROUTE_PATH}"), body1.as_bytes())).into();
     let rt2 = json!({"session": session, "lockId": lock_id, "amount": d, "lockAuth": la, "hub": pubh(&hub)});
     let body2 = dumps(&json!({"route": rt2}));
     let mut pl2 = json!({"chan": p2.channel_id(), "seq": 3, "cum": cum2.to_string(), "point": pt(&tp), "adaptor": pre2.to_json()});
     let k2 = channel_auth_key(&ch2key, &p2.payee_pub).expect("key");
-    pl2["auth"] = request_auth(&k2, &p2.channel_id(), pl2.get("seq"), pl2.get("cum"), None, &request_digest("POST", ROUTE_LOCK_PATH, body2.as_bytes())).into();
+    pl2["auth"] = request_auth(&k2, &p2.channel_id(), pl2.get("seq"), pl2.get("cum"), None, &request_digest_v2("POST", &format!("https://provider.example{ROUTE_LOCK_PATH}"), body2.as_bytes())).into();
     let sig2 = with_type(adaptor::adapt(&pre2, &t).expect("adapt"));
     let mut payee2 = Payee::new(p2.clone(), channel_payee_secret(NET, &prov, &p2.payer_pub, p2.expiry).expect("secret")).expect("payee");
     payee2.accept(cum2, &sig2).expect("ch2 completion is a valid state");
@@ -350,11 +350,11 @@ pub fn check(doc: &Value) -> Vec<String> {
     let rp = &lk["routePayload"];
     let k1 = channel_auth_key(&key("lock/client"), &p1.payee_pub).unwrap_or_default();
     ok("lock route payload auth".into(), s(rp, "auth") == request_auth(&k1, &p1.channel_id(), rp.get("seq"), rp.get("cum"), None,
-                                                                      &request_digest("POST", HUB_ROUTE_PATH, s(lk, "routeBody").as_bytes())));
+                                                                      &request_digest_v2("POST", &format!("https://hub.example{HUB_ROUTE_PATH}"), s(lk, "routeBody").as_bytes())));
     let lp = &lk["lockPayload"];
     let k2 = channel_auth_key(&key("lock/hub-ch2"), &p2.payee_pub).unwrap_or_default();
     ok("lock hub payload auth".into(), s(lp, "auth") == request_auth(&k2, &p2.channel_id(), lp.get("seq"), lp.get("cum"), None,
-                                                                    &request_digest("POST", ROUTE_LOCK_PATH, s(lk, "lockBody").as_bytes())));
+                                                                    &request_digest_v2("POST", &format!("https://provider.example{ROUTE_LOCK_PATH}"), s(lk, "lockBody").as_bytes())));
     let sig2 = hx(lk, "ch2Completed");
     ok("lock ch2 completion is a valid 0x21 state".into(), sig2.last() == Some(&0x21) && ecdsa::verify(&p2.payer_pub, &z2, &sig2[..sig2.len() - 1]));
     match Tx::parse_hex(s(lk, "ch2Close")) {

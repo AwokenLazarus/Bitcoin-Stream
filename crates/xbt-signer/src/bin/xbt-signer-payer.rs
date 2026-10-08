@@ -28,9 +28,8 @@ struct Funding {
     min_conf: u64,
 }
 
-impl xbt402::client::Wallet for Funding {
-    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
-        let (txid, vout) = xbt402::client::Wallet::fund(&self.remote, address, sats)?;
+impl Funding {
+    fn confirmed(&self, txid: String, vout: u32) -> xbt402::Result<(String, u32)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
         loop {
             let v = self.remote.client.call("tx_confirmations", json!({"txid": txid, "vout": vout}))?;
@@ -42,6 +41,18 @@ impl xbt402::client::Wallet for Funding {
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+    }
+}
+
+impl xbt402::client::Wallet for Funding {
+    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let (txid, vout) = xbt402::client::Wallet::fund(&self.remote, address, sats)?;
+        self.confirmed(txid, vout)
+    }
+
+    fn fund_channel(&self, origin: &str, params: &xbt402::channel::ChannelParams, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let (txid, vout) = self.remote.fund_channel(origin, params, address, sats)?;
+        self.confirmed(txid, vout)
     }
 }
 

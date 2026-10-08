@@ -2,6 +2,9 @@
 //! pays many providers through hub-funded hub → provider channels, with adaptor-locked states on
 //! both hops.
 //!
+//! **Experimental:** not production-ready; do not route funds you cannot lose. `xbt402-hub` says
+//! so when it starts.
+//!
 //! ```text
 //! client --ch1 (client pays, hub is payee)--> hub --ch2 (hub pays, provider is payee)--> provider
 //! ```
@@ -122,6 +125,40 @@ fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// ch1's routing counters, the base every lock is quoted on: `routed_sat`, `fee_units`, `fee_paid`.
+const COUNTERS: [&str; 3] = ["routed_sat", "fee_units", "fee_paid"];
+/// The same counters in a lock's `after` and a hold's `hold`.
+const LOCK_COUNTERS: [&str; 3] = ["routed", "units", "paid"];
+
+/// AGP-064 (H2): a lock written off after its ch2 pre-signature left stays in ch1's base until that
+/// ch2 resolves. Raise the counters to the lock's `after` and record on it what was added (`hold`),
+/// so a release takes back exactly that, whatever came after.
+fn hold_in_base(ex: &mut Map<String, Value>, lock: &mut Value) {
+    let mut hold = Map::new();
+    for (k, a) in COUNTERS.iter().zip(LOCK_COUNTERS) {
+        let cur = u128_of(ex.get(*k)).unwrap_or(0);
+        let to = cur.max(u128_of(lock.get("after").and_then(|x| x.get(a))).unwrap_or(0));
+        ex.insert((*k).into(), int_value(to));
+        hold.insert(a.into(), int_value(to - cur));
+    }
+    lock["hold"] = Value::Object(hold);
+}
+
+/// The lockIds of ch1's written-off locks that are held in its base.
+fn held_ids(ex: &Map<String, Value>) -> Vec<Value> {
+    ex.get("stale_locks").and_then(Value::as_array).into_iter().flatten()
+        .filter(|s| s.get("hold").is_some_and(Value::is_object)).filter_map(|s| s.get("lockId").cloned()).collect()
+}
+
+/// ch1 as the hub counts it, for a client to resync on (`expectCum` is added where a lock was
+/// refused for its amount): the held locks, and the last ones released (AGP-064).
+fn ch1_view(st1: &ChannelState) -> Value {
+    let ex = &st1.extra;
+    json!({"bestCum": st1.best_cum, "routedSat": py_u64(ex.get("routed_sat")).unwrap_or(0),
+           "feeUnits": int_value(u128_of(ex.get("fee_units")).unwrap_or(0)), "feePaid": py_u64(ex.get("fee_paid")).unwrap_or(0),
+           "held": held_ids(ex), "released": ex.get("released").cloned().unwrap_or_else(|| json!([]))})
+}
+
 /// Everything a hub operator decides (JSON: [`HubConfig::from_json`]); nothing here is protocol.
 ///
 /// `fee_strategy`: `{"kind": "flat"}` charges `fee_base_msat` + `fee_ppm`; `{"kind":
@@ -205,7 +242,7 @@ pub struct HubConfig {
 
 impl Default for HubConfig {
     fn default() -> Self {
-        Self { fee_base_msat: 1_000, fee_ppm: 2_000, fee_strategy: json!({"kind": "flat"}), quote_ttl: 600, max_lock_sat: 50_000,
+        Self { fee_base_msat: 1_000, fee_ppm: 2_000, fee_strategy: json!({"kind": "flat"}), quote_ttl: 600, max_lock_sat: 20_000,
                max_unguarded_lock_sat: 500, delta: 144, reveal_timeout: 10.0, ch2_capacity: 100_000, ch2_expiry_blocks: 1_100,
                liquidity_cap_sat: 0, close_fee: 600, ch1_close_fee_payer: FeePayer::Payer, ch2_close_fee_payer: FeePayer::Payee,
                close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}),
@@ -303,6 +340,11 @@ impl HubConfig {
             }
         }
         c.funding_policy()?;
+        // AGP-064: a written-off lock holds the client's base and blocks its ch2 until that ch2
+        // resolves, so a lock is a small share of a ch2: at most half (the default is a fifth)
+        if c.max_lock_sat == 0 || c.max_lock_sat.saturating_mul(2) > c.ch2_capacity {
+            return Err(bad(format!("max_lock_sat {} must be at most half of ch2_capacity {}", c.max_lock_sat, c.ch2_capacity)));
+        }
         Ok(c)
     }
 
@@ -561,6 +603,9 @@ pub struct HubStats {
     pub lock_ms: Vec<f64>,
     /// ch1 channels holding a lock at each forward (constraint 3: always 1, the forwarded one).
     pub ch1_locks_at_forward: Vec<usize>,
+    /// Locks completed after their ch1 closed below them: paid to the provider, not collected
+    /// (AGP-064; only an operator's close_now or a margin close past its wait can do that).
+    pub uncollected: u64,
 }
 
 /// `callable(hub) -> (fee_base_msat, fee_ppm)`.
@@ -876,7 +921,7 @@ impl RouteHub {
         if path.split('?').next() == Some(HUB_ROUTE_PATH) {
             let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
             if let (true, Some(h)) = (method == "POST", hdr) {
-                return self.route(method, HUB_ROUTE_PATH, h, body);
+                return self.route(method, &crate::provider::binding_url(url, HUB_ROUTE_PATH), h, body);
             }
             let mut doc = self.inbound.payment_required_doc(if url.is_empty() { path } else { url }, 0, "payment_required", None);
             match self.routing_extra() {
@@ -885,7 +930,38 @@ impl RouteHub {
             }
             return self.inbound.required_response(&doc);
         }
+        if method == "POST" && path.split('?').next() == Some(CLOSE_PATH) {
+            if let Some(ch1) = crate::json::parse_slice(body).ok().and_then(|v| v.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok())) {
+                self.drop_orphan_lock(&ch1);
+            }
+        }
         self.inbound.serve(method, path, headers, body, url, max_body)
+    }
+
+    /// AGP-064: a ch1 lock that no route is forwarding and no ch2 holds (the hub stopped between its
+    /// write-ahead and the ch2 one, or the withholding test hook) can never complete: it is dropped,
+    /// so it does not keep ch1 from closing. Checked under the provider's busy flag, which route()
+    /// holds from before it writes the lock until its forward ends.
+    fn drop_orphan_lock(&self, ch1: &str) {
+        let Some(rl) = self.ch1_state(ch1).and_then(|s| s.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned()) else { return };
+        let origin = py_str(rl.get("provider"));
+        let Some(_busy) = self.acquire(&origin, Duration::ZERO) else { return };
+        {
+            let b = lk(&self.out);
+            if b.chans.get(&origin).into_iter().chain(b.next_chans.get(&origin)).any(|c| c.pending.get("lockId") == rl.get("lockId")) {
+                return;
+            }
+        }
+        let mut l = self.inbound.ledger_lock();
+        let Some(mut st1) = l.channels.get(ch1).cloned() else { return };
+        if st1.extra.get("route_lock").and_then(|x| x.get("lockId")) != rl.get("lockId") {
+            return;
+        }
+        st1.extra.insert("route_lock".into(), Value::Null);
+        if self.inbound.save_state(&mut l, &st1).is_ok() {
+            drop(l);
+            self.event(json!({"event": "orphan_lock_dropped", "chan": ch1, "lockId": rl.get("lockId"), "provider": origin}));
+        }
     }
 
     fn acquire(&self, origin: &str, timeout: Duration) -> Option<Busy<'_>> {
@@ -903,7 +979,8 @@ impl RouteHub {
 
     // --- POST /x402/route ---------------------------------------------------------------------------
 
-    fn route(&self, method: &str, path: &str, hdr: &str, body: &[u8]) -> HttpResponse {
+    /// `bind`: the request's URL as [`request_digest_v2`] binds it.
+    fn route(&self, method: &str, bind: &str, hdr: &str, body: &[u8]) -> HttpResponse {
         let t0 = Instant::now();
         let parsed = (|| -> Option<(Value, Value, i128, i128, String, String)> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
@@ -922,7 +999,7 @@ impl RouteHub {
         let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
         let Some(cid) = cid else { return e400("unknown_channel", "") };
         let mut st1 = l.channels[&cid].clone();
-        if !self.inbound.authentic(&st1, &pl, method, path, body) {
+        if !self.inbound.authentic(&st1, &pl, method, bind, body) {
             return err(401, "bad_auth", "", json!({}));
         }
         st1.seq = py_u64(pl.get("seq")).unwrap_or(st1.seq);
@@ -966,9 +1043,12 @@ impl RouteHub {
         let (d, f) = (d as u64, u64::try_from(f).unwrap_or(u64::MAX / 4));
         let need1 = next_cum(routed1, d.saturating_add(f), st1.params.min_amount());
         let floor1 = need1 <= st1.best_cum;
-        // our view of ch1, so a client that gave up a lock we later completed can resync
-        let view = |expect: u64| json!({"expectCum": expect, "bestCum": st1.best_cum, "routedSat": routed1,
-                                        "feeUnits": int_value(fee_units), "feePaid": fee_paid});
+        // our view of ch1, so a client that gave up a lock we later completed, held or released can resync
+        let view = |expect: u64| {
+            let mut v = ch1_view(&st1);
+            v["expectCum"] = expect.into();
+            v
+        };
         if floor1 {
             if cum != st1.best_cum as i128 || truthy(pl.get("adaptor")) {
                 return err(400, "bad_amount", &format!("the dust floor covers this lock: cum {}, no adaptor", st1.best_cum), view(st1.best_cum));
@@ -1078,6 +1158,11 @@ impl RouteHub {
         let Some(oc) = oc.filter(|o| o.pending.is_empty()) else {
             return Some(("lock_outstanding", "a lock on this provider's ch2 is pending".into()));
         };
+        // AGP-064 (H2): a written-off lock's pre-signature may be out. Nothing more over this ch2
+        // until it resolves: its close shows whether t was used, its refund that it was not
+        if !oc.stale.is_empty() {
+            return Some(("route_blocked", "a written-off lock on this ch2 is unresolved".into()));
+        }
         if oc.state != "open" {
             return Some(("route_blocked", self.no_channel(&oc.origin, Some(oc))));
         }
@@ -1235,16 +1320,17 @@ impl RouteHub {
             std::thread::sleep(Duration::from_millis(100));
         };
         let Some(ans) = ans else {
-            self.void(ch1, &oc.origin, &p2.channel_id(), "no reveal within revealTimeoutSec", "the provider did not reveal a lock in time");
-            return err(502, "route_failed", "provider did not reveal within revealTimeoutSec", json!({}));
+            let view = self.void(ch1, &oc.origin, &p2.channel_id(), "no reveal within revealTimeoutSec", "the provider did not reveal a lock in time");
+            return err(502, "route_failed", "provider did not reveal within revealTimeoutSec", view);
         };
         if let Some(code) = ans.get("error").and_then(Value::as_str) {
-            self.void(ch1, &oc.origin, &p2.channel_id(), &format!("provider refused: {code}"), "");
+            let mut view = self.void(ch1, &oc.origin, &p2.channel_id(), &format!("provider refused: {code}"), "");
             *lk(&self.stats).refused.entry(code.to_string()).or_insert(0) += 1;
             let shown = if safe_code(code) { code } else { "provider_error" };
             let det = ans.get("detail").and_then(Value::as_str).unwrap_or("");
             let detail = if det.is_empty() { format!("provider refused the lock: {shown}") } else { format!("provider refused the lock: {shown} ({det})") };
-            return err(502, "route_failed", &detail, json!({"providerError": code}));
+            view["providerError"] = code.into();
+            return err(502, "route_failed", &detail, view);
         }
         let out = self.settled(ch1, &oc.origin, &ans);
         lk(&self.stats).lock_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -1279,7 +1365,7 @@ impl RouteHub {
             pl["adaptor"] = pend["pre"].clone();
         }
         let key = channel_auth_key(&oc.secret_key().ok()?, &p2.payee_pub).ok()?;
-        pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest("POST", ROUTE_LOCK_PATH, body.as_bytes())).into();
+        pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest_v2("POST", &format!("{origin}{ROUTE_LOCK_PATH}"), body.as_bytes())).into();
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&json!({"x402Version": 2, "accepted": oc.terms, "payload": pl}))),
                         ("Content-Type".to_string(), "application/json".to_string())];
         let r = self.http.request("POST", &format!("{origin}{ROUTE_LOCK_PATH}"), body.as_bytes(), &hdrs).ok()?;
@@ -1341,6 +1427,9 @@ impl RouteHub {
         let r = Sc::from_hex_mod_n(&py_str(lock1.get("r")))?;
         let s1 = Sc::from_secret(t).add(&r);
         let lcum = py_u64(lock1.get("cum")).unwrap_or(0);
+        // ch1 closed below this lock (the operator's close_now, or the margin close past its wait):
+        // the provider is paid and the client is not charged. Never counted as routed (AGP-064 H1).
+        let closed_below = !st1.closed_txid.is_empty() && st1.best_cum < lcum;
         if !truthy(lock1.get("floor")) {
             let pre1 = PreSig::from_json(lock1.get("pre")?).ok()?;
             let mut sig1 = adaptor::adapt(&pre1, &s1.secret()?).ok()?;
@@ -1362,18 +1451,19 @@ impl RouteHub {
             let mut recovered = ex.get("recovered").and_then(Value::as_array).cloned().unwrap_or_default();
             recovered.push(rec);
             ex.insert("recovered".into(), Value::Array(recovered));
-            if let Some(aft) = lock1.get("after").filter(|a| a.is_object()) {
+            // a held lock is in the base already (AGP-064); one written off before that is counted
+            // once it is our best state
+            let held = lock1.get("hold").is_some_and(Value::is_object);
+            if let Some(aft) = lock1.get("after").filter(|a| a.is_object() && !held) {
                 if st1.best_cum == lcum {
-                    // it is our best state now: count it
-                    let mx = |k: &str, v: u128| -> Value { int_value(u128_of(ex.get(k)).unwrap_or(0).max(v)) };
-                    let routed = mx("routed_sat", u128_of(aft.get("routed")).unwrap_or(0));
-                    let units = mx("fee_units", u128_of(aft.get("units")).unwrap_or(0));
-                    let paid = mx("fee_paid", u128_of(aft.get("paid")).unwrap_or(0));
-                    ex.insert("routed_sat".into(), routed);
-                    ex.insert("fee_units".into(), units);
-                    ex.insert("fee_paid".into(), paid);
+                    for (k, a) in COUNTERS.iter().zip(LOCK_COUNTERS) {
+                        let v = u128_of(ex.get(*k)).unwrap_or(0).max(u128_of(aft.get(a)).unwrap_or(0));
+                        ex.insert((*k).into(), int_value(v));
+                    }
                 }
             }
+        } else if closed_below {
+            ex.insert("route_lock".into(), Value::Null);
         } else {
             let d = py_u64(lock1.get("d")).unwrap_or(0);
             let f = py_u64(lock1.get("f")).unwrap_or(0);
@@ -1393,6 +1483,12 @@ impl RouteHub {
         st1.extra = ex;
         self.inbound.save_state(&mut l, &st1).ok()?;
         drop(l);
+        if closed_below {
+            lk(&self.stats).uncollected += 1;
+            self.event(json!({"event": "lock_uncollected", "chan": ch1, "lockId": lock_id, "cum": lcum, "closedAt": st1.best_cum,
+                              "close": st1.closed_txid}));
+            return Some(ans);
+        }
         let mut s = lk(&self.stats);
         s.routed += 1;
         if truthy(lock1.get("floor")) {
@@ -1401,16 +1497,20 @@ impl RouteHub {
         Some(ans)
     }
 
-    /// Write both locks off (kept for on-chain recovery). A later state above them dominates them;
-    /// until then a late completion costs the hub at most this one lock.
-    fn void(&self, ch1: &str, origin: &str, ch2: &str, why: &str, block: &str) {
+    /// Write both locks off. If the ch2 pre-signature may have left (the lock was pending on ch2),
+    /// they are kept for on-chain recovery, and ch1's lock stays in its base until that ch2 resolves
+    /// (AGP-064 H2): a later lock is quoted above it, so a `t` read off the ch2 close later still
+    /// collects, and routing over that ch2 or rolling it over waits. Otherwise nothing can complete
+    /// the lock and ch1's is dropped. Returns ch1's view for the client when the lock is held.
+    fn void(&self, ch1: &str, origin: &str, ch2: &str, why: &str, block: &str) -> Value {
         let lock_id;
         {
             let mut b = lk(&self.out);
             let mut id = Value::Null;
             if let Some(c) = b.chans.get_mut(origin).filter(|c| c.params.channel_id() == ch2) {
                 if !c.pending.is_empty() {
-                    id = c.pending.get("lockId").cloned().unwrap_or(Value::Null);
+                    // a ch2 already resolved for good (its close or refund confirmed) can pay nothing more
+                    id = if c.final_ { Value::Null } else { c.pending.get("lockId").cloned().unwrap_or(Value::Null) };
                     let mut s = Value::Object(std::mem::take(&mut c.pending));
                     s["voided"] = round3(now_f());
                     s["why"] = why.into();
@@ -1424,21 +1524,78 @@ impl RouteHub {
             lock_id = id;
         }
         let mut l = self.inbound.ledger_lock();
-        let mut lid = lock_id;
+        let mut lid = lock_id.clone();
+        let (mut view, mut held) = (json!({}), false);
         if let Some(mut st1) = l.channels.get(ch1).cloned() {
-            if let Some(rl) = st1.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned() {
+            if let Some(mut rl) = st1.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned() {
                 lid = rl.get("lockId").cloned().unwrap_or(lid);
-                let mut s = rl;
-                s["voided"] = round3(now_f());
-                let mut stale = st1.extra.get("stale_locks").and_then(Value::as_array).cloned().unwrap_or_default();
-                stale.push(s);
-                st1.extra.insert("stale_locks".into(), Value::Array(stale));
                 st1.extra.insert("route_lock".into(), Value::Null);
+                if !lock_id.is_null() && rl.get("lockId") == Some(&lock_id) {
+                    rl["voided"] = round3(now_f());
+                    hold_in_base(&mut st1.extra, &mut rl);
+                    let mut stale = st1.extra.get("stale_locks").and_then(Value::as_array).cloned().unwrap_or_default();
+                    stale.push(rl);
+                    st1.extra.insert("stale_locks".into(), Value::Array(stale));
+                    (view, held) = (ch1_view(&st1), true);
+                }
                 let _ = self.inbound.save_state(&mut l, &st1);
             }
         }
         drop(l);
-        self.event(json!({"event": "void", "provider": origin, "lockId": lid, "why": why, "blocked": !block.is_empty()}));
+        self.event(json!({"event": "void", "provider": origin, "lockId": lid, "why": why, "blocked": !block.is_empty(), "held": held}));
+        view
+    }
+
+    /// AGP-064: written-off locks whose ch2 resolved without paying them (a confirmed refund, a
+    /// confirmed close that does not reveal their t). Each `(ch1, lockId)` leaves ch1's
+    /// `stale_locks`, and its hold leaves the base: the client is quoted below its best state again
+    /// (the floor), so what it paid ahead for that lock pays its next ones. The lockId goes on
+    /// ch1's `released` list, the last 64, for the client to resync on.
+    fn release_unpaid(&self, locks: &[(String, String)]) -> Vec<Value> {
+        let mut out = vec![];
+        if locks.is_empty() {
+            return out;
+        }
+        let mut l = self.inbound.ledger_lock();
+        for (ch1, lid) in locks {
+            let Some(mut st1) = l.channels.get(ch1).cloned() else { continue };
+            let stale = st1.extra.get("stale_locks").and_then(Value::as_array).cloned().unwrap_or_default();
+            let (gone, keep): (Vec<Value>, Vec<Value>) = stale.into_iter().partition(|s| s.get("lockId").and_then(Value::as_str) == Some(lid.as_str()));
+            let Some(s) = gone.into_iter().next() else { continue };
+            st1.extra.insert("stale_locks".into(), Value::Array(keep));
+            let mut ev = json!({"event": "lock_released", "chan": ch1, "lockId": lid, "held": false});
+            if let Some(hold) = s.get("hold").filter(|h| h.is_object()) {
+                for (k, a) in COUNTERS.iter().zip(LOCK_COUNTERS) {
+                    let v = u128_of(st1.extra.get(*k)).unwrap_or(0).saturating_sub(u128_of(hold.get(a)).unwrap_or(0));
+                    st1.extra.insert((*k).into(), int_value(v));
+                }
+                let mut rel = st1.extra.get("released").and_then(Value::as_array).cloned().unwrap_or_default();
+                rel.push(lid.as_str().into());
+                if rel.len() > 64 {
+                    rel.remove(0);
+                }
+                st1.extra.insert("released".into(), Value::Array(rel));
+                ev["held"] = true.into();
+                ev["hold"] = hold.clone();
+            }
+            if self.inbound.save_state(&mut l, &st1).is_ok() {
+                out.push(ev);
+            }
+        }
+        drop(l);
+        for ev in &out {
+            self.event(ev.clone());
+        }
+        out
+    }
+
+    /// Release the written-off locks still on `oc` (its ch2 resolved without revealing them) and
+    /// clear them from the ch2 record.
+    fn release_stale(&self, loc: Loc<'_>, oc: &OutChannel) -> Result<Vec<Value>> {
+        let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub && !c.stale.is_empty()) else { return Ok(vec![]) };
+        let locks: Vec<(String, String)> = cur.stale.iter().map(|s| (py_str(s.get("ch1")), py_str(s.get("lockId")))).collect();
+        self.upd(loc, &cur, |c| c.stale.clear())?;
+        Ok(self.release_unpaid(&locks))
     }
 
     // --- hub-funded ch2 ----------------------------------------------------------------------------
@@ -1891,6 +2048,11 @@ impl RouteHub {
     /// The next ch2's key is written ahead (`next`), and its funding txid is known before the
     /// request leaves, so a lost answer is finished by the watcher when that tx spends the funding.
     pub fn rollover(&self, oc: &OutChannel) -> Result<Value> {
+        // AGP-064 (H2): a rollover spends the funding a written-off lock's pre-signature is on, and
+        // its secret could no longer be read off a close
+        if !oc.pending.is_empty() || !oc.stale.is_empty() {
+            return fail("lock_pending", "a lock on this ch2 is pending or written off and unresolved");
+        }
         let p = &oc.params;
         let amount = oc.signed;
         let next_cap = p.rollover_next_capacity(amount);
@@ -2481,6 +2643,10 @@ impl RouteHub {
             }
             return Ok(out);
         }
+        if !oc.stale.is_empty() {
+            // AGP-064: no rollover until the written-off locks resolve (the provider's close, or the refund)
+            return Ok(out);
+        }
         // settlement: the provider's net payout >= its settleMultiple × closeFee, or near ch2's close
         // margin as the provider counts it (it co-signs only then): roll over. Past expiry the refund
         // took over.
@@ -2647,6 +2813,8 @@ impl RouteHub {
                                 "fee": fee, "versions": oc.refund_prev.len() + 1});
                 self.event(ev.clone());
                 out.push(ev);
+                // the refund proves the written-off locks unpaid
+                out.extend(self.release_stale(loc, &oc)?);
             } else if self.bump_due(&oc, tip) {
                 // stuck in the mempool: replace it at a higher fee
                 if let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub) {
@@ -2699,6 +2867,8 @@ impl RouteHub {
         }
         self.event(ev.clone());
         out.push(ev);
+        // a confirmed close that did not reveal a written-off lock's t did not pay it
+        out.extend(self.release_stale(loc, &oc)?);
         Ok(out)
     }
 
@@ -2842,5 +3012,16 @@ mod tests {
         assert_eq!((c.fee_ppm, c.reveal_timeout), (10, 2.5));
         assert_eq!(c.funding_policy().unwrap().min_expiry_blocks, 10);
         assert!(HubConfig::from_json(&json!({"policy": {"bogus": 1}})).is_err());
+    }
+
+    #[test]
+    fn max_lock_sat_defaults_small_and_is_at_most_half_of_ch2_capacity() {
+        let c = HubConfig::from_json(&json!({})).unwrap();
+        assert!(c.max_lock_sat * 5 <= c.ch2_capacity, "{} vs {}", c.max_lock_sat, c.ch2_capacity);
+        assert!(HubConfig::from_json(&json!({"max_lock_sat": 0})).is_err());
+        let cap = c.ch2_capacity;
+        assert!(HubConfig::from_json(&json!({"max_lock_sat": cap / 2})).is_ok());
+        assert!(HubConfig::from_json(&json!({"max_lock_sat": cap / 2 + 1})).is_err());
+        assert!(HubConfig::from_json(&json!({"max_lock_sat": 1_000, "ch2_capacity": 1_999})).is_err());
     }
 }

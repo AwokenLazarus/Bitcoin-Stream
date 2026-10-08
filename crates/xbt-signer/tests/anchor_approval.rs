@@ -18,7 +18,7 @@ fn anchored_at_start_close_refund_rotation_and_a_rewritten_log_refuses_start() {
     rig.call("close_channel", json!({"counterparty": PROVIDER}));
     let lines = rig.s.sigaudit.raw_lines().len() as i64;
     assert_eq!(rig.witness.as_ref().unwrap().store.latest()["n"], lines, "anchored after the close");
-    rig.call("rotate_hot_key", json!({}));
+    rig.rotate_hot_key();
     let lines = rig.s.sigaudit.raw_lines().len() as i64;
     assert_eq!(rig.witness.as_ref().unwrap().store.latest()["n"], lines, "anchored after the rotation");
     let st = rig.call("anchor_status", json!({}));

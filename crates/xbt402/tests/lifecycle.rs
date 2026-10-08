@@ -228,7 +228,7 @@ fn watcher_closes_with_an_unfolded_conditional_state_and_claims() {
     let chan = ch.payer.params.channel_id();
     let mut pl = json!({"chan": chan, "seq": ch.seq, "cum": ch.payer.signed.to_string(), "hashlock": hex::encode(h), "sig": sig});
     pl["auth"] = request_auth(&ch.auth_key, &chan, pl.get("seq"), pl.get("cum"), pl.get("sig").and_then(Value::as_str),
-                              &request_digest("GET", "/v1/report", b"")).into();
+                              &request_digest_v2("GET", "/v1/report", b"")).into();
     let r = prov.serve("GET", "/v1/report", &[("PAYMENT-SIGNATURE".into(), b64json(&payment_payload(&acc, &pl)))], b"", "", None);
     assert_eq!(r.status, 200);
     let expiry = ch.payer.params.expiry;
@@ -297,7 +297,7 @@ fn refusals() {
     // postpay: this call owes the first call's 150 sat, so it carries the least state (546)
     let sig546 = hex::encode(ch.payer.sign_state(546).unwrap());
     let mut pl = json!({"chan": chan, "seq": ch.seq, "cum": "546", "sig": sig546});
-    pl["auth"] = request_auth(&ch.auth_key, &chan, pl.get("seq"), pl.get("cum"), Some(&sig546), &request_digest("GET", "/v1/q", b"")).into();
+    pl["auth"] = request_auth(&ch.auth_key, &chan, pl.get("seq"), pl.get("cum"), Some(&sig546), &request_digest_v2("GET", "/v1/q", b"")).into();
     let acc = ch.accepted.clone();
     let hdr = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
     assert_eq!(prov.serve("GET", "/v1/q", &hdr, b"", "", None).status, 200);
@@ -694,4 +694,165 @@ fn close_channel_refuses_a_channel_with_a_call_in_flight() {
     assert_eq!(shared.lock().unwrap().2, ["call_in_flight"]);
     shared.lock().unwrap().1.clear();
     assert_eq!(prov.close_channel(&chan).unwrap()["cum"], "1200");
+}
+
+// --- AGP-068: request binding and receipts (Guida T2, T4) ------------------------------------
+
+/// The request binding of `method url body` (the digest `payload.auth` and `receipt.req` carry).
+fn req(method: &str, url: &str, body: &[u8]) -> String {
+    request_digest_v2(method, url, body)
+}
+
+/// A paid call's PAYMENT-SIGNATURE for `method url body` at `seq`, carrying the least state.
+fn paid_header(ch: &xbt402::client::ClientChannel, seq: u64, cum: &str, sig: Option<&str>, method: &str, url: &str, body: &[u8]) -> Vec<(String, String)> {
+    let chan = ch.payer.params.channel_id();
+    let mut pl = json!({"chan": chan, "seq": seq, "cum": cum});
+    if let Some(s) = sig {
+        pl["sig"] = s.into();
+    }
+    pl["auth"] = request_auth(&ch.auth_key, &chan, pl.get("seq"), pl.get("cum"), sig, &req(method, url, body)).into();
+    vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&ch.accepted, &pl)))]
+}
+
+fn error_of(r: &HttpResponse) -> String {
+    xbt402::json::parse_slice(&r.body).ok().and_then(|b| b.get("error").and_then(Value::as_str).map(str::to_string)).unwrap_or_default()
+}
+
+fn receipt_in(r: &HttpResponse) -> Value {
+    receipt_of(&unb64json(r.header("PAYMENT-RESPONSE").expect("PAYMENT-RESPONSE")).unwrap()).unwrap().clone()
+}
+
+#[test]
+fn a_payment_is_bound_to_one_request_and_one_origin() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let mut c = client(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let ch = c.channels.get_mut(O).unwrap();
+    let sig = hex::encode(ch.payer.sign_state(546).unwrap());
+    let ch = ch.clone();
+    // fields that ran together under "|": paid for (GET, /q?a|b, ""), sent as (GET, /q?a, "b|")
+    let h = paid_header(&ch, 10, "546", Some(&sig), "GET", &format!("{O}/q?a|b"), b"");
+    let r = prov.serve("GET", "/q?a", &h, b"b|", &format!("{O}/q?a"), None);
+    assert_eq!((r.status, error_of(&r)), (402, "bad_auth".into()), "a payment moved to another request");
+    // the same request sent to another scheme, host or port
+    for (seq, other) in [(11, "http://api.example"), (12, "https://evil.example"), (13, "https://api.example:8443")] {
+        let h = paid_header(&ch, seq, "546", Some(&sig), "GET", &format!("{O}/v1/q"), b"");
+        let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{other}/v1/q"), None);
+        assert_eq!((r.status, error_of(&r)), (402, "bad_auth".into()), "a payment moved to {other}");
+    }
+    // where it was sent, it pays: the host's case and the scheme's default port make no difference
+    let h = paid_header(&ch, 20, "546", Some(&sig), "GET", "https://API.example:443/v1/q", b"");
+    let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{O}/v1/q"), None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}
+
+#[test]
+fn concurrent_calls_get_the_numbers_of_their_own_reservation() {
+    use std::sync::mpsc;
+    let chain = MemChain::new();
+    let (entered_tx, entered) = mpsc::sync_channel::<()>(1);
+    let (release, release_rx) = mpsc::sync_channel::<()>(1);
+    let gate = Mutex::new((entered_tx, release_rx));
+    let handler = move |_: &str, p: &str, _: &[u8]| {
+        if p == "/slow" {
+            let g = gate.lock().unwrap();
+            g.0.send(()).unwrap();
+            g.1.recv().unwrap();
+        }
+        HttpResponse::new(200, vec![], p.as_bytes().to_vec())
+    };
+    let prov = Arc::new(Provider::new(chain.clone(), secret("provider payTo"), ProviderConfig::new(NET), Ledger::in_memory(),
+                                      Box::new(|_, _| 150), Box::new(handler)).unwrap());
+    let mut c = client(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let ch = c.channels.get_mut(O).unwrap();
+    let sig = hex::encode(ch.payer.sign_state(546).unwrap());
+    let ch = ch.clone();
+    let ha = paid_header(&ch, 10, "546", Some(&sig), "GET", &format!("{O}/slow"), b"");
+    let hb = paid_header(&ch, 11, "546", Some(&sig), "GET", &format!("{O}/fast"), b"");
+    let p2 = prov.clone();
+    let a = std::thread::spawn(move || p2.serve("GET", "/slow", &ha, b"", &format!("{O}/slow"), None));
+    entered.recv().unwrap();
+    // B is reserved and answered while A's handler runs
+    let rb = prov.serve("GET", "/fast", &hb, b"", &format!("{O}/fast"), None);
+    release.send(()).unwrap();
+    let ra = a.join().unwrap();
+    let (ra, rb) = (receipt_in(&ra), receipt_in(&rb));
+    // 150 sat before; A reserved 150 more, then B
+    assert_eq!((ra["seq"].as_u64(), ra["spentMsat"].as_str()), (Some(10), Some("300000")), "A's receipt: {ra}");
+    assert_eq!((rb["seq"].as_u64(), rb["spentMsat"].as_str()), (Some(11), Some("450000")), "B's receipt: {rb}");
+}
+
+#[test]
+fn a_seq_spent_on_a_refusal_survives_a_restart() {
+    let dir = tmp("seq-refused");
+    let path = dir.join("ledger.jsonl");
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::open(&path).unwrap());
+    let mut c = client(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let ch = c.channels[O].clone();
+    let chan = ch.payer.params.channel_id();
+    // authentic, but postpay owes the first call's 150 sat and this carries no state: refused
+    let h = paid_header(&ch, 7, "0", None, "GET", &format!("{O}/v1/q"), b"");
+    let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{O}/v1/q"), None);
+    assert_eq!(error_of(&r), "insufficient_payment");
+    drop(prov);
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::open(&path).unwrap());
+    assert_eq!(prov.channel_state(&chan).unwrap().seq, 7, "the refused call's seq was only in memory");
+    let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{O}/v1/q"), None);
+    assert_eq!(error_of(&r), "bad_auth", "the refused header still authenticates after a restart");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `Local`, changing the body of answers to `/tamper...` on the way back (a conditional answer
+/// keeps its key and gets another ciphertext).
+struct Tamper(Arc<Provider>);
+
+impl Transport for Tamper {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        let mut r = Local(self.0.clone()).request(method, url, body, headers)?;
+        if split_url(url).1.starts_with("/tamper") && r.status == 200 {
+            r.body = match serde_json::from_slice::<Value>(&r.body) {
+                Ok(mut v) if v.get("preimage").is_some() => {
+                    v["cipher"] = json!("00".repeat(11));
+                    serde_json::to_vec(&v).unwrap()
+                }
+                _ => b"something else".to_vec(),
+            };
+        }
+        Ok(r)
+    }
+}
+
+#[test]
+fn the_receipt_covers_the_response() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let mut c = Client::new(ClientConfig::new(NET), Box::new(Tamper(prov.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)));
+    let r = c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let rc = c.channels[O].receipts.last().unwrap().clone();
+    assert_eq!(rc["status"], json!(200), "{rc}");
+    assert_eq!(rc["bodyHash"], json!(hex::encode(sha256(&r.body))), "{rc}");
+    let e = c.request("GET", &format!("{O}/tamper"), b"").unwrap_err();
+    assert_eq!(e.code, "bad_receipt", "a changed body was accepted: {e}");
+}
+
+#[test]
+fn an_altered_conditional_answer_keeps_the_hash_lock() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    prov.offer_conditional("/tamper/report", 1_000, b"deliverable", None);
+    let mut c = Client::new(ClientConfig::new(NET), Box::new(Tamper(prov.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)));
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let e = c.request_conditional("GET", &format!("{O}/tamper/report"), b"").unwrap_err();
+    assert_eq!(e.code, "bad_receipt", "{e}");
+    assert!(c.channels[O].pending_cond.is_some(), "the hash lock was dropped with the answer");
+    // the provider closes with the hash lock; its claim reveals k for the offered ciphertext
+    *chain.tip.lock().unwrap() = c.channels[O].payer.params.expiry - prov.cfg.close_margin;
+    let closed = prov.close_due().unwrap();
+    let sent = chain.sent();
+    let claim = sent.iter().find(|t| t.inputs[0].prevout.txid_hex() == closed[0]).expect("claim");
+    assert_eq!(c.recover_conditional(O, claim).unwrap(), b"deliverable");
 }

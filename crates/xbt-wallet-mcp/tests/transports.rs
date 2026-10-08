@@ -171,34 +171,91 @@ fn streamable_http_sessions_and_guards() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, _) = mock_signer(dir.path());
     let h = http(&sock, 33591, None);
-    let (st, sid, body) = req("POST", &h.base, Some(&init_msg(1)), &[]);
+    // AGP-063 X1: no token configured: one is generated next to the signer socket, and required
+    let tok = std::fs::read_to_string(dir.path().join("mcp-http-token")).unwrap().trim().to_string();
+    let auth = format!("Bearer {tok}");
+    let a = ("Authorization", auth.as_str());
+    assert_eq!(req("POST", &h.base, Some(&init_msg(1)), &[]).0, 401);
+    let (st, sid, body) = req("POST", &h.base, Some(&init_msg(1)), &[a]);
     assert_eq!(st, 200);
     let sid = sid.expect("session id");
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["serverInfo"]["name"], "xbt-agent-wallet");
     let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-    assert_eq!(req("POST", &h.base, Some(&list), &[]).0, 400); // no session
-    assert_eq!(req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", "nope")]).0, 404);
-    let (st, _, body) = req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "2025-06-18")]);
+    assert_eq!(req("POST", &h.base, Some(&list), &[a]).0, 400); // no session
+    assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", "nope")]).0, 404);
+    let (st, _, body) = req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "2025-06-18")]);
     assert_eq!(st, 200);
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["tools"].as_array().unwrap().len(), 10);
     let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-    assert_eq!(req("POST", &h.base, Some(&note), &[("Mcp-Session-Id", &sid)]).0, 202);
+    assert_eq!(req("POST", &h.base, Some(&note), &[a, ("Mcp-Session-Id", &sid)]).0, 202);
     let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "balance", "arguments": {}}});
-    let (st, _, body) = req("POST", &h.base, Some(&call), &[("Mcp-Session-Id", &sid)]);
+    let (st, _, body) = req("POST", &h.base, Some(&call), &[a, ("Mcp-Session-Id", &sid)]);
     assert_eq!(st, 200);
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["isError"], false);
-    assert_eq!(req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "1999-01-01")]).0, 400);
-    assert_eq!(req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", &sid), ("Origin", "https://evil.example")]).0, 403);
-    assert_eq!(req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", &sid), ("Origin", "http://localhost:3000")]).0, 200);
-    assert_eq!(req("GET", &h.base, None, &[("Mcp-Session-Id", &sid)]).0, 405);
-    assert_eq!(req("POST", &h.base.replace("/mcp", "/other"), Some(&list), &[]).0, 404);
-    assert_eq!(req("DELETE", &h.base, None, &[("Mcp-Session-Id", &sid)]).0, 200);
-    assert_eq!(req("POST", &h.base, Some(&list), &[("Mcp-Session-Id", &sid)]).0, 404);
+    assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "1999-01-01")]).0, 400);
+    assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("Origin", "https://evil.example")]).0, 403);
+    assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("Origin", "http://localhost:3000")]).0, 200);
+    assert_eq!(req("GET", &h.base, None, &[a, ("Mcp-Session-Id", &sid)]).0, 405);
+    assert_eq!(req("POST", &h.base.replace("/mcp", "/other"), Some(&list), &[a]).0, 404);
+    assert_eq!(req("DELETE", &h.base, None, &[a, ("Mcp-Session-Id", &sid)]).0, 200);
+    assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid)]).0, 404);
 
     let t = http(&sock, 33592, Some("s3cret"));
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[]).0, 401);
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[("Authorization", "Bearer wrong!")]).0, 401);
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[("Authorization", "Bearer s3cret")]).0, 200);
+}
+
+// ports: AGP-063's range 29060-29069 (outside the ephemeral range)
+#[test]
+fn x1_the_generated_token_is_private_and_origin_is_checked_with_allow_remote() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _) = mock_signer(dir.path());
+    let h = http(&sock, 29060, None);
+    let p = dir.path().join("mcp-http-token");
+    assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+    let tok = std::fs::read_to_string(&p).unwrap().trim().to_string();
+    assert_eq!(tok.len(), 64);
+    assert_eq!(req("POST", &h.base, Some(&init_msg(1)), &[]).0, 401, "loopback is no authentication");
+    drop(h);
+    let h = http(&sock, 29061, None);
+    let auth = format!("Bearer {tok}");
+    assert_eq!(req("POST", &h.base, Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200, "the same token after a restart");
+    // a remote listener still refuses a browser page from elsewhere (a DNS rebinding: Origin = Host)
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear().env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_HTTP_TOKEN", "s3cret").args(["--http", "127.0.0.1:29062", "--http-allow-remote"])
+        .stdout(Stdio::null()).stderr(Stdio::null());
+    let r = Http { child: cmd.spawn().unwrap(), base: "http://127.0.0.1:29062/mcp".into() };
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", 29062)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let b = ("Authorization", "Bearer s3cret");
+    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", "http://rebind.example:29062")]).0, 403);
+    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", "http://127.0.0.1:29062")]).0, 200);
+}
+
+#[test]
+fn x1_the_local_payer_checks_the_allowlist_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, seen) = mock_signer(dir.path());
+    let target = std::net::TcpListener::bind("127.0.0.1:29063").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let mut child = Command::new(BIN).env_clear().env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_PAYER", "local").env("XBT_MCP_NETWORK", "regtest")
+        .env("XBT_MCP_LEDGER", dir.path().join("payer.jsonl")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let mut s = Stdio_ { child, out };
+    s.ask(init_msg(1));
+    let r = s.call(2, "xbt402_pay", json!({"url": "http://127.0.0.1:29063/internal", "max_sats": 5}));
+    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("allowlist")), "{v}");
+    assert!(matches!(target.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "the probe never left");
+    assert!(seen.lock().unwrap().iter().any(|q| q["method"] == "policy_get"));
+    drop(s.child.stdin.take());
+    let _ = s.child.wait();
 }
 
 #[test]

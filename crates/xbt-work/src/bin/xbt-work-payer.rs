@@ -1,11 +1,14 @@
 //! The Rust pay-with-work payer for the regtest run (the xbt-063 `flagship.pww_payer` scenario,
 //! with the Rust xbt402 Client and the xbt-work payer).
 //!
-//! xbt-work-payer prepare BASE --state FILE
+//! xbt-work-payer prepare BASE --state FILE [--gateway-config FILE]
 //!     unpaid call -> 402 offering xbt-channel AND xbt-work; take a work invoice; print the stratum
-//!     username to mine as (`<identity>.pw-<invoice>.payer`, the worker-field form)
+//!     username to mine as (`<identity>.pw-<invoice>.payer`, the worker-field form). With
+//!     `--gateway-config` (the DATUM gateway's JSON config), refuse to start when the gateway would
+//!     not pass the username through (`datum.pool_pass_full_users` false, AGP-065).
 //! xbt-work-payer pay BASE CALLS SECS --state FILE --rpc-port R --cookie PATH --window-url URL
-//!                [--pause-file FILE] [--provider-admin]
+//!                [--pause-file FILE] [--provider-admin] [--prime-window-min-work W ...]
+//!     (the Prime terms flags of xbt-work-provider: the payer-side audit holds statements to them)
 //!     wait for the Prime's signed receipts (through the blinded relay) to cover CALLS calls, pay them
 //!     with the Rust Client, run the refusal checks, read the coinbases, audit them (payer side: the
 //!     third-party bound from receipts and signed window statements; provider side: its own bound,
@@ -26,9 +29,10 @@ use xbt402::wire::unb64json;
 use xbt_work::audit::{audit_block, check_fraud_proof, deferred_sats, expected_sats, receipts_bound, TOLERANCE};
 use xbt_work::auth::request_digest;
 use xbt_work::book::ReceiptBook;
-use xbt_work::payer::{PayerConfig, WorkPayer};
+use xbt_work::chain::ChainBlock;
+use xbt_work::payer::{check_gateway_config, PayerConfig, WorkPayer};
 use xbt_work::receipt::{pubkey_from_hex, Signed};
-use xbt_work::tools::{arg, block_count, coinbase, flag, network, paid_to, rpc, window};
+use xbt_work::tools::{arg, block_count, chain_block, flag, network, prime_terms, rpc, window};
 
 const CALLS: [&str; 4] = ["/v1/share-change?window=7d", "/v1/pools?window=7d", "/v1/pool/lazarus", "/v1/pools?window=1d"];
 
@@ -53,6 +57,18 @@ fn payer(state: &str, net: &str) -> Arc<WorkPayer> {
 }
 
 fn prepare(base: &str, state: &str) {
+    if let Some(path) = arg("--gateway-config") {
+        let cfg = std::fs::read(&path).map_err(|e| e.to_string())
+            .and_then(|b| xbt402::json::parse_slice(&b).map_err(|_| "not JSON".to_string()))
+            .unwrap_or_else(|e| {
+                eprintln!("xbt-work-payer: --gateway-config {path}: {e}");
+                std::process::exit(2);
+            });
+        if let Err(e) = check_gateway_config(&cfg) {
+            eprintln!("xbt-work-payer: {e}");
+            std::process::exit(2);
+        }
+    }
     let t = UreqTransport::default();
     let url = format!("{base}{}", CALLS[0]);
     let r = t.request("GET", &url, b"", &[]).expect("GET");
@@ -86,6 +102,10 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let net = meta["network"].as_str().expect("network").to_string();
     let node = rpc(&arg("--rpc-port").expect("--rpc-port"), &arg("--cookie").expect("--cookie")).expect("node");
     let window_url = arg("--window-url").expect("--window-url");
+    let terms = prime_terms().unwrap_or_else(|e| {
+        eprintln!("xbt-work-payer: {e}");
+        std::process::exit(2);
+    });
     let t = UreqTransport::default();
     let p = payer(state, &net);
     let s = p.session(base).expect("session: run prepare first");
@@ -108,12 +128,18 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
             first_receipt_s.get_or_insert(((now() - prepared) * 10.0).round() / 10.0);
         }
     };
+    let mut warned = false;
     while t0.elapsed().as_secs_f64() < secs {
         if let Ok(Some(r)) = p.refresh(&t, base) {
             note(&r, &mut receipts);
             if r.receipt.cum_work >= need {
                 break;
             }
+        }
+        if !warned && receipts.is_empty() && t0.elapsed() > Duration::from_secs(300) {
+            warned = true;
+            eprintln!("  warning: no receipt after 5 min. If the miner's shares are accepted, check the DATUM gateway: \
+                       datum.pool_pass_full_users must be true, or the Prime credits the gateway's pool_address, not {inv}");
         }
         std::thread::sleep(Duration::from_secs(3));
     }
@@ -232,31 +258,40 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
 
     // on-chain: the payer's shares were pool blocks; their coinbases pay the provider's TIDES row
     let (lo, hi) = (receipts[0].receipt.first_height, block_count(&node).unwrap_or(0));
-    let mut paid_out = vec![];
+    let mut paid_out: Vec<ChainBlock> = vec![];
     for h in lo..=hi {
-        if let Ok((hash, v, outs)) = coinbase(&node, h) {
-            let paid = paid_to(&outs, &ident);
-            if paid > 0 {
-                paid_out.push((h, hash, v, paid));
-            }
+        match chain_block(&node, h, &ident) {
+            Ok(b) if b.paid_sats > 0 => paid_out.push(b),
+            Ok(_) => {}
+            Err(e) => c.check(false, format!("read block {h} from the payer's node: {e}")),
         }
     }
     c.check(!paid_out.is_empty(), format!("coinbases of the payer's blocks paid the provider identity on-chain: {} sat in {} coinbase output(s)",
-                                         paid_out.iter().map(|p| p.3).sum::<u64>(), paid_out.len()));
-    // payer-side audit: the third-party bound (§10.4) from the receipts it holds and the signed statements
+                                         paid_out.iter().map(|b| b.paid_sats).sum::<u64>(), paid_out.len()));
+    // payer-side audit: the third-party bound (§10.4) from the receipts it holds and the signed
+    // statements, each held to the Prime's published terms (AGP-065)
     let mut audits = vec![];
-    for (h, hash, v, paid) in &paid_out {
-        let r = match window(&t, &window_url, *h) {
-            Ok(Some((sw, def, _))) if sw.verify(&pk) && &sw.stmt.block_hash == hash => {
-                let l = receipts_bound(receipts.iter().map(|r| &r.receipt), &sw.stmt);
-                let exp = expected_sats(*v, sw.stmt.fee_bps, l, sw.stmt.window_work).unwrap_or(u64::MAX);
-                let (owed, _) = deferred_sats(&pk, &sw.stmt, &ident, &def);
-                let ok = exp < sw.stmt.min_payout || paid + owed + TOLERANCE >= exp;
-                json!({"height": h, "ok": ok, "expectedSats": exp, "paidSats": paid, "deferredSats": owed, "provenWork": l,
-                       "windowStart": sw.stmt.window_start, "windowWork": sw.stmt.window_work, "statement": sw.line_doc()})
+    for b in &paid_out {
+        let bounds = match terms.bounds(b) {
+            Ok(x) => x,
+            Err(e) => {
+                audits.push(json!({"height": b.height, "ok": false, "error": e.to_string()}));
+                continue;
             }
-            Ok(Some(_)) => json!({"height": h, "ok": false, "error": "window statement unsigned, or for another block"}),
-            _ => json!({"height": h, "ok": false, "error": "no window statement"}),
+        };
+        let r = match window(&t, &window_url, b.height) {
+            Ok(Some((sw, def, _))) if sw.verify(&pk) && sw.stmt.block_hash == b.hash && sw.stmt.height == b.height => {
+                let (ww, fee, mp, bounded) = bounds.apply(&sw.stmt);
+                let l = receipts_bound(receipts.iter().map(|r| &r.receipt), &sw.stmt);
+                let exp = expected_sats(b.value_sats, fee, l, ww).unwrap_or(u64::MAX);
+                let (owed, _) = deferred_sats(&pk, &sw.stmt, &ident, &def);
+                let ok = exp < mp || b.paid_sats + owed + TOLERANCE >= exp;
+                json!({"height": b.height, "ok": ok, "expectedSats": exp, "paidSats": b.paid_sats, "deferredSats": owed, "provenWork": l,
+                       "windowStart": sw.stmt.window_start, "windowWork": ww, "bounded": bounded, "statement": sw.line_doc()})
+            }
+            Ok(Some(_)) => json!({"height": b.height, "ok": false, "error": "window statement unsigned, or for another block"}),
+            Ok(None) => json!({"height": b.height, "ok": false, "error": "no window statement"}),
+            Err(e) => json!({"height": b.height, "ok": false, "error": e.to_string()}),
         };
         audits.push(r);
     }
@@ -269,14 +304,15 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
         let _ = book.accept(r, &inv);
     }
     let mut underpay = Value::Null;
-    for (h, _, v, _) in paid_out.iter().rev() {
-        if let Ok(Some((sw, def, _))) = window(&t, &window_url, *h) {
-            if let Ok(o) = audit_block(&book, &sw, *v, 1, &def) {
-                if let Some(proof) = o.proof {
-                    let ok = check_fraud_proof(&proof, &pk, *v, 1) && !check_fraud_proof(&proof, &pk, *v, o.expected_sats);
-                    underpay = json!({"height": h, "expectedSats": o.expected_sats, "proof": proof, "checks": ok});
-                    break;
-                }
+    for b in paid_out.iter().rev() {
+        let one = ChainBlock { paid_sats: 1, ..b.clone() };
+        let (Ok(Some((sw, def, _))), Ok(bounds)) = (window(&t, &window_url, b.height), terms.bounds(b)) else { continue };
+        if let Ok(o) = audit_block(&book, &sw, &one, &bounds, &def) {
+            if let Some(proof) = o.proof {
+                let honest = ChainBlock { paid_sats: o.expected_sats, ..b.clone() };
+                let ok = check_fraud_proof(&proof, &pk, &one, &bounds) && !check_fraud_proof(&proof, &pk, &honest, &bounds);
+                underpay = json!({"height": b.height, "expectedSats": o.expected_sats, "proof": proof, "checks": ok});
+                break;
             }
         }
     }
@@ -303,7 +339,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
                     "prime_pubkey": s.accepted["extra"]["primePubkey"], "first_receipt_s": first_receipt_s,
                     "receipts": receipts.iter().map(|r| r.receipt.to_doc()["receipt"].clone()).collect::<Vec<_>>(), "last_receipt": last.to_doc(),
                     "calls": calls_out,
-                    "coinbase_payouts": paid_out.iter().map(|(h, hash, v, p)| json!({"height": h, "block": hash, "coinbaseValueSats": v, "sat": p})).collect::<Vec<_>>(),
+                    "coinbase_payouts": paid_out.iter().map(|b| json!({"height": b.height, "block": b.hash, "coinbaseValueSats": b.value_sats, "sat": b.paid_sats})).collect::<Vec<_>>(),
                     "payer_audit": audits, "underpay_fraud_proof": underpay, "provider_audit": provider_audit, "checks": c.list, "ok": c.ok});
     println!("{}", xbt402::json::dumps(&ev));
     if c.ok { 0 } else { 1 }

@@ -68,6 +68,8 @@ pub struct HttpConfig {
     /// rotation endpoint: a bearer token must not be able to replace itself.
     pub token_file: Option<PathBuf>,
     pub allow_remote: bool,
+    /// Browser origins besides loopback ones that may call (`XBT_MCP_ALLOWED_ORIGINS`, `scheme://host:port`).
+    pub allowed_origins: Vec<String>,
     /// A path prefix a reverse proxy keeps (`XBT_BASE_PATH`): `<base>/mcp`, `<base>/healthz`. Requests
     /// without it are served too, for proxies that strip it.
     pub base: String,
@@ -77,7 +79,8 @@ pub struct HttpConfig {
 
 impl HttpConfig {
     pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into(), path: "/mcp".into(), token: None, token_file: None, allow_remote: false, base: String::new(), ready: None }
+        Self { addr: addr.into(), path: "/mcp".into(), token: None, token_file: None, allow_remote: false, allowed_origins: vec![], base: String::new(),
+               ready: None }
     }
 }
 
@@ -176,10 +179,11 @@ fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: 
     if path != cfg.path {
         return reply(req, 404, rpc_error(-32600, "Not found"), &[]);
     }
-    // DNS rebinding: a browser page elsewhere must not reach a loopback wallet
+    // DNS rebinding: a browser page elsewhere must not reach the wallet, remote listener or not
+    // (AGP-063 X1). A rebound page is same-origin with its Host, so that is no exception.
     if let Some(o) = header(&req, "Origin") {
         let host = o.split("://").nth(1).unwrap_or("");
-        if !cfg.allow_remote && !is_loopback_host(host) {
+        if !is_loopback_host(host) && !cfg.allowed_origins.iter().any(|a| a.eq_ignore_ascii_case(o.trim_end_matches('/'))) {
             return reply(req, 403, rpc_error(-32600, "Forbidden origin"), &[]);
         }
     }
@@ -256,6 +260,10 @@ pub fn serve_http(server: Arc<Server>, cfg: HttpConfig) -> Result<(), String> {
     }
     if cfg.allow_remote && !matches!(live_token(&cfg), Ok(Some(_))) {
         return Err("--http-allow-remote needs XBT_MCP_HTTP_TOKEN".into());
+    }
+    // AGP-063 X1: loopback is no authentication (any local process, a browser page)
+    if !matches!(live_token(&cfg), Ok(Some(_))) {
+        return Err("the HTTP transport needs a bearer token: XBT_MCP_HTTP_TOKEN(_FILE), the mcp-http-token secret, or a generated one".into());
     }
     let http = tiny_http::Server::http(&cfg.addr).map_err(|e| format!("{}: {e}", cfg.addr))?;
     eprintln!("xbt-wallet-mcp: streamable HTTP on http://{}{}{} (health: /healthz, /readyz)", cfg.addr, xbt_svc::proxy::normalize_base(&cfg.base), cfg.path);

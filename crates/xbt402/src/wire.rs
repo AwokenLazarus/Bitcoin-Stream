@@ -5,7 +5,8 @@
 //! 402 + PAYMENT-REQUIRED: base64(PaymentRequired)      (the same JSON in the body)
 //! PaymentRequired = {x402Version: 2, error?, resource: {url}, accepts: [PaymentRequirements]}
 //! pay:    PAYMENT-SIGNATURE: base64({x402Version: 2, accepted, payload: {chan, seq, cum, sig?, auth}})
-//!         auth = HMAC-SHA256(K, "xbt402/auth|chan|seq|cum|sig|sha256(method|path|body)")
+//!         auth = HMAC-SHA256(K, "xbt402/auth|chan|seq|cum|sig|" + request_digest_v2)
+//!         request_digest_v2 = tagged_hash("xbt402/req/v2", length-prefixed method, scheme, host, port, target, body)
 //! result: PAYMENT-RESPONSE: base64(SettlementResponse {success, transaction: "", network, payer,
 //!         amount: "", extra: {chargedAmount, receipt}})
 //! ```
@@ -60,14 +61,91 @@ pub fn unb64json(s: &str) -> Result<Value> {
     crate::json::parse_slice(&raw).map_err(|_| ChannelError::new("bad_payload", "not JSON"))
 }
 
-/// `sha256(method | path | body)` hex: which request a payment or receipt is for.
-pub fn request_digest(method: &str, path: &str, body: &[u8]) -> String {
+/// The v1 binding `sha256(method | target | body)` hex. Its fields run together and it binds no
+/// origin (Guida T2); xbt402 uses [`request_digest_v2`]. Only the xbt-work scheme still binds requests
+/// with it, because its published vectors (XBT-053) do.
+pub fn request_digest_v1(method: &str, target: &str, body: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(method.as_bytes());
     h.update(b"|");
-    h.update(path.as_bytes());
+    h.update(target.as_bytes());
     h.update(b"|");
     h.update(body);
+    hex::encode(h.finalize())
+}
+
+/// Where a request went, as [`request_digest_v2`] binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestUrl {
+    /// Lowercase; empty for a bare target.
+    pub scheme: String,
+    /// Lowercase, an IPv6 literal in brackets, no port; empty for a bare target.
+    pub host: String,
+    /// Decimal with no leading zeros, or the scheme's default (80 for http, 443 for https).
+    pub port: String,
+    /// Path and query exactly as sent; `/` when the URL has no path.
+    pub target: String,
+}
+
+/// Split `scheme://host[:port]target` (userinfo and a fragment are dropped). Anything without
+/// `://` is a bare target: it binds no origin, which only matches a payer that bound none either.
+pub fn request_url(url: &str) -> RequestUrl {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return RequestUrl { scheme: String::new(), host: String::new(), port: String::new(), target: url.to_string() };
+    };
+    let rest = rest.split('#').next().unwrap_or("");
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = match authority.find(']') {
+        Some(i) if authority.starts_with('[') => (&authority[..=i], authority[i + 1..].strip_prefix(':').unwrap_or("")),
+        _ => authority.rsplit_once(':').unwrap_or((authority, "")),
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let digits = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    let port = match (digits.then(|| port.parse::<u16>().ok()).flatten(), scheme.as_str()) {
+        (Some(p), _) => p.to_string(),
+        (None, "http") if port.is_empty() => "80".into(),
+        (None, "https") if port.is_empty() => "443".into(),
+        _ => port.to_string(),
+    };
+    let target = if tail.starts_with('/') { tail.to_string() } else { format!("/{tail}") };
+    RequestUrl { scheme, host: host.to_ascii_lowercase(), port, target }
+}
+
+/// `scheme://authority` of an absolute URL, or `""` for a bare target.
+pub fn url_origin(url: &str) -> &str {
+    match url.find("://") {
+        Some(i) => &url[..i + 3 + url[i + 3..].find(['/', '?', '#']).unwrap_or(url.len() - i - 3)],
+        None => "",
+    }
+}
+
+/// `LE64(len(x)) ‖ x`: every field of a v2 digest or receipt, so no two field lists hash alike.
+fn put_field(h: &mut Sha256, x: &[u8]) {
+    h.update((x.len() as u64).to_le_bytes());
+    h.update(x);
+}
+
+fn tagged(tag: &str) -> Sha256 {
+    let t = Sha256::digest(tag.as_bytes());
+    let mut h = Sha256::new();
+    h.update(t);
+    h.update(t);
+    h
+}
+
+/// Which request a payment or receipt is for (AGP-068, Guida T2): hex of
+/// `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`,
+/// `f(x) = LE64(len(x)) ‖ x`, the URL split by [`request_url`]. `url` is the absolute URL the payer
+/// sent the request to; the server rebuilds it from its public scheme, the `Host` header and the
+/// request target.
+pub fn request_digest_v2(method: &str, url: &str, body: &[u8]) -> String {
+    let u = request_url(url);
+    let mut h = tagged("xbt402/req/v2");
+    for f in [method.as_bytes(), u.scheme.as_bytes(), u.host.as_bytes(), u.port.as_bytes(), u.target.as_bytes(), body] {
+        put_field(&mut h, f);
+    }
     hex::encode(h.finalize())
 }
 
@@ -91,10 +169,22 @@ pub fn auth_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `tagged_hash("xbt402/receipt", "chan|seq|cum|charged|spentMsat|req")`.
+/// The fields a receipt signs, in order (AGP-068 adds the answer's `status` and `bodyHash`).
+pub const RECEIPT_FIELDS: [&str; 8] = ["chan", "seq", "cum", "charged", "spentMsat", "req", "status", "bodyHash"];
+
+/// `tagged_hash("xbt402/receipt/v2", f(chan) ‖ f(seq) ‖ … ‖ f(bodyHash))` over [`RECEIPT_FIELDS`],
+/// each formatted as Python's `str()`, `f(x) = LE64(len(x)) ‖ x`.
 pub fn receipt_message(r: &Value) -> [u8; 32] {
-    let parts: Vec<String> = ["chan", "seq", "cum", "charged", "spentMsat", "req"].iter().map(|k| py_str(r.get(*k))).collect();
-    tagged_hash("xbt402/receipt", parts.join("|").as_bytes())
+    let mut h = tagged("xbt402/receipt/v2");
+    for k in RECEIPT_FIELDS {
+        put_field(&mut h, py_str(r.get(k)).as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// `bodyHash` of a receipt: hex `sha256` of the answer's body exactly as sent.
+pub fn body_hash(body: &[u8]) -> String {
+    hex::encode(Sha256::digest(body))
 }
 
 /// What the payer signs to close: `tagged_hash("xbt402/close", chan)`.
@@ -355,10 +445,77 @@ mod tests {
         assert!(scheme_accepted(Some(SCHEME)) && scheme_accepted(Some(SCHEME_ALIAS)));
         assert!(!scheme_accepted(Some("exact")));
         assert!(safe_code("bad_sig") && !safe_code("Bad") && !safe_code("a b") && !safe_code("__"));
-        assert_eq!(request_digest("", "", b""), hex::encode(Sha256::digest(b"||")));
+        assert_eq!(request_digest_v1("", "", b""), hex::encode(Sha256::digest(b"||")));
         let v = json!({"a": 1});
         assert_eq!(unb64json(&b64json(&v)).unwrap(), v);
-        let r = json!({"chan": "c", "seq": 3, "cum": "5", "charged": "1", "spentMsat": "2", "req": "r"});
-        assert_eq!(receipt_message(&r), tagged_hash("xbt402/receipt", b"c|3|5|1|2|r"));
+        let r = json!({"chan": "c", "seq": 3, "cum": "5", "charged": "1", "spentMsat": "2", "req": "r", "status": 200, "bodyHash": "bh"});
+        let mut pre = Vec::new();
+        for f in ["c", "3", "5", "1", "2", "r", "200", "bh"] {
+            pre.extend((f.len() as u64).to_le_bytes());
+            pre.extend(f.as_bytes());
+        }
+        assert_eq!(receipt_message(&r), tagged_hash("xbt402/receipt/v2", &pre));
+        assert_eq!(body_hash(b"x"), hex::encode(Sha256::digest(b"x")));
+    }
+
+    fn v2_preimage(fields: [&[u8]; 6]) -> Vec<u8> {
+        let mut pre = Vec::new();
+        for f in fields {
+            pre.extend((f.len() as u64).to_le_bytes());
+            pre.extend(f);
+        }
+        pre
+    }
+
+    #[test]
+    fn request_digest_v2_is_the_tagged_hash_of_length_prefixed_fields() {
+        let want = tagged_hash("xbt402/req/v2", &v2_preimage([b"POST", b"https", b"api.example", b"8443", b"/v1/q?a=1", b"{}"]));
+        assert_eq!(request_digest_v2("POST", "https://api.example:8443/v1/q?a=1", b"{}"), hex::encode(want));
+        // a bare target binds no origin; a close's payload binds the empty request
+        let bare = tagged_hash("xbt402/req/v2", &v2_preimage([b"GET", b"", b"", b"", b"/v1/q", b""]));
+        assert_eq!(request_digest_v2("GET", "/v1/q", b""), hex::encode(bare));
+        let empty = tagged_hash("xbt402/req/v2", &v2_preimage([b"", b"", b"", b"", b"", b""]));
+        assert_eq!(request_digest_v2("", "", b""), hex::encode(empty));
+    }
+
+    #[test]
+    fn request_urls_are_canonical() {
+        let u = |s: &str| {
+            let r = request_url(s);
+            (r.scheme, r.host, r.port, r.target)
+        };
+        let t = |a: &str, b: &str, c: &str, d: &str| (a.to_string(), b.to_string(), c.to_string(), d.to_string());
+        assert_eq!(u("HTTPS://API.Example/v1/Q?A=1"), t("https", "api.example", "443", "/v1/Q?A=1"));
+        assert_eq!(u("https://api.example:443/x"), u("https://api.example/x"));
+        assert_eq!(u("http://h"), t("http", "h", "80", "/"));
+        assert_eq!(u("http://h?q=1"), t("http", "h", "80", "/?q=1"));
+        assert_eq!(u("http://user:pw@h:08080/p#frag"), t("http", "h", "8080", "/p"));
+        assert_eq!(u("http://[::1]:8402/p"), t("http", "[::1]", "8402", "/p"));
+        assert_eq!(u("http://[::1]/p"), t("http", "[::1]", "80", "/p"));
+        assert_eq!(u("/v1/q"), t("", "", "", "/v1/q"));
+        assert_eq!(url_origin("https://h:1/p?q"), "https://h:1");
+        assert_eq!(url_origin("https://h"), "https://h");
+        assert_eq!(url_origin("/p"), "");
+    }
+
+    #[test]
+    fn no_two_requests_share_a_v2_digest() {
+        // Chris's pair, and the same request at another scheme, host or port
+        assert_ne!(request_digest_v2("GET", "/q?a|b", b""), request_digest_v2("GET", "/q?a", b"b|"));
+        assert_eq!(request_digest_v1("GET", "/q?a|b", b""), request_digest_v1("GET", "/q?a", b"b|"), "the v1 collision");
+        let base = request_digest_v2("GET", "https://api.example/v1/q", b"");
+        for other in ["http://api.example/v1/q", "https://evil.example/v1/q", "https://api.example:8443/v1/q", "https://api.example/v1/q?"] {
+            assert_ne!(base, request_digest_v2("GET", other, b""), "{other}");
+        }
+        // every way of cutting one byte string into (method, target, body) hashes differently
+        let s = b"GET|/a|b|c";
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..=s.len() {
+            for j in i..=s.len() {
+                let (m, t, b) = (&s[..i], &s[i..j], &s[j..]);
+                let d = request_digest_v2(std::str::from_utf8(m).unwrap(), std::str::from_utf8(t).unwrap(), b);
+                assert!(seen.insert(d), "cut at {i},{j} collides");
+            }
+        }
     }
 }

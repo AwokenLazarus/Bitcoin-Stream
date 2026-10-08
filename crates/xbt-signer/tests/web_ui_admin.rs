@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use xbt_signer::approval::{backup_message, canonical_message, human_key_message, policy_message, rotate_message};
+use xbt_signer::approval::{backup_message, canonical_message, deny_message, human_key_message, policy_message, rotate_message};
 
 fn expiry_of(r: &Value) -> i64 {
     r["approval_expires"].as_i64().unwrap()
@@ -85,7 +85,9 @@ fn a_pay_token_approved_through_the_queue_pays_at_once_as_in_b2_and_deny_drops_a
     assert_eq!(r["verdict"], "needs_human", "{r}");
     let q = rig.call("approvals", json!({}));
     assert_eq!(q["approvals"][0]["kind"], "pay");
-    let d = rig.call("deny_approval", json!({"token": r["approval_token"], "reason": "not today"}));
+    let exp = xbt_signer::pyjson::now_f64() as i64 + 300;
+    let tok = r["approval_token"].as_str().unwrap().to_string();
+    let d = rig.call("deny_approval", json!({"token": tok, "reason": "not today", "expiry": exp, "signature": sign_human(&deny_message(&tok, exp))}));
     assert_eq!(d["state"], "denied");
     assert_eq!(rig.call("approval_status", json!({"token": r["approval_token"]}))["state"], "denied");
     assert_eq!(approve(&rig, &r, None)["rule"], "approval");
@@ -177,8 +179,10 @@ fn the_first_human_key_is_enrolled_once_and_later_only_the_old_key_can_hand_over
     assert_eq!(rig.call("policy_set", set)["rule"], "human_key");
     let pubhex = hex::encode(human().verifying_key().to_bytes());
     assert_eq!(rig.call("human_key_enroll", json!({"pubkey": "zz"}))["rule"], "human_key");
-    let r = rig.call("human_key_enroll", json!({"pubkey": pubhex}));
+    let code = std::fs::read_to_string(rig.root.join(".run/enroll-code")).unwrap().trim().to_string();
+    let r = rig.call("human_key_enroll", json!({"pubkey": pubhex, "code": code}));
     assert_eq!(r["ok"], true, "{r}");
+    assert!(!rig.root.join(".run/enroll-code").exists(), "the code is spent");
     assert_eq!(rig.call("human_key_enroll", json!({"pubkey": pubhex}))["rule"], "human_key", "trust on first use only");
     // rotate to a new device key, signed by the old one
     let new = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);

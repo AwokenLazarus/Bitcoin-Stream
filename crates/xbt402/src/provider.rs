@@ -6,7 +6,7 @@
 //! [`crate::route_seller`] (AGP-026).
 //!
 //! [`Provider::serve`] is transport-independent: give it the method, path, headers and body of a
-//! request and send back what it returns. The `http-server` feature wraps it in `tiny_http`.
+//! request and send back what it returns. The `http-server` feature serves it on std::net.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,6 +25,10 @@ use crate::funding::{check_funding, ChainBackend, FundingPolicy};
 use crate::json::{dumps, py_int, py_str, py_u64, truthy};
 use crate::ledger::{ChannelState, Ledger};
 use crate::wire::*;
+
+/// The header the HTTP server sets to the TCP peer's IP address. A client-sent header of this name
+/// never reaches the service.
+pub const PEER_HEADER: &str = "X-Xbt402-Peer";
 
 /// A response for the transport to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +174,16 @@ pub struct Provider {
     recovered: Vec<(String, u64)>,
 }
 
+/// A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
+/// (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
+/// have to pay on its ch2. Closing ch1 now would close below it.
+fn locks_open(st: &ChannelState) -> bool {
+    truthy(st.extra.get("route_lock"))
+        || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
+            s.iter().any(|x| py_u64(x.get("cum")).map_or(true, |c| c > st.best_cum))
+        })
+}
+
 /// A direct call between its reservation and its settlement (AGP-059). Dropped unsettled (the
 /// handler or the charge panicked), it refunds the reservation: nothing was charged.
 struct InCall<'a> {
@@ -216,6 +230,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn path_key(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
+}
+
+/// The URL a request's payment binds: the origin of `url` (where the server was reached) and the
+/// target it routes on. A `url` without an origin binds the target alone.
+pub(crate) fn binding_url(url: &str, path: &str) -> String {
+    format!("{}{path}", url_origin(url))
 }
 
 fn random32() -> [u8; 32] {
@@ -434,7 +454,8 @@ impl Provider {
     }
 
     /// payload.auth is the channel's HMAC over this request and a seq above every earlier one.
-    pub(crate) fn authentic(&self, st: &ChannelState, pl: &Value, method: &str, path: &str, body: &[u8]) -> bool {
+    /// `bind` is the request's URL as [`request_digest_v2`] binds it ([`binding_url`]).
+    pub(crate) fn authentic(&self, st: &ChannelState, pl: &Value, method: &str, bind: &str, body: &[u8]) -> bool {
         let Some(seq) = py_int(pl.get("seq")) else { return false };
         if seq <= st.seq as i128 {
             return false;
@@ -454,7 +475,7 @@ impl Provider {
         };
         let sig = if truthy(pl.get("sig")) { py_str(pl.get("sig")) } else { String::new() };
         let want = request_auth(&key, &cid, Some(&Value::String(seq.to_string())), pl.get("cum"),
-                                Some(&sig), &request_digest(method, path, body));
+                                Some(&sig), &request_digest_v2(method, bind, body));
         let got = match pl.get("auth") {
             None => String::new(),
             v => py_str(v),
@@ -683,6 +704,11 @@ impl Provider {
         }
         let mut l = lock(&self.ledger);
         let mut st = l.channels[&cid].clone();
+        // AGP-064 (H1): route() writes its lock and lets go of the ledger before it forwards, so a
+        // close here could otherwise land between the two
+        if st.closed_txid.is_empty() && locks_open(&st) {
+            return fail("lock_pending", "a routed lock is open on this channel");
+        }
         if truthy(req.get("payload")) && st.closed_txid.is_empty() {
             let r = self.apply(&mut st, &req["payload"]);
             if let Err(e) = r {
@@ -715,7 +741,7 @@ impl Provider {
         if !st.closed_txid.is_empty() {
             return fail("channel_closed", format!("closed by {}", st.closed_txid));
         }
-        if truthy(st.extra.get("route_lock")) || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+        if locks_open(&st) {
             return fail("lock_pending", "a routed lock is open on this channel");
         }
         if st.extra.get("hub").is_some_and(|h| truthy(Some(h))) {
@@ -951,6 +977,12 @@ impl Provider {
             }
         }
         if (!st.best_sig.is_empty() || !st.cond_sig.is_empty()) && h as i64 >= p.expiry as i64 - self.cfg.close_margin as i64 {
+            // AGP-064: a lock in flight (seconds: the hub's revealTimeout) is let finish, in the first
+            // half of the margin only. Never for a written-off lock: a skipped margin close lets the
+            // payer refund the whole channel at expiry.
+            if truthy(st.extra.get("route_lock")) && (h as i64) < p.expiry as i64 - (self.cfg.close_margin as i64 + 1) / 2 {
+                return Ok(());
+            }
             out.push(self.close_locked(l, st)?);
             if truthy(st.extra.get("cond_close")) {
                 self.claim(st)?;
@@ -1212,11 +1244,12 @@ impl Provider {
                 Err(e) => HttpResponse::json(400, &json!({"error": e.code, "detail": e.to_string()})),
             };
         }
+        let bind = binding_url(url, path);
         if path == LOCK_PATH {
             if method != "POST" {
                 return HttpResponse::text(405, "method not allowed");
             }
-            return self.route_lock(method, path, headers, body);
+            return self.route_lock(method, &bind, headers, body);
         }
         if path == TERMS_PATH && method == "GET" {
             return HttpResponse::json(200, &self.terms());
@@ -1289,40 +1322,42 @@ impl Provider {
         let _ = acc;
         let hashlock = truthy(pl.get("hashlock"));
         let metered = self.charge.is_some();
-        let (cid, price, cond_sale, mut call) = {
+        let (cid, price, cond_sale, mut call, numbers) = {
             let mut l = lock(&self.ledger);
             let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
             let Some(cid) = cid else { return self.payment_required(url, price, "unknown_channel", None) };
             let mut st = l.channels[&cid].clone();
-            if !self.authentic(&st, &pl, method, path, body) {
+            if !self.authentic(&st, &pl, method, &bind, body) {
                 return self.payment_required(url, price, "bad_auth", None);
             }
             st.seq = py_u64(pl.get("seq")).unwrap_or(st.seq);        // spent, whatever happens next
-            l.channels.insert(cid.clone(), st.clone());
-            let height = match self.height() {
-                Ok(h) => h,
-                Err(e) => return HttpResponse::json(500, &json!({"error": "node_error", "detail": e.to_string()})),
-            };
-            if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
-                return self.payment_required(url, price, "channel_closing", Some(&st));
-            }
-            if st.suspended {
-                return self.payment_required(url, price, "unconfirmed", Some(&st));
-            }
-            let best = st.best_cum;
-            if !hashlock {
-                if let Err(e) = self.apply(&mut st, &pl) {
-                    return self.payment_required(url, price, &e.code, Some(&st));
-                }
-            }
+            // every refusal from here on is durable: the seq it spent, and a higher state that
+            // still does not cover this call (Guida T4: a seq kept only in memory came back after a
+            // restart, and the refused header with it)
             let refuse = |l: &mut Ledger, st: &ChannelState, error: &str, price: u64| {
-                l.channels.insert(cid.clone(), st.clone());
-                if st.best_cum != best {
-                    // a higher state that still does not cover this call: keep it
-                    let _ = l.save(&[&cid]);
+                if let Err(e) = self.save_state(l, st) {
+                    return HttpResponse::json(500, &json!({"error": e.code, "detail": e.to_string()}));
                 }
                 self.payment_required(url, price, error, Some(st))
             };
+            let height = match self.height() {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = self.save_state(&mut l, &st);
+                    return HttpResponse::json(500, &json!({"error": "node_error", "detail": e.to_string()}));
+                }
+            };
+            if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
+                return refuse(&mut l, &st, "channel_closing", price);
+            }
+            if st.suspended {
+                return refuse(&mut l, &st, "unconfirmed", price);
+            }
+            if !hashlock {
+                if let Err(e) = self.apply(&mut st, &pl) {
+                    return refuse(&mut l, &st, &e.code, price);
+                }
+            }
             let mut price = price;
             let mut cond_sale = false;
             let cond = lock(&self.cond);
@@ -1379,7 +1414,7 @@ impl Provider {
                 return HttpResponse::json(500, &json!({"error": e.code, "detail": e.to_string()}));
             }
             let call = InCall::new(self, &cid, st.seq, reserved);
-            (cid, price, cond_sale, call)
+            (cid, price, cond_sale, call, (st.best_cum, st.spent_msat))
         };
         let mut resp = (self.handler)(method, path, body);
         if resp.headers.iter().any(|(k, v)| k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0'])) {
@@ -1404,12 +1439,13 @@ impl Provider {
             let Some(mut st) = l.channels.get(&cid).cloned() else { return HttpResponse::text(500, "channel vanished") };
             call.settled = true;
             st.release(call.seq);
-            st.spent_msat = st.spent_msat.saturating_sub((price - charged).saturating_mul(1000));
+            let mut refund = (price - charged).saturating_mul(1000);
             if resp.status >= 500 {
                 // don't bill failed calls
-                st.spent_msat = st.spent_msat.saturating_sub(charged.saturating_mul(1000));
+                refund = price.saturating_mul(1000);
                 charged = 0;
             }
+            st.spent_msat = st.spent_msat.saturating_sub(refund);
             if metered || charged != price {
                 // a metered call's charge is durable before its answer leaves: the row on disk held
                 // the reservation, which a restart refunds (AGP-059)
@@ -1421,11 +1457,14 @@ impl Provider {
             } else {
                 l.channels.insert(cid.clone(), st.clone());
             }
-            let r = json!({"scheme": SCHEME, "chan": cid, "seq": st.seq, "cum": st.best_cum.to_string(), "charged": charged.to_string(),
-                           "spentMsat": st.spent_msat.to_string(),
-                           "owedMsat": st.spent_msat.saturating_sub(st.best_cum * 1000).to_string(),
-                           "creditMsat": (st.best_cum * 1000).saturating_sub(st.spent_msat).to_string(), "expiry": st.params.expiry,
-                           "req": request_digest(method, path, body)});
+            // the numbers of this call's own reservation (Guida T4): calls running beside it move the
+            // channel, not this receipt. Calls reserved before it count at what they reserved.
+            let (cum, spent) = (numbers.0, numbers.1.saturating_sub(refund));
+            let r = json!({"scheme": SCHEME, "chan": cid, "seq": call.seq, "cum": cum.to_string(), "charged": charged.to_string(),
+                           "spentMsat": spent.to_string(),
+                           "owedMsat": spent.saturating_sub(cum * 1000).to_string(),
+                           "creditMsat": (cum * 1000).saturating_sub(spent).to_string(), "expiry": st.params.expiry,
+                           "req": request_digest_v2(method, &bind, body), "status": resp.status, "bodyHash": body_hash(&resp.body)});
             (r, self.chan_secret(&st.params), hex::encode(st.params.payer_pub))
         };
         let Ok(secret) = secret else { return HttpResponse::text(500, "channel key") };

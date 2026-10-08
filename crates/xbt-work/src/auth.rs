@@ -9,8 +9,10 @@ use crate::grammar::check_invoice;
 
 pub const AUTH_TAG: &str = "xbt-work/auth";
 
-/// `hex(SHA256(method | target | body))`, exactly as `xbt-channel`.
-pub use xbt402::wire::request_digest;
+/// `hex(SHA256(method | target | body))`: xbt402's v1 request digest, which `xbt-channel` replaced
+/// with the length-prefixed, origin-bound v2 (AGP-068). xbt-work keeps v1 because its published
+/// vectors (XBT-053) do; moving it is the scheme owner's change.
+pub use xbt402::wire::request_digest_v1 as request_digest;
 
 /// `hex(HMAC-SHA256(authKey, "xbt-work/auth|" invoice "|" n "|" seq "|" cum_work "|" req))`.
 pub fn auth_tag(auth_key: &[u8], invoice: &str, n: u64, seq: u64, cum_work: u64, req: &str) -> GResult<String> {

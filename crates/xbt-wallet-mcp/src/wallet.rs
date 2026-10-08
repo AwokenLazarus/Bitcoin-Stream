@@ -221,9 +221,8 @@ struct Funding {
     min_conf: u64,
 }
 
-impl xbt402::client::Wallet for Funding {
-    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
-        let (txid, vout) = xbt402::client::Wallet::fund(&self.remote, address, sats)?;
+impl Funding {
+    fn confirmed(&self, txid: String, vout: u32) -> xbt402::Result<(String, u32)> {
         let deadline = std::time::Instant::now() + Duration::from_secs(180);
         loop {
             let v = self.remote.client.call("tx_confirmations", json!({"txid": txid, "vout": vout}))?;
@@ -235,6 +234,18 @@ impl xbt402::client::Wallet for Funding {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+    }
+}
+
+impl xbt402::client::Wallet for Funding {
+    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let (txid, vout) = xbt402::client::Wallet::fund(&self.remote, address, sats)?;
+        self.confirmed(txid, vout)
+    }
+
+    fn fund_channel(&self, origin: &str, params: &xbt402::channel::ChannelParams, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let (txid, vout) = self.remote.fund_channel(origin, params, address, sats)?;
+        self.confirmed(txid, vout)
     }
 }
 
@@ -276,11 +287,27 @@ impl LocalPayer {
         Ok(Self { client, remote, http: UreqTransport::default(), network: cfg.network.clone() })
     }
 
+    /// `origin` is on the signer's allowlist now (read on every call: the owner may change it).
+    fn allowlisted(&self, origin: &str) -> xbt402::Result<()> {
+        let dest = xbt_signer::policy::normalize_dest(origin);
+        let v = self.remote.client.call("policy_get", json!({}))?;
+        let listed = v.pointer("/policy/allowlist").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(Value::as_str).any(|a| xbt_signer::policy::normalize_dest(a) == dest);
+        if dest.is_empty() || !listed {
+            return Err(xbt402::ChannelError::new("allowlist", format!("destination not on allowlist: {dest}")));
+        }
+        Ok(())
+    }
+
     /// One paid call through xbt402's `Client`. The provider's body and receipt only come back under
     /// `untrusted_provider_response`, as the signer's own `xbt402_pay` returns them.
     fn pay(&mut self, url: &str, method: &str, body: &str, max_sats: u64) -> Value {
         let (origin, _) = split_url(url);
         let cap = xbt_signer::session::body_cap();
+        // AGP-063 X1: the owner's allowlist before any request, so the probe reaches no other host
+        if let Err(e) = self.allowlisted(&origin) {
+            return deny(e);
+        }
         // This call's price, before anything is signed: an open channel pays without a 402 first, and
         // xbt402's Client checks max_price only when it opens one, so max_sats is enforced here.
         let probe = match xbt402::client::Transport::request(&self.http, method, url, body.as_bytes(), &[]) {

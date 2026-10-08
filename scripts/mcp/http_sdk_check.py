@@ -59,7 +59,9 @@ def main():
     b1_root = os.environ.get("B1_ROOT", "").strip() or os.environ.get("XBT402_B1", "").strip()
     if b1_root:
         env["B1_ROOT"] = b1_root
-    srv = subprocess.Popen([a.rust, "--http", f"127.0.0.1:{a.port}"], env=env, stderr=subprocess.DEVNULL)
+    token = os.urandom(16).hex()      # AGP-063 X1: the HTTP transport always needs a bearer token
+    srv = subprocess.Popen([a.rust, "--http", f"127.0.0.1:{a.port}"], env=dict(env, XBT_MCP_HTTP_TOKEN=token),
+                           stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
             try:
@@ -68,7 +70,9 @@ def main():
                 break
             except OSError:
                 time.sleep(0.05)
-        rust = asyncio.run(session_run(streamable_http_client(f"http://127.0.0.1:{a.port}/mcp")))
+        from mcp.shared._httpx_utils import create_mcp_http_client
+        client = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+        rust = asyncio.run(session_run(streamable_http_client(f"http://127.0.0.1:{a.port}/mcp", http_client=client)))
         b2 = asyncio.run(session_run(stdio_client(StdioServerParameters(command=a.py, args=["-m", "agentwallet.mcp_server"],
                                                                           env=dict(env, PYTHONPATH=a.b2)))))
     finally:

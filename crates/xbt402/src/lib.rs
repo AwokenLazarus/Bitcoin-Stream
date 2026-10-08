@@ -18,7 +18,7 @@
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
 //! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
 //!
-//! Optional features: `http-client` (ureq transport), `http-server` (tiny_http around the
+//! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
 
 pub mod adaptor;

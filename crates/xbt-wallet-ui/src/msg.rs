@@ -29,3 +29,7 @@ pub fn rotate(hot_address: &str, expiry: i64) -> Vec<u8> {
 pub fn backup(hot_address: &str, expiry: i64) -> Vec<u8> {
     join(&["xbt-agentwallet-backup-v1", hot_address, &expiry.to_string()])
 }
+
+pub fn deny(token: &str, expiry: i64) -> Vec<u8> {
+    join(&["xbt-agentwallet-deny-v1", token, &expiry.to_string()])
+}

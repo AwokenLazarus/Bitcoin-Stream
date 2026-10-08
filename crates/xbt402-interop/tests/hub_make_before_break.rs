@@ -199,13 +199,17 @@ fn hub_caps_the_child_below_the_providers_zero_conf_max() {
 #[test]
 fn provider_enforces_its_cap_and_margin_itself() {
     let w = world(None, true);
-    let (_, child) = w.roll();
+    w.roll();
     w.set_hub_zc("maxCum", json!(1_000_000_000u64)); // a hub that ignores the cap
     let r = w.lock(70);
     assert_eq!(r["error"], "route_failed", "{r}");
     assert_eq!(w.hub_refused("zero_conf_cap"), 1);
+    // the provider holds the refused lock's pre-signature: the child is not routed over again
+    assert_eq!(w.lock(1)["error"], "route_blocked");
     // at the parent's close margin the provider takes nothing more on the unconfirmed child (here
     // parent and child expire together, so the margin is moved rather than the tip)
+    let w = world(None, true);
+    let (_, child) = w.roll();
     let h = w.chain.height();
     w.prov.with_state(&child.params.channel_id(), |st| {
         let mut zc = st.extra["zero_conf"].clone();

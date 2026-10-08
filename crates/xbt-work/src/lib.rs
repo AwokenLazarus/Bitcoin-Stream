@@ -16,7 +16,8 @@
 //! * [`pricing`]: work units and exact pricing per nBits epoch (§6).
 //! * [`auth`]: the request binding (§8.2).
 //! * [`audit`]: window statements, deferral lines (NTA carry), the audit rule, fraud proofs, the
-//!   carry ledger (§10).
+//!   carry ledger (§10), and the bounds the provider holds a statement to (AGP-065).
+//! * [`chain`]: what the provider's own node says about a block, and coinbase maturity.
 //! * [`relay`]: the blinded relay client, ChaCha20-Poly1305 (§11.1).
 //! * [`nta`]: payee attestation (XBT-NTA v1, §13.8).
 //! * [`provider`]: the `xbt-work` offer beside `xbt-channel` in the xbt402 Provider (§7, §9).
@@ -29,6 +30,7 @@
 pub mod audit;
 pub mod auth;
 pub mod book;
+pub mod chain;
 pub mod error;
 mod fsx;
 pub mod grammar;

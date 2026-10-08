@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use xbt402::channel::ChannelParams;
 use xbt402::client::Transport;
 use xbt_primitives::tx::Tx;
 
@@ -137,6 +138,19 @@ fn is_non_finite_token(s: &str) -> bool {
     )
 }
 
+/// AGP-063 W1: a channel's dust floor signs more than the amount the policy approved, so the
+/// budgets are checked again on the whole increase. A human-threshold verdict is a refusal here.
+fn floor_check(engine: &PolicyEngine, dest: &str, asked: i64, delta: i64, human: bool) -> Result<Option<Value>> {
+    let d = engine.evaluate_booking(&Payment::new(dest, asked, "dust floor"), delta, human)?;
+    if d.allowed() {
+        return Ok(None);
+    }
+    if let Some(t) = &d.approval_token {
+        engine.store.pop_approval(t)?;
+    }
+    Ok(Some(deny(&d.rule, format!("the channel's dust floor signs {delta} sat: {}", d.reason))))
+}
+
 pub fn deny(rule: &str, reason: impl Into<String>) -> Value {
     json!({"verdict": "deny", "rule": rule, "reason": reason.into()})
 }
@@ -148,6 +162,13 @@ pub(crate) fn with(mut v: Value, extra: Value) -> Value {
         }
     }
     v
+}
+
+/// The longest channel an external client may open or roll into, in blocks from now (AGP-063 W3):
+/// the policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. A
+/// routed ch1 must outlive the hub's ch2 to a provider, so a routing hub gets twice that.
+fn max_expiry_blocks(cfg: &PolicyConfig, hub: bool) -> i64 {
+    cfg.channel_expiry_blocks.max(4032) * if hub { 2 } else { 1 }
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -215,6 +236,8 @@ pub struct Signer {
     pub ln_book: LnBook,
     /// AGP-049: channel funding verdicts from our own node, per funding outpoint (final ones only).
     pub(crate) ln_funding: Mutex<HashMap<String, crate::ln_funding::Funding>>,
+    /// AGP-063 W4: the one-time code that enrols the first human key.
+    pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
 }
 
 impl Signer {
@@ -272,6 +295,18 @@ impl Signer {
         };
         let session = Session::new(book.clone(), hot.clone(), node.clone(), transport, &chain, mine, config.open_wait_s as f64,
                                    config.close_fee_max_sats, config.refund_margin_blocks)?;
+        // AGP-063 W1: the signed increase is committed before the signature is sent. The txid is
+        // the channel and the cumulative amount, so a restart that signs nothing new does not book twice.
+        let engine_book = engine.clone();
+        session.set_spend_book(Arc::new(move |dest, delta, chan, cum| {
+            if delta <= 0 {
+                return Err(err("amount", "signed delta must be positive"));
+            }
+            engine_book.commit_once(&Payment::new(dest, delta, "xbt402 signed delta"), &format!("xbt402:{chan}:{cum}"))?;
+            Ok(())
+        }));
+        let engine_check = engine.clone();
+        session.set_spend_check(Arc::new(move |dest, asked, delta| floor_check(&engine_check, dest, asked, delta, false)));
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
                                        Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))))?;
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
@@ -284,10 +319,16 @@ impl Signer {
             },
         };
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
-        Ok(Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
-                           human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
-                           keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval,
-                           ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()) }))
+        let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
+                                human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
+                                keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval,
+                                ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), enroll: Mutex::new(Default::default()) });
+        if s.human_key().is_empty() {
+            s.issue_enroll_code()?;
+        } else {
+            let _ = std::fs::remove_file(s.run.join(crate::admin::ENROLL_CODE_FILE));
+        }
+        Ok(s)
     }
 
     /// Fail closed if the signature log no longer holds the witness's latest anchor.
@@ -415,14 +456,12 @@ impl Signer {
                 sanitize(with(self.hot.status(), json!({"noticed": n})))
             }
             "fund" => {
-                let sats = py_int(p.get("sats")).filter(|v| *v != 0).or_else(|| py_int(p.get("amount_sats"))).unwrap_or(0);
-                let addr = if s("address").is_empty() { s("to") } else { s("address") };
-                let (txid, vout) = self.hot.fund(&address_to_spk(&addr, &self.hrp)?, sats, DEFAULT_FEE)?;
-                sanitize(json!({"txid": txid, "vout": vout, "sats": sats, "sighash": "0x21"}))
+                let _g = self.lock();
+                sanitize(self.fund_client_channel(p)?)
             }
             "open_channel" => {
                 let _g = self.lock();
-                sanitize(self.open_channel_locked(p)?)
+                sanitize(self.open_channel_checked(p)?)
             }
             "sign_state" | "xbt402_sign_state" => sanitize(self.sign_state(p)?),
             "xbt402_pay" => {
@@ -534,10 +573,6 @@ impl Signer {
             "forward_pending" => json!({"pending": []}),
             "forward_transfers" => json!({"delivered": []}),
             "forward_recover" => deny("forward_disabled", "the forward rail is not ported to the Rust signer"),
-            "rotate_hot_key" => {
-                let _g = self.lock();
-                self.rotate_locked("operator:rotate_hot_key")?
-            }
             "sweep_hot" => {
                 let _g = self.lock();
                 sanitize(self.sweep_hot_signed(p))
@@ -826,7 +861,7 @@ impl Signer {
         sigaudit::set_rule(&if human { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
         let dest = pay.normalized(self.now()).dest;
         if self.uses_channel(&dest) {
-            return self.channel_pay(&pay, &dest, d.as_value());
+            return self.channel_pay(&pay, &dest, d.as_value(), human);
         }
         let xbt = format!("{:.8}", pay.amount_sats as f64 / XBT_SATS as f64);
         let txid = self.node.call("sendtoaddress", json!([pay.dest, xbt, pay.memo, "", false]))?;
@@ -835,19 +870,38 @@ impl Signer {
         Ok(with(d.as_value(), json!({"txid": txid, "rail": "onchain"})))
     }
 
-    fn channel_pay(&self, pay: &Payment, dest: &str, d: Value) -> Result<Value> {
+    fn channel_pay(&self, pay: &Payment, dest: &str, d: Value, human: bool) -> Result<Value> {
         if self.book.get(dest).is_none_or(|r| r.state != "open") {
             let opened = self.open_channel_locked(&json!({"dest": dest}))?;
             if opened["verdict"] == "deny" {
                 return Ok(opened);
             }
         }
+        let (chan, cum, booked) = match (self.book.get(dest), self.book.next_cum(dest, pay.amount_sats)) {
+            (Some(r), Ok(cum)) => (r.chan.clone(), cum, Session::booked_through(&r)),
+            (_, Err(e)) => return Ok(deny(&e.code, e.msg)),
+            (None, _) => return Ok(deny("unknown_channel", dest.to_string())),
+        };
+        if cum - booked > pay.amount_sats {
+            if let Some(d) = floor_check(&self.engine, dest, pay.amount_sats, cum - booked, human)? {
+                return Ok(d);
+            }
+        }
+        let txid = format!("xbt402:{chan}:{cum}");
+        let added = cum > booked && self.engine.commit_once(&Payment { amount_sats: cum - booked, ..pay.clone() }, &txid)?;
         let rec = match self.book.increment(dest, pay.amount_sats) {
             Ok((rec, _)) => rec,
-            Err(e) => return Ok(deny(&e.code, e.msg)),
+            Err(e) => {
+                if added {
+                    self.engine.store.amend(&txid, None)?;
+                }
+                return Ok(deny(&e.code, e.msg));
+            }
         };
-        self.engine.commit(pay, &rec.chan)?;
-        Ok(with(d, json!({"rail": "channel", "chan": rec.chan, "cum": rec.used_sats, "seq": rec.seq, "cap_sats": rec.cap_sats,
+        if cum > booked {
+            self.book.mark_ledger_booked(dest, rec.used_sats)?;
+        }
+        Ok(with(d, json!({"rail": "channel", "booked_sats": (cum - booked).max(0), "chan": rec.chan, "cum": rec.used_sats, "seq": rec.seq, "cap_sats": rec.cap_sats,
                           "used_sats": rec.used_sats})))
     }
 
@@ -860,7 +914,8 @@ impl Signer {
         if let Some(existing) = self.book.get(&dest).filter(|r| r.state == "open") {
             return Ok(with(json!({"verdict": "allow", "already": true}), existing.public()));
         }
-        let pay_to = { let v = str_or_empty(p.get("pay_to")); if v.trim().is_empty() { self.config().pay_to_for(&dest) } else { v.trim().to_string() } };
+        // AGP-063 W3: the owner's registered payTo, never the caller's
+        let pay_to = self.config().pay_to_for(&dest);
         if pay_to.is_empty() {
             return Ok(deny("pay_to", format!("no payTo pubkey registered for {dest}")));
         }
@@ -889,6 +944,144 @@ impl Signer {
         let rec = self.book.mark_open(&dest)?;
         self.mine_safe();
         Ok(with(json!({"verdict": "allow", "rail": "channel"}), with(rec.public(), json!({"funding_sighash": "0x21"}))))
+    }
+
+    /// The socket's `open_channel` (AGP-063 W3): an allowlisted dest, the owner's payTo (a caller's
+    /// `pay_to` that differs is refused), and capacity, expiry and close fee within the policy.
+    fn open_channel_checked(&self, p: &Value) -> Result<Value> {
+        let raw = { let d = str_or_empty(p.get("dest")); if d.is_empty() { str_or_empty(p.get("to")) } else { d } };
+        let dest = normalize_dest(&raw);
+        if !dest.is_empty() && !self.engine.allowlist().contains(&dest) {
+            return Ok(deny("allowlist", format!("destination not on allowlist: {dest}")));
+        }
+        let given = str_or_empty(p.get("pay_to")).trim().to_lowercase();
+        if !given.is_empty() && given != self.config().pay_to_for(&dest).to_lowercase() {
+            return Ok(deny("pay_to", "payTo comes from the policy's counterparties, never from the caller"));
+        }
+        let cfg = self.config();
+        let cap = py_int(p.get("cap_sats")).unwrap_or(0);
+        if cap < 0 || cap > cfg.per_counterparty_cap_sats {
+            return Ok(deny("channel_cap", format!("cap_sats {cap} is above per_counterparty_cap_sats {}", cfg.per_counterparty_cap_sats)));
+        }
+        let blocks = py_int(p.get("expiry_blocks")).unwrap_or(0);
+        if blocks != 0 && (blocks <= cfg.refund_margin_blocks || blocks > max_expiry_blocks(&cfg, false)) {
+            return Ok(deny("expiry", format!("expiry_blocks {blocks} outside ({}, {}]", cfg.refund_margin_blocks, max_expiry_blocks(&cfg, false))));
+        }
+        let close_fee = py_int(p.get("close_fee")).unwrap_or(0);
+        if close_fee < 0 || (cfg.close_fee_max_sats > 0 && close_fee > cfg.close_fee_max_sats) {
+            return Ok(deny("close_fee", format!("close_fee {close_fee} is above close_fee_max_sats {}", cfg.close_fee_max_sats)));
+        }
+        self.open_channel_locked(p)
+    }
+
+    /// AGP-063 W3: the payTo of `origin` this signer trusts: the owner's `counterparties[origin].pay_to`,
+    /// else the seller's terms, fetched by the signer itself (`GET <origin>/x402/xbt-channel/terms`).
+    /// Never a caller's. Only for an allowlisted origin or routing hub, so it is no request to anywhere.
+    fn verified_pay_to(&self, origin: &str) -> Result<Vec<u8>> {
+        let dest = normalize_dest(origin);
+        let hub = crate::routing::RoutePolicy::from_value(&self.config().routing).hubs.iter().any(|(h, _, _)| *h == dest);
+        if !hub && !self.engine.allowlist().contains(&dest) {
+            return Err(err("allowlist", format!("destination not on allowlist: {dest}")));
+        }
+        let mut pay_to = self.config().pay_to_for(&dest);
+        if pay_to.is_empty() {
+            let r = self.session.transport.request("GET", &format!("{dest}{}", xbt402::wire::TERMS_PATH), b"", &[])?;
+            let terms: Value = serde_json::from_slice(&r.body).ok().filter(|_| r.status == 200)
+                .ok_or_else(|| err("pay_to", format!("{dest}: no channel terms (HTTP {})", r.status)))?;
+            if terms.get("network").and_then(Value::as_str) != Some(self.session.network()?.as_str()) {
+                return Err(err("pay_to", format!("{dest}: the channel terms are for another network")));
+            }
+            pay_to = str_or_empty(terms.get("payTo"));
+        }
+        let b = hex::decode(pay_to.trim()).map_err(|_| err("pay_to", "payTo is not hex"))?;
+        if b.len() != 33 {
+            return Err(err("pay_to", "payTo is not a 33-byte public key"));
+        }
+        Ok(b)
+    }
+
+    /// AGP-063 W3: an external client's channel for the key issued for `key_origin` (`<origin>/next`
+    /// for a rollover's next channel), against what this signer trusts: its own issued key, the payee
+    /// derived from the verified payTo, change and refunds to the hot key, the close-fee cap, and an
+    /// expiry the refund can reach in time.
+    fn check_client_channel(&self, key_origin: &str, p: &ChannelParams) -> Result<()> {
+        let origin = key_origin.strip_suffix("/next").unwrap_or(key_origin);
+        if self.book.issued_pub(key_origin)? != p.payer_pub {
+            return Err(err("bad_key", "the channel's payer key is not the one issued for this origin"));
+        }
+        let pay_to = self.verified_pay_to(origin)?;
+        let want = ChannelParams::derive(&pay_to, &p.payer_pub, p.expiry, p.close_fee, Some(self.hot.spk()), &self.session.network()?, p.close_fee_payer)?;
+        if want.payee_pub != p.payee_pub || want.payee_spk != p.payee_spk {
+            return Err(err("pay_to", "the channel's payee is not derived from the seller's verified payTo"));
+        }
+        if p.payer_spk != self.hot.spk() {
+            return Err(err("payer_spk", "the channel's change and refund must go to this signer's hot key"));
+        }
+        let cfg = self.config();
+        if cfg.close_fee_max_sats > 0 && p.close_fee as i64 > cfg.close_fee_max_sats {
+            return Err(err("close_fee", format!("close fee {} is above close_fee_max_sats {}", p.close_fee, cfg.close_fee_max_sats)));
+        }
+        let h = self.height()?;
+        let rel = p.expiry as i64 - h;
+        let hub = crate::routing::RoutePolicy::from_value(&cfg.routing).hubs.iter().any(|(d, _, _)| *d == normalize_dest(origin));
+        let most = max_expiry_blocks(&cfg, hub);
+        if rel <= cfg.refund_margin_blocks || rel > most {
+            return Err(err("expiry", format!("expiry {} is {rel} blocks away, outside ({}, {most}]", p.expiry, cfg.refund_margin_blocks)));
+        }
+        Ok(())
+    }
+
+    /// The most a channel to one counterparty may hold: the owner's cap plus the payer's close fee.
+    fn channel_funding_cap(&self, p: &ChannelParams) -> i64 {
+        self.config().per_counterparty_cap_sats.saturating_add(p.payer_fee() as i64)
+    }
+
+    /// `fund` (AGP-063 W3): only the channel an external client derived for a key this signer issued
+    /// (`origin`, `params` unfunded), checked by [`Self::check_client_channel`], at most the owner's
+    /// cap. Write-ahead as the signer's own opens: the record is pending (refunded at expiry) before
+    /// the funding is broadcast; `xbt402_attach` opens it. Each issued key funds one channel.
+    fn fund_client_channel(&self, p: &Value) -> Result<Value> {
+        let origin = str_or_empty(p.get("origin"));
+        let Some(raw) = p.get("params").filter(|v| v.is_object()) else {
+            return Ok(deny("fund_unbound", "fund pays only a channel for a key this signer issued: pass origin and params (unfunded ChannelParams)"));
+        };
+        if origin.is_empty() || origin.ends_with("/next") {
+            return Ok(deny("fund_unbound", "fund needs the origin the key was issued for"));
+        }
+        let params = match ChannelParams::from_json(raw) {
+            Ok(pp) if pp.funding.is_none() => pp,
+            Ok(_) => return Ok(deny("bad_params", "fund takes the channel's unfunded params")),
+            Err(e) => return Ok(deny("bad_params", e.msg)),
+        };
+        if let Err(e) = self.check_client_channel(&origin, &params) {
+            return Ok(deny(&e.code, e.msg));
+        }
+        let sats = py_int(p.get("sats")).filter(|v| *v != 0).or_else(|| py_int(p.get("amount_sats"))).unwrap_or(0);
+        let cap = self.channel_funding_cap(&params);
+        if sats <= params.payer_fee() as i64 || sats > cap {
+            return Ok(deny("channel_cap", format!("{sats} sats is outside this wallet's per-channel funding ({}, {cap}]", params.payer_fee())));
+        }
+        let addr = if str_or_empty(p.get("address")).is_empty() { str_or_empty(p.get("to")) } else { str_or_empty(p.get("address")) };
+        if !addr.is_empty() && address_to_spk(&addr, &self.hrp)? != params.spk() {
+            return Ok(deny("bad_address", "the address is not this channel's funding script"));
+        }
+        if let Err(e) = self.hot.check_channel_funding() {
+            return Ok(with(deny("hot_balance_cap", e.msg), json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats()})));
+        }
+        let dest = normalize_dest(&origin);
+        if let Some(r) = self.book.get(&dest).filter(|r| r.state == "open" || r.state == "pending") {
+            return Ok(deny(&format!("channel_{}", r.state), format!("{dest} already has a {} channel", r.state)));
+        }
+        let prep = self.hot.prepare_fund(&params.spk(), sats, DEFAULT_FEE)?;
+        let funded = params.with_funding(&prep.txid, 0, sats as u64)?;
+        let secret = self.book.take_issued(&origin)?;
+        self.book.add_pending(&dest, secret, &funded, &origin, None, self.height()?, "", &self.session.network()?, 0, &prep.hex)?;
+        if let Err(e) = self.hot.broadcast(&prep) {
+            self.book.drop_pending(&dest, &funded.channel_id())?;
+            return Err(e);
+        }
+        self.hot.commit(&prep)?;
+        Ok(json!({"txid": prep.txid, "vout": 0, "sats": sats, "sighash": "0x21", "chan": funded.channel_id()}))
     }
 
     /// B2's error → deny mapping for `xbt402_pay`.
@@ -936,10 +1129,15 @@ impl Signer {
                 Ok(r) => with(with(json!({"verdict": "allow", "rule": "free"}), r), json!({"rail": "xbt402"})),
             };
         }
+        // AGP-063 W1: on an open channel the most this call can book (price <= max_sats) is known
+        // before the 402, so the budgets are held to that
+        let bound = self.book.get(&dest).filter(|r| r.state == "open")
+            .and_then(|r| self.book.next_cum(&dest, max_sats).ok().map(|c| c - Session::booked_through(&r)))
+            .filter(|b| *b > 0).unwrap_or(max_sats);
         let pay = Payment::new(&dest, max_sats, &format!("xbt402 {method} {url}"));
         // AGP-039: a human-approved grant for exactly this call pays as B2's approve does (human = true)
         let grant = self.find_xbt402_grant(&dest, max_sats, &url, &method);
-        let d = match self.engine.evaluate(&pay, grant.is_some()) {
+        let d = match self.engine.evaluate_booking(&pay, bound, grant.is_some()) {
             Ok(d) => d,
             Err(e) => return deny("xbt402", e.msg),
         };
@@ -959,15 +1157,11 @@ impl Signer {
         if result["verdict"] == "deny" || result["verdict"] == "pending" {
             return result;
         }
-        let charged = py_int(result.get("charged_sats")).unwrap_or(0);
-        if charged != 0 {
-            let chan = str_or_empty(result.get("chan"));
-            if let Err(e) = self.engine.commit(&Payment::new(&dest, charged, &pay.memo), &chan) {
-                return deny("xbt402", e.msg);
-            }
-        }
+        // The signed delta was committed inside the session, before the signature left (AGP-063).
+        // The seller's charged_sats is not a budget figure.
+        let booked = py_int(result.get("booked_sats")).unwrap_or(0);
         if let Some(t) = &grant {
-            self.use_xbt402_grant(t, charged);
+            self.use_xbt402_grant(t, booked);
             return with(with(d.as_value(), result), json!({"rail": "xbt402", "approved": true, "approval_token": t}));
         }
         with(with(d.as_value(), result), json!({"rail": "xbt402"}))
@@ -979,66 +1173,103 @@ impl Signer {
         let key = ["dest", "to", "chan"].iter().map(|k| str_or_empty(p.get(*k))).find(|v| !v.is_empty()).unwrap_or_default();
         let dest = self.book.find_dest(&key).unwrap_or_else(|| normalize_dest(&key));
         let cum = py_int(p.get("cum")).filter(|v| *v != 0).or_else(|| py_int(p.get("amount"))).unwrap_or(0);
-        let used = self.book.get(&dest).map(|r| r.used_sats).unwrap_or(0);
-        let pay = Payment::new(&dest, (cum - used).max(0), "");
-        let d = self.engine.evaluate(&pay, false)?;
-        if !d.allowed() {
-            return Ok(d.as_value());
-        }
-        sigaudit::set_rule(&format!("policy:{}", d.rule));
-        let sig = self.book.sign_state(&dest, cum)?;
+        let sig = match self.booked_increase(&dest, cum, "", || self.book.sign_state(&dest, cum))? {
+            Ok(sig) => sig,
+            Err(d) => return Ok(d),
+        };
         let chan = self.book.get(&dest).map(|r| r.chan).unwrap_or_default();
-        self.engine.commit(&pay, &chan)?;
         Ok(json!({"verdict": "allow", "chan": chan, "cum": cum, "sig": hex::encode(sig)}))
     }
 
-    /// Policy on an increase of the signed amount (a3, rollover, conditional): `None` = allowed.
-    fn policy_on_increase(&self, dest: &str, increase: i64, memo: &str) -> Result<Option<Value>> {
-        if increase <= 0 {
+    /// Raise `dest`'s signed amount to `cum` (sign_state, a3, rollover, conditional). The increase
+    /// over what the policy ledger already holds for the channel is evaluated, then committed
+    /// before `sign` runs, so no signature leaves unbooked (AGP-063 W1/K1). A row this call added
+    /// is taken out again when `sign` fails. `Ok(Err(deny))`: the policy refused.
+    fn booked_increase<T>(&self, dest: &str, cum: i64, memo: &str, sign: impl FnOnce() -> Result<T>) -> Result<std::result::Result<T, Value>> {
+        let rec = self.book.get(dest);
+        let origin = rec.as_ref().map(|r| if r.origin.is_empty() { dest.to_string() } else { r.origin.clone() }).unwrap_or_else(|| dest.into());
+        let booked = rec.as_ref().map(Session::booked_through).unwrap_or(0);
+        let txid = format!("xbt402:{}:{cum}", rec.as_ref().map(|r| r.chan.as_str()).unwrap_or(""));
+        let increase = cum - booked;
+        if let Some(r) = rec.as_ref().filter(|r| cum < r.used_sats) {
+            return Ok(Err(deny("amount", format!("never sign a lower cumulative amount: have {}, got {cum}", r.used_sats))));
+        }
+        let mut added = false;
+        if increase > 0 {
+            let pay = Payment::new(&origin, increase, memo);
+            let d = self.engine.evaluate(&pay, false)?;
+            if !d.allowed() {
+                return Ok(Err(d.as_value()));
+            }
+            sigaudit::set_rule(&format!("policy:{}", d.rule));
+            added = self.engine.commit_once(&pay, &txid)?;
+        } else {
             sigaudit::set_rule("policy:no_increase");
-            return Ok(None);
         }
-        let origin = self.book.get(dest).map(|r| if r.origin.is_empty() { dest.to_string() } else { r.origin }).unwrap_or(dest.into());
-        let pay = Payment::new(&origin, increase, memo);
-        let d = self.engine.evaluate(&pay, false)?;
-        if !d.allowed() {
-            return Ok(Some(d.as_value()));
+        match sign() {
+            Ok(v) => {
+                if increase > 0 && rec.is_some() {
+                    self.book.mark_ledger_booked(dest, cum)?;
+                }
+                Ok(Ok(v))
+            }
+            Err(e) => {
+                if added {
+                    self.engine.store.amend(&txid, None)?;
+                }
+                Err(e)
+            }
         }
-        sigaudit::set_rule(&format!("policy:{}", d.rule));
-        self.engine.commit(&pay, &self.book.get(dest).map(|r| r.chan).unwrap_or_default())?;
-        Ok(None)
     }
 
     fn sign_a3(&self, p: &Value) -> Value {
         let chan = str_or_empty(p.get("chan"));
         let dest = self.book.find_dest(&chan).unwrap_or(chan.clone());
         let amount = py_int(p.get("amount")).unwrap_or(0);
-        let used = self.book.get(&dest).map(|r| r.used_sats).unwrap_or(0);
-        match self.policy_on_increase(&dest, amount - used, "xbt402 0xA3 state") {
-            Ok(Some(d)) => return d,
-            Err(e) => return deny("xbt402_sign_state_a3", e.msg),
-            Ok(None) => {}
-        }
-        match self.book.sign_state_a3(&dest, amount) {
-            Ok(sig) => json!({"sig": hex::encode(sig)}),
+        match self.booked_increase(&dest, amount, "xbt402 0xA3 state", || self.book.sign_state_a3(&dest, amount)) {
+            Ok(Ok(sig)) => json!({"sig": hex::encode(sig)}),
+            Ok(Err(d)) => d,
             Err(e) => deny("xbt402_sign_state_a3", e.msg),
         }
     }
 
+    /// A rollover only into the channel's own next channel (AGP-063 W3): `next` (unfunded params)
+    /// must be derived from the key issued for `<origin>/next` and the verified payTo, keep this
+    /// channel's close fee and fee payer, and take exactly what the rollover leaves
+    /// (`rollover_next_capacity`), so nothing leaks to a third script or to the fee.
     fn sign_rollover(&self, p: &Value) -> Value {
         let chan = str_or_empty(p.get("chan"));
         let Some(dest) = self.book.find_dest(&chan) else { return deny("unknown_channel", format!("no channel for {chan}")) };
+        let Some(rec) = self.book.get(&dest) else { return deny("unknown_channel", format!("no channel for {chan}")) };
         let amount = py_int(p.get("amount")).unwrap_or(0);
         let Some(next_spk) = x2b(&str_or_empty(p.get("next_spk"))) else { return deny("bad_request", "next_spk is not hex") };
         let next_cap = py_int(p.get("next_capacity")).unwrap_or(0).max(0) as u64;
-        let used = self.book.get(&dest).map(|r| r.used_sats).unwrap_or(0);
-        match self.policy_on_increase(&dest, amount - used, "xbt402 rollover") {
-            Ok(Some(d)) => return d,
-            Err(e) => return deny("xbt402", e.msg),
-            Ok(None) => {}
+        let next = match p.get("next").filter(|v| v.is_object()).map(ChannelParams::from_json) {
+            Some(Ok(n)) if n.funding.is_none() => n,
+            Some(Ok(_)) => return deny("bad_params", "next must be the next channel's unfunded params"),
+            Some(Err(e)) => return deny("bad_params", e.msg),
+            None => return deny("rollover_unbound", "a rollover must name its next channel: pass next (unfunded ChannelParams)"),
+        };
+        if next.spk() != next_spk {
+            return deny("bad_rollover", "next_spk is not the next channel's script");
         }
-        match self.book.sign_rollover(&dest, amount, &next_spk, next_cap) {
-            Ok(sig) => json!({"sig": hex::encode(sig)}),
+        let cur = match rec.params() {
+            Ok(c) => c,
+            Err(e) => return deny(&e.code, e.msg),
+        };
+        if amount < 0 || next.close_fee != cur.close_fee || next.close_fee_payer != cur.close_fee_payer {
+            return deny("bad_rollover", "the next channel must keep this channel's close fee and fee payer");
+        }
+        if next_cap != cur.rollover_next_capacity(amount as u64) {
+            return deny("bad_rollover", format!("next_capacity {next_cap} is not what the rollover leaves ({})", cur.rollover_next_capacity(amount as u64)));
+        }
+        let origin = if rec.origin.is_empty() { dest.clone() } else { rec.origin.clone() };
+        if let Err(e) = self.check_client_channel(&format!("{origin}/next"), &next) {
+            return deny(&e.code, e.msg);
+        }
+        match self.booked_increase(&dest, amount, "xbt402 rollover", || self.book.sign_rollover(&dest, amount, &next_spk, next_cap)) {
+            Ok(Ok(sig)) => json!({"sig": hex::encode(sig)}),
+            Ok(Err(d)) => d,
             Err(e) => deny(&e.code, e.msg),
         }
     }
@@ -1052,38 +1283,53 @@ impl Signer {
         let Some(hash) = x2b(&str_or_empty(p.get("hash"))).and_then(|v| <[u8; 32]>::try_from(v).ok()) else {
             return deny("bad_request", "hash must be 32 bytes of hex");
         };
-        let used = self.book.get(&dest).map(|r| r.used_sats).unwrap_or(0);
-        match self.policy_on_increase(&dest, uncond + amount - used, "xbt402 conditional state") {
-            Ok(Some(d)) => return d,
-            Err(e) => return deny("xbt402", e.msg),
-            Ok(None) => {}
+        if amount < 0 {
+            return deny("bad_amount", "the conditional amount must not be negative");
         }
-        match self.book.sign_conditional(&dest, uncond, hash, amount.max(0) as u64, csv, None) {
-            Ok((_, sig)) => json!({"sig": hex::encode(sig)}),
+        match self.booked_increase(&dest, uncond + amount, "xbt402 conditional state",
+                                   || self.book.sign_conditional(&dest, uncond, hash, amount as u64, csv, None)) {
+            Ok(Ok((_, sig))) => json!({"sig": hex::encode(sig)}),
+            Ok(Err(d)) => d,
             Err(e) => deny(&e.code, e.msg),
         }
     }
 
-    /// The external client's funded channel: bind the key issued for `origin` (B1 `attach`).
+    /// The external client's funded channel (B1 `attach`; AGP-063 W3): the one `fund` recorded for
+    /// `origin`, now opened, or a rollover's next channel (`<origin>/next`), checked as `fund` checks.
     fn attach(&self, p: &Value) -> Value {
         let origin = str_or_empty(p.get("origin"));
-        let params = match p.get("params").map(xbt402::channel::ChannelParams::from_json) {
+        let params = match p.get("params").map(ChannelParams::from_json) {
             Some(Ok(pp)) => pp,
             _ => return deny("bad_params", "params must be ChannelParams.to_dict()"),
         };
         if params.funding.is_none() {
             return deny("bad_params", "attach a funded channel");
         }
+        // a rolled-over channel ("<origin>/next") replaces the one it spends, at the same origin
+        let base = origin.strip_suffix("/next").unwrap_or(&origin).to_string();
+        let dest = normalize_dest(&base);
+        if base == origin {
+            let Some(rec) = self.book.get(&dest).filter(|r| r.state == "pending" && r.chan == params.channel_id()) else {
+                return deny("unknown_channel", "attach only a channel this signer funded (fund) or rolled over (xbt402_sign_rollover)");
+            };
+            if rec.params().ok().as_ref() != Some(&params) {
+                return deny("bad_params", "the attached params differ from the channel this signer funded");
+            }
+            return match self.book.mark_open(&dest) {
+                Ok(rec) => json!({"chan": rec.chan, "dest": dest}),
+                Err(e) => deny(&e.code, e.msg),
+            };
+        }
+        if let Err(e) = self.check_client_channel(&origin, &params) {
+            return deny(&e.code, e.msg);
+        }
+        if params.capacity as i64 > self.channel_funding_cap(&params) {
+            return deny("channel_cap", "the next channel holds more than this wallet's per-channel cap");
+        }
         let secret = match self.book.take_issued(&origin) {
             Ok(s) => s,
             Err(e) => return deny(&e.code, e.msg),
         };
-        if xbt_primitives::ecdsa::pubkey(&secret) != params.payer_pub {
-            return deny("bad_key", "attached params do not match the issued key");
-        }
-        // a rolled-over channel ("<origin>/next") replaces the one it spends, at the same origin
-        let base = origin.strip_suffix("/next").unwrap_or(&origin).to_string();
-        let dest = normalize_dest(&base);
         let open_height = self.height_safe();
         match self.book.add_funded(&dest, secret, &params, &base, Some(params.max_amount() as i64), open_height) {
             Ok(rec) => json!({"chan": rec.chan, "dest": dest}),

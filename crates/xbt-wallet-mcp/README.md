@@ -90,7 +90,8 @@ xbt-wallet-mcp --list-tools                                       # the tool lis
 | `B2_SIGNER_TIMEOUT` | seconds per signer call (default 60; a first paid call can wait for a confirmation) |
 | `B2_BODY_CAP` | the provider body preview in local-payer answers (default 12000 chars) |
 | `XBT_MCP_PAYER` | `signer` (the default) or `local` (see below) |
-| `XBT_MCP_HTTP_TOKEN` | the bearer token that HTTP requests must carry |
+| `XBT_MCP_HTTP_TOKEN` | the bearer token that HTTP requests must carry. AGP-063 X1: HTTP always needs a token. Without this, a token file or a data dir, one is generated on first run in `<signer socket dir>/mcp-http-token` (0600) and read from there on restart |
+| `XBT_MCP_ALLOWED_ORIGINS` | AGP-063 X1: browser origins allowed besides loopback, comma-separated (`https://wallet.example.com`). Checked with or without `--http-allow-remote` |
 | `XBT_MCP_HTTP_TOKEN_FILE` | AGP-042: the bearer token as a file someone else owns (default `$XBT_DATA_DIR/run/ui/mcp-http-token` when it exists: the web UI's). Read on every request and never written, so the owner's rotation in the UI cuts the old token off at once; unreadable, empty or world-readable refuses every request. There is no rotation endpoint. |
 | `XBT_MCP_APPROVAL_WAIT_S` | AGP-039: seconds an over-threshold `xbt402_pay` waits for the human to approve it in the wallet's web UI (`xbt-wallet-ui`); approved, the same call is paid and the answer has `waited_for_human: true`. 0 (the default): answer `needs_human` at once, as B2 does; the agent may then repeat the identical call after the approval. Signer payer mode only. |
 
@@ -201,11 +202,15 @@ The endpoint takes one JSON-RPC message per POST.
   unknown one).
 - Requests get `application/json` answers; notifications get 202.
 - GET is 405, because the server never pushes, and DELETE ends a session.
-- A request whose `Origin` is not loopback is refused with 403 (DNS rebinding).
-- With `XBT_MCP_HTTP_TOKEN` set, every request needs `Authorization: Bearer <token>`.
+- A request whose `Origin` is not loopback or in `XBT_MCP_ALLOWED_ORIGINS` is refused with 403 (DNS
+  rebinding), with or without `--http-allow-remote`. There is no same-origin exception: a rebound page
+  has Origin equal to Host.
+- Every request needs `Authorization: Bearer <token>` (AGP-063 X1). The token is
+  `XBT_MCP_HTTP_TOKEN`, the token file, the data dir's `mcp-http-token` secret, or, with none of
+  those, `<signer socket dir>/mcp-http-token`, generated 0600 on first run.
 
-The server listens on loopback only. `--http-allow-remote` lifts that, and only works with a token set.
-Any local user can reach a loopback port, so set a token on shared hosts.
+The server listens on loopback only. `--http-allow-remote` lifts that; a non-loopback listener with no
+token is refused at start.
 
 ## Who pays: `XBT_MCP_PAYER`
 

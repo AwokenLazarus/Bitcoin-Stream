@@ -10,6 +10,8 @@ pub const POLICY_DOMAIN: &[u8] = b"xbt-agentwallet-policy-v1";
 pub const HUMAN_KEY_DOMAIN: &[u8] = b"xbt-agentwallet-human-key-v1";
 pub const ROTATE_DOMAIN: &[u8] = b"xbt-agentwallet-hot-rotate-v1";
 pub const BACKUP_DOMAIN: &[u8] = b"xbt-agentwallet-backup-v1";
+/// AGP-063 W3: refuse (or revoke) a pending approval.
+pub const DENY_DOMAIN: &[u8] = b"xbt-agentwallet-deny-v1";
 
 fn join(parts: &[&[u8]]) -> Vec<u8> {
     parts.join(&b'\n')
@@ -49,6 +51,11 @@ pub fn rotate_message(hot_address: &str, expiry: i64) -> Vec<u8> {
 /// passphrase), valid until `expiry`.
 pub fn backup_message(hot_address: &str, expiry: i64) -> Vec<u8> {
     join(&[BACKUP_DOMAIN, hot_address.as_bytes(), expiry.to_string().as_bytes()])
+}
+
+/// AGP-063 W3: deny or revoke the approval `token`, valid until `expiry`.
+pub fn deny_message(token: &str, expiry: i64) -> Vec<u8> {
+    join(&[DENY_DOMAIN, token.as_bytes(), expiry.to_string().as_bytes()])
 }
 
 /// Ed25519 verification; any malformed key or signature is `false`.

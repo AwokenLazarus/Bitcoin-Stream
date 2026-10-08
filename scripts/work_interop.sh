@@ -88,6 +88,9 @@ fi
 wait_http "http://127.0.0.1:${RELAY}/health" "receipt relay" 15
 
 echo "== primed ($(git -C "$(dirname "$PRIMED")/../.." rev-parse --short HEAD 2>/dev/null || echo ?), rnd/agp-011) on ${PRIME}/${STATS}"
+PRIME_WINDOW_MIN_WORK=${WORK_WINDOW_MIN_WORK:-64}
+# AGP-065: the provider and payer hold window statements to the Prime's published terms
+PRIME_TERMS=(--prime-window 8 --prime-window-min-work "$PRIME_WINDOW_MIN_WORK" --prime-fee-bps 0 --prime-min-payout 546)
 cat >"$RUN/prime.toml" <<EOF
 listen = "127.0.0.1:${PRIME}"
 stats-listen = "127.0.0.1:${STATS}"
@@ -102,7 +105,7 @@ window = 8
 # regtest D is ~5e-10, so 8 x D is under one share and the window would hold only the latest one:
 # no receipted span could lie strictly inside (window_start, H) and the audit could never prove work.
 # The floor keeps every share of the run in the window, as a real window holds many.
-window-min-work = ${WORK_WINDOW_MIN_WORK:-64}
+window-min-work = ${PRIME_WINDOW_MIN_WORK}
 min-payout = 546
 fee-bps = 0
 network = "regtest"
@@ -158,7 +161,7 @@ echo "== provider ($PROVIDER): pool-analytics :${API} with xbt-channel + xbt-wor
 if [ "$PROVIDER" = rust ]; then
   "$T/xbt-work-provider" --port "$API" --rpc-port "$RPC_B" --cookie "$COOKIE_B" --identity "$PROVIDER_ID" --prime-pubkey "$PRIME_PUB" \
       --prime-id 70 --receipt-url "http://127.0.0.1:${STATS}/receipt" --relay-url "http://127.0.0.1:${RELAY}" \
-      --window-url "http://127.0.0.1:${STATS}/window" --state "$RUN/provider-work.json" --admin \
+      --window-url "http://127.0.0.1:${STATS}/window" --state "$RUN/provider-work.json" --admin "${PRIME_TERMS[@]}" \
       --pull-secs "$([ "$PAYER" = rust ] && echo 3 || echo 0)" >"$RUN/server.log" 2>&1 & PIDS+=($!)
   # (with the Python payer, which has no pause signal, the provider credits only the receipts presented:
   #  a relay pull mid-run would refill the balance its "spent receipt" refusal check expects to be empty)
@@ -187,7 +190,8 @@ MINER_PID=$!
 echo "== payer: wait for receipts covering $CALLS calls, pay, refusal checks, coinbase audit"
 PAUSE=$RUN/pause-miner
 if [ "$PAYER" = rust ]; then
-  PAYER_ARGS=(--state "$RUN/payer-work.json" --rpc-port "$RPC_A" --cookie "$COOKIE_A" --window-url "http://127.0.0.1:${STATS}/window" --pause-file "$PAUSE")
+  PAYER_ARGS=(--state "$RUN/payer-work.json" --rpc-port "$RPC_A" --cookie "$COOKIE_A" --window-url "http://127.0.0.1:${STATS}/window" --pause-file "$PAUSE"
+              "${PRIME_TERMS[@]}")
   [ "$PROVIDER" = rust ] && PAYER_ARGS+=(--provider-admin)
   "$T/xbt-work-payer" pay "$BASEURL" "$CALLS" "$((MINER_MAX_SECS - 60))" "${PAYER_ARGS[@]}" >"$RUN/evidence.json" 2>"$RUN/payer.log" & PAYER_PID=$!
 else

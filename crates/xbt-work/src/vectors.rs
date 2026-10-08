@@ -14,9 +14,10 @@ use sha2::{Digest, Sha256, Sha512};
 use xbt402::json::{as_big_int, big_uint, dumps, dumps_compact};
 use xbt_primitives::secp256k1::{PublicKey, Scalar, SecretKey, SECP256K1};
 
-use crate::audit::{audit_block, check_fraud_proof, Deferral, SignedDeferral, WindowStatement};
+use crate::audit::{audit_block, check_fraud_proof, AuditBounds, Deferral, SignedDeferral, SignedWindow, WindowStatement};
 use crate::auth::{auth_tag, request_digest};
 use crate::book::ReceiptBook;
+use crate::chain::ChainBlock;
 use crate::grammar::{new_invoice, parse_username, usernames};
 use crate::nta;
 use crate::pricing::{bits_to_target, diff1_target, difficulty, value_sats, work_units_for_price};
@@ -33,6 +34,20 @@ pub const BIP86_PUBLISHED: (&str, &str, &str) = ("cc8a4bc64d897bddc5fbc2f670f7a8
                                                   "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr");
 pub const BIP341_KEYPATH: (&str, &str) = ("6b973d88838f27366ed61c9ad6367663045cb456e28335c109e30717ae0c6baa",
                                           "2405b971772ad26915c8dcdf10f238753a9b837e5f8e6a86fd7c0cce5b7296d9");
+
+/// The vectors have no chain: the block is the one the statement names. With
+/// [`AuditBounds::STATEMENT_ONLY`] nothing reads the difficulty.
+fn statement_block(w: &WindowStatement, value_sats: u64, paid_sats: u64) -> ChainBlock {
+    ChainBlock { height: w.height, hash: w.block_hash.clone(), value_sats, paid_sats, bits: 0, prev_bits: 0 }
+}
+
+/// The block a fraud proof names (an unreadable proof gets a block nothing matches).
+fn proof_block(proof: &Value, value_sats: u64, paid_sats: u64) -> ChainBlock {
+    match SignedWindow::from_doc(&proof["window"]) {
+        Ok(sw) => statement_block(&sw.stmt, value_sats, paid_sats),
+        Err(_) => ChainBlock { height: 0, hash: String::new(), value_sats, paid_sats, bits: 0, prev_bits: 0 },
+    }
+}
 
 const ABOUT: &str = "xbt-work v1 draft test vectors. Keys are derived from public seeds: never use them.";
 const RULE_INJECTION: &str = "The Prime MUST refuse to sign (queried invoice fails the grammar); the provider MUST refuse the presented document (difficulty is not an integer). Only a verifier that rebuilds the line from unchecked strings reads the signature as valid.";
@@ -238,7 +253,9 @@ pub fn generate() -> Value {
     let stmt = |hash: [u8; 32], fee: u32| WindowStatement { prime_id: PRIME_ID, height, block_hash: hex::encode(hash), window_start: height - 32,
                                                            window_work: w, min_payout: 546, fee_bps: fee };
     let sw = prime.sign_window(&stmt(sha(b"vector block 1012"), 0)).expect("window");
-    let aud = |sw, paid, def: &[SignedDeferral]| audit_block(&ap, sw, value, paid, def).expect("audit");
+    let aud = |sw: &SignedWindow, paid, def: &[SignedDeferral]| {
+        audit_block(&ap, sw, &statement_block(&sw.stmt, value, paid), &AuditBounds::STATEMENT_ONLY, def).expect("audit")
+    };
     let exp = aud(&sw, 0, &[]).expected_sats;
     let pass = aud(&sw, exp, &[]);
     let fraud = aud(&sw, exp / 2, &[]);
@@ -473,8 +490,9 @@ fn rows_push_rest(stored: &Value, pk: &ed25519_dalek::VerifyingKey, rows: &mut V
     // coinbase audit fraud proofs, from their signed contents alone
     let a = &stored["audit"];
     let val = a["coinbaseValueSats"].as_u64().unwrap_or(0);
-    ck(check_fraud_proof(&a["fraud"]["proof"], pk, val, a["fraud"]["paidSats"].as_u64().unwrap_or(0)), "fraud proof does not check".into());
-    ck(!check_fraud_proof(&a["fraud"]["proof"], pk, val, a["pass"]["paidSats"].as_u64().unwrap_or(0)), "fraud proof checks against an honest coinbase".into());
+    let fraud = |proof: &Value, v: u64, paid: u64| check_fraud_proof(proof, pk, &proof_block(proof, v, paid), &AuditBounds::STATEMENT_ONLY);
+    ck(fraud(&a["fraud"]["proof"], val, a["fraud"]["paidSats"].as_u64().unwrap_or(0)), "fraud proof does not check".into());
+    ck(!fraud(&a["fraud"]["proof"], val, a["pass"]["paidSats"].as_u64().unwrap_or(0)), "fraud proof checks against an honest coinbase".into());
     let c = &stored["auditNtaCarry"];
     let dl = &c["deferral"];
     ck(dl["sig"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <[u8; 64]>::try_from(b).ok())
@@ -485,10 +503,10 @@ fn rows_push_rest(stored: &Value, pk: &ed25519_dalek::VerifyingKey, rows: &mut V
     ck(c["carried"]["ok"] == json!(true) && c["noDeferral"]["ok"] == json!(false) && c["deferralForAnotherBlock"]["ok"] == json!(false),
        "NTA carry verdicts".into());
     let cv = c["coinbaseValueSats"].as_u64().unwrap_or(0);
-    ck(check_fraud_proof(&c["noDeferral"]["proof"], pk, cv, 0), "NTA: the no-deferral fraud proof does not check".into());
+    ck(fraud(&c["noDeferral"]["proof"], cv, 0), "NTA: the no-deferral fraud proof does not check".into());
     let mut withline = c["noDeferral"]["proof"].clone();
     withline["deferred"] = json!([dl]);
-    ck(!check_fraud_proof(&withline, pk, cv, 0), "NTA: a fraud proof survives the Prime's deferral line".into());
+    ck(!fraud(&withline, cv, 0), "NTA: a fraud proof survives the Prime's deferral line".into());
     // NTA: BIP86 against the published values, the attestation by BIP340
     let t = &stored["nta"];
     let b = &t["bip86"];

@@ -65,6 +65,13 @@ pub struct ChannelRecord {
     pub open_error: String,
     pub last_sig: String,
     pub acked_sats: i64,
+    /// AGP-063: cumulative sats already committed to the policy ledger for this channel.
+    /// `-1` (the serde default, so a file from before this field loads as already booked
+    /// through `used_sats`) does not re-book history and is not written, so an old record
+    /// keeps B2's field set. A channel opened here starts at 0, and every signed increase
+    /// is committed before the signature is sent.
+    #[serde(skip_serializing_if = "ledger_booked_is_legacy")]
+    pub ledger_booked_sats: i64,
     pub pending_lock: Value,
     pub given_up: Vec<Value>,
     /// AGP-055: the last resolved (or adopted) locks `{key, amount, hub, lockId, at}`, written with
@@ -85,9 +92,13 @@ impl Default for ChannelRecord {
                funding_vout: 0, funding_sats: 0, seq: 0, origin: String::new(), pending_cond: json!({}), state: "open".into(),
                closed_txid: String::new(), refund_txid: String::new(), open_height: 0, spent_sats: -1, open_url: String::new(),
                network: String::new(), min_conf: 0, funding_hex: String::new(), funding_height: 0, open_error: String::new(),
-               last_sig: String::new(), acked_sats: 0, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
+               last_sig: String::new(), acked_sats: 0, ledger_booked_sats: -1, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
                close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into() }
     }
+}
+
+fn ledger_booked_is_legacy(v: &i64) -> bool {
+    *v < 0
 }
 
 fn has_lock(v: &Value) -> bool {
@@ -430,7 +441,7 @@ impl ChannelBook {
         if amount > rec.cap_sats {
             return Err(cap_error(rec.used_sats, amount - rec.used_sats, rec.cap_sats));
         }
-        let payer = self.payer_locked(&g, &rec)?;
+        let mut payer = self.payer_locked(&g, &rec)?;
         let sig = payer.sign_state_a3(amount as u64)?;
         audit_rec(&self.audit, "channel_state_a3", &sig, &rec.chan, &rec.dest, json!({"cum": amount, "sighash": "0xa3"}))?;
         let r = g.records.get_mut(&k).unwrap();
@@ -476,7 +487,7 @@ impl ChannelBook {
         if uncond + cond_amount as i64 > rec.cap_sats {
             return Err(cap_error(rec.used_sats, uncond + cond_amount as i64 - rec.used_sats, rec.cap_sats));
         }
-        let payer = self.payer_locked(&g, &rec)?;
+        let mut payer = self.payer_locked(&g, &rec)?;
         let cp = ConditionalParams::new(payer.params.clone(), hash, cond_amount, csv_delta)?;
         let sig = payer.sign_conditional(uncond as u64, &cp)?;
         audit_rec(&self.audit, "conditional_state", &sig, &rec.chan, &rec.dest,
@@ -524,6 +535,13 @@ impl ChannelBook {
         Ok(pubk)
     }
 
+    /// The public key [`issue_key`](Self::issue_key) sealed for `origin`, still unused.
+    pub fn issued_pub(&self, origin: &str) -> Result<ecdsa::PubkeyBytes> {
+        let g = self.lock();
+        let s = g.secrets.get(&format!("pending:{origin}")).ok_or_else(|| err("bad_key", format!("no key was issued for {origin}: call xbt402_new_key")))?;
+        Ok(ecdsa::pubkey(s))
+    }
+
     /// Take the key [`issue_key`](Self::issue_key) sealed for `origin`.
     pub fn take_issued(&self, origin: &str) -> Result<SecretKey> {
         let mut g = self.lock();
@@ -538,7 +556,7 @@ impl ChannelBook {
                         close_fee: p.close_fee as i64, payer_spk: hex::encode(&p.payer_spk), payee_spk: hex::encode(&p.payee_spk),
                         funding_txid: p.funding_txid(), funding_vout: p.funding_vout() as i64, funding_sats: p.capacity as i64, seq: 0,
                         origin: origin.into(), open_height, spent_sats: 0, close_fee_payer: p.close_fee_payer.as_str().into(),
-                        ..Default::default() }
+                        ledger_booked_sats: 0, ..Default::default() }
     }
 
     /// P1: record a channel and seal its payer key before its funding is broadcast. A pending or
@@ -642,13 +660,12 @@ impl ChannelBook {
         Ok(())
     }
 
-    /// Atomically raise the signed cumulative amount by a charge of `amount_sats`.
-    pub fn increment(&self, dest: &str, amount_sats: i64) -> Result<(ChannelRecord, Vec<u8>)> {
+    /// `(spent, signed cum)` after a charge of `amount_sats`: the cum is never below the last one
+    /// signed, and is raised to the dust floor on a first state.
+    fn plan_increment(rec: &ChannelRecord, amount_sats: i64) -> Result<(i64, i64)> {
         if amount_sats <= 0 {
             return Err(err("bad_amount", "amount must be positive"));
         }
-        let mut g = self.lock();
-        let mut rec = g.records.get(dest).cloned().ok_or_else(|| err("unknown_channel", dest.to_string()))?;
         let spent = rec.spent();
         if spent + amount_sats > rec.cap_sats {
             return Err(cap_error(spent, amount_sats, rec.cap_sats));
@@ -662,6 +679,21 @@ impl ChannelBook {
             }
             sign_cum = floor;
         }
+        Ok((new_spent, sign_cum))
+    }
+
+    /// The cum [`increment`](Self::increment) would sign for `amount_sats`, without signing.
+    pub fn next_cum(&self, dest: &str, amount_sats: i64) -> Result<i64> {
+        let g = self.lock();
+        let rec = g.records.get(dest).ok_or_else(|| err("unknown_channel", dest.to_string()))?;
+        Ok(Self::plan_increment(rec, amount_sats)?.1)
+    }
+
+    /// Atomically raise the signed cumulative amount by a charge of `amount_sats`.
+    pub fn increment(&self, dest: &str, amount_sats: i64) -> Result<(ChannelRecord, Vec<u8>)> {
+        let mut g = self.lock();
+        let mut rec = g.records.get(dest).cloned().ok_or_else(|| err("unknown_channel", dest.to_string()))?;
+        let (new_spent, sign_cum) = Self::plan_increment(&rec, amount_sats)?;
         Self::plain_over_lock(&mut rec, sign_cum)?;
         let mut payer = self.payer_locked(&g, &rec)?;
         let mut sig = vec![];
@@ -679,6 +711,18 @@ impl ChannelBook {
         g.records.insert(dest.into(), rec.clone());
         self.persist(&g)?;
         Ok((rec, sig))
+    }
+
+    /// Remember that the policy ledger now holds this channel through `cum` (AGP-063 write-ahead).
+    pub fn mark_ledger_booked(&self, dest: &str, cum: i64) -> Result<()> {
+        let mut g = self.lock();
+        let k = Self::key_of(&g, dest)?;
+        let r = g.records.get_mut(&k).unwrap();
+        if cum > r.ledger_booked_sats {
+            r.ledger_booked_sats = cum;
+            self.persist(&g)?;
+        }
+        Ok(())
     }
 
     /// The caller (policy-checked) decided `cum`. Still refuses a cap breach. An already-signed

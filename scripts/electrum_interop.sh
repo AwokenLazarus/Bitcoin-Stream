@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-023}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-068}
 R=${XBT_RS_RUN:-$ROOT/run}/electrum
 PB=${XBT_ELECTRUM_PORT_BASE:-33300}
 ELECTRS_DIR=${XBT_ELECTRS_DIR:-$HOME/xbt-rnd/electrs-agp-024}

@@ -25,7 +25,7 @@ use xbt402::route::*;
 use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::{AdaptorLock, LocalSigner, RouteSigner, StateSigner};
-use xbt402::wire::{b64json, request_auth, request_digest};
+use xbt402::wire::{b64json, request_auth, request_digest_v2};
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
@@ -228,7 +228,7 @@ fn route_request(net: &Arc<MemNet>, pay: &RoutePayer, sh: &Arc<Shard>, tamper: O
     }
     pl["seq"] = seq.into();
     let body = dumps(&json!({"route": route}));
-    pl["auth"] = pay.signer().request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest("POST", HUB_ROUTE_PATH, body.as_bytes())).unwrap().into();
+    pl["auth"] = pay.signer().request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{HUB}{HUB_ROUTE_PATH}"), body.as_bytes())).unwrap().into();
     if let Mode::NoAuth = mode {
         pl["auth"] = "00".repeat(32).into();
     }
@@ -438,7 +438,7 @@ fn hub_lock(w: &W, route_over: Value, pl_over: Value) -> (u16, Value) {
     }
     let body = dumps(&json!({"route": route}));
     let key = channel_auth_key(&secret, &p2.payee_pub).unwrap();
-    pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest("POST", ROUTE_LOCK_PATH, body.as_bytes())).into();
+    pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest_v2("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes())).into();
     let r = NetTransport(w.net.clone()).request("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes(),
                                                   &[("PAYMENT-SIGNATURE".into(), b64json(&json!({"x402Version": 2, "accepted": {}, "payload": pl})))]).unwrap();
     (r.status, xbt402::json::parse_slice(&r.body).unwrap())

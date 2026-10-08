@@ -15,9 +15,9 @@ fn every_published_vector_is_byte_identical() {
     for g in &groups {
         assert!(g.ok(), "{}: {}/{} {:?}", g.name, g.passed, g.total, g.failures);
     }
-    assert_eq!(groups[0].total, 50, "check_vectors.py counts 50 xbt402 vectors");
+    assert_eq!(groups[0].total, 54, "check_vectors.py counts 54 xbt402 vectors");
     assert_eq!(groups[1].total, 166);
-    assert_eq!(total, 249);
+    assert_eq!(total, 253);
 }
 
 fn failing(v: &Value) -> Vec<String> {

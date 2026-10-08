@@ -303,6 +303,12 @@ fn a_rust_payer_on_the_signer_socket_never_holds_a_key_and_the_signer_decides() 
             self.1.mine(1);
             Ok(r)
         }
+
+        fn fund_channel(&self, o: &str, p: &xbt402::channel::ChannelParams, a: &str, s: u64) -> xbt402::Result<(String, u32)> {
+            let r = self.0.fund_channel(o, p, a, s)?;
+            self.1.mine(1);
+            Ok(r)
+        }
     }
     let mut client = Client::new(cfg, Box::new(WebRef(rig.web.clone())), Box::new(ConfirmingWallet(remote.clone(), wallet_chain)),
                                  Box::new(move || Ok(chain.height() as u32))).with_signer(signer);

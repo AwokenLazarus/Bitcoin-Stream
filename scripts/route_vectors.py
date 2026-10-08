@@ -31,7 +31,7 @@ from xbt402 import adaptor, ecc  # noqa: E402
 from xbt402.channel import ChannelParams, Payee, channel_auth_key, channel_payee_secret  # noqa: E402
 from xbt402.route import (FeeQuote, Invoice, PriceQuote, call_auth, fee_due, hub_channel_message,  # noqa: E402
                           lock_auth, next_cum, route_ok, session_key, state_sign, state_verify)
-from xbt402.x402_channel import request_auth, request_digest  # noqa: E402
+from xbt402.x402_channel import request_auth, request_digest_v2  # noqa: E402
 
 N = ecc.N
 NET = "bip122:0000000000000000000000000000beef"
@@ -107,7 +107,7 @@ def route_section() -> dict:
     signed_state = state_sign(prov, st)
     sk = session_key(client, bytes.fromhex(pub(prov)))
     assert sk == session_key(prov, bytes.fromhex(pub(client)))
-    req = request_digest("POST", "/v1/chunk", b'{"tokens":1}')
+    req = request_digest_v2("POST", "https://provider.example/v1/chunk", b'{"tokens":1}')
     return {
         "hub": pub(hub), "provider": pub(prov), "client": pub(client),
         "feeQuote": q.__dict__, "feeQuoteVerifies": q.verify(), "feeCarry": carry,
@@ -154,12 +154,12 @@ def lock_section() -> dict:
     body1 = json.dumps({"route": route}).encode()
     pl1 = {"chan": p1.channel_id, "seq": 5, "cum": str(cum1), "adaptor": pre1.to_json(), "point": adaptor.enc(T1).hex()}
     pl1["auth"] = request_auth(channel_auth_key(client, bytes.fromhex(p1.payee_pub)), pl1["chan"], pl1["seq"], pl1["cum"],
-                               None, request_digest("POST", "/x402/route", body1))
+                               None, request_digest_v2("POST", "https://hub.example/x402/route", body1))
     rt2 = {"session": session, "lockId": lock_id, "amount": d, "lockAuth": la, "hub": pub(hub)}
     body2 = json.dumps({"route": rt2}).encode()
     pl2 = {"chan": p2.channel_id, "seq": 3, "cum": str(cum2), "point": adaptor.enc(T).hex(), "adaptor": pre2.to_json()}
     pl2["auth"] = request_auth(channel_auth_key(ch2key, bytes.fromhex(p2.payee_pub)), pl2["chan"], pl2["seq"], pl2["cum"],
-                               None, request_digest("POST", "/x402/xbt-channel/lock", body2))
+                               None, request_digest_v2("POST", "https://provider.example/x402/xbt-channel/lock", body2))
     # the provider completes ch2 with t: a plain 0x21 state its Payee takes
     sig2 = adaptor.adapt(pre2, t) + b"\x21"
     payee2 = Payee(p2, channel_payee_secret(NET, prov, bytes.fromhex(p2.payer_pub), p2.expiry))
@@ -260,10 +260,10 @@ def check(doc: dict) -> list:
     ok("lock ch2 pre-signature is for the payee-pays state only", not lk["ch2PreverifyV11State"])
     ok("lock route payload auth", lk["routePayload"]["auth"] == request_auth(
         channel_auth_key(key("lock/client"), bytes.fromhex(p1.payee_pub)), p1.channel_id, lk["routePayload"]["seq"],
-        lk["routePayload"]["cum"], None, request_digest("POST", "/x402/route", lk["routeBody"].encode())))
+        lk["routePayload"]["cum"], None, request_digest_v2("POST", "https://hub.example/x402/route", lk["routeBody"].encode())))
     ok("lock hub payload auth", lk["lockPayload"]["auth"] == request_auth(
         channel_auth_key(key("lock/hub-ch2"), bytes.fromhex(p2.payee_pub)), p2.channel_id, lk["lockPayload"]["seq"],
-        lk["lockPayload"]["cum"], None, request_digest("POST", "/x402/xbt-channel/lock", lk["lockBody"].encode())))
+        lk["lockPayload"]["cum"], None, request_digest_v2("POST", "https://provider.example/x402/xbt-channel/lock", lk["lockBody"].encode())))
     sig2 = bytes.fromhex(lk["ch2Completed"])
     ok("lock ch2 completion is a valid 0x21 state", ecc.verify(bytes.fromhex(p2.payer_pub), z2, sig2[:-1]) and sig2[-1] == 0x21)
     from xbt402.tx import Tx

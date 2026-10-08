@@ -176,7 +176,8 @@
     policy: function (f) { return joinLines(["xbt-agentwallet-policy-v1", f.prev_sha256, String(f.expiry), f.text]); },
     "human-key": function (f) { return joinLines(["xbt-agentwallet-human-key-v1", f.old_pub, f.pubkey, String(f.expiry)]); },
     rotate: function (f) { return joinLines(["xbt-agentwallet-hot-rotate-v1", f.hot_address, String(f.expiry)]); },
-    backup: function (f) { return joinLines(["xbt-agentwallet-backup-v1", f.hot_address, String(f.expiry)]); }
+    backup: function (f) { return joinLines(["xbt-agentwallet-backup-v1", f.hot_address, String(f.expiry)]); },
+    deny: function (f) { return joinLines(["xbt-agentwallet-deny-v1", f.token, String(f.expiry)]); }
   };
 
   // ---- the key in this browser: the seed XORed with a PBKDF2 pad of the passphrase, and a MAC ------

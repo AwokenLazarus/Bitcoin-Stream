@@ -1,7 +1,7 @@
 #!/bin/bash
 # Conformance of xbt-primitives + xbt402 (Rust) with the Python references, both directions.
-#   1. the pinned vector copies in vectors/ are the published files (B1 agp-050, B2 agp-next2);
-#   2. Rust recomputes every published vector: xbt402 (50), UnifiedSighash (166), BLAKE2b header v2
+#   1. the pinned vector copies in vectors/ are the published files (B1 agp-068, B2 agp-next2);
+#   2. Rust recomputes every published vector: xbt402 (54), UnifiedSighash (166), BLAKE2b header v2
 #      stages (5), the Knots BLAKE2b regtest capture (28) -> N/N byte-identical;
 #   3. the Rust emitter rebuilds the whole xbt402 vector file and B1's check_vectors.py checks it
 #      (diff against the Python library + its generator-independent checks);
@@ -10,7 +10,7 @@
 # Runs under the soak rules (CPUQuota 200%, 4G, nice 19). Env: XBT402_B1, XBT402_B2.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-059}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-068}
 export XBT402_B1=$B1
 B2=${XBT402_B2:-$HOME/xbt-rnd/b2}
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)

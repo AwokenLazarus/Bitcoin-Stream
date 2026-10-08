@@ -7,7 +7,8 @@
 3. The human logs in to the UI, finds it on the Approvals page, signs the message the page shows with
    the device key (`xbt-wallet-ui sign`), and submits the approval in the UI.
 4. The MCP call returns: paid under the approval (charged 150 sats, the provider's price).
-5. A second over-threshold call is denied in the UI; the MCP answers needs_human, approval_state denied.
+5. A second over-threshold call is denied in the UI, signed like the approval (AGP-063 W3: an unsigned
+   deny is refused); the MCP answers needs_human, approval_state denied.
 6. close_channel through the MCP; the close is confirmed on chain; the UI shows the channel closed with
    its close report, and the signature log intact and anchored.
 """
@@ -191,7 +192,14 @@ for _ in range(100):
         break
     time.sleep(0.2)
 t2 = field(page, "token")
-f = ui.post("/approvals", "/deny", {"token": t2, "reason": "not this one"})
+f = ui.post("/approvals", "/deny", {"token": t2, "reason": "unsigned"})
+check("an unsigned deny is refused (AGP-063 W3): the call still waits", signer("approval_status", token=t2)["state"] == "pending" and th2.is_alive(), f)
+form = re.search(r'<form method="post" action="\./deny"(.*?)</form>', page, re.S).group(1)
+d_exp = field(form, "expiry")
+d_hex = re.search(r'<pre class="hex">([0-9a-f]+)</pre>', form).group(1)
+check("the deny message shown for the device is (token, expiry)", d_hex == "\n".join(["xbt-agentwallet-deny-v1", t2, d_exp]).encode().hex())
+d_sig = subprocess.check_output([a.sign_bin, "sign", "--key", a.human_key, "--message-hex", d_hex], text=True).strip()
+f = ui.post("/approvals", "/deny", {"token": t2, "reason": "not this one", "expiry": d_exp, "signature": "", "signature_ext": d_sig})
 th2.join(60)
 r2 = out2.get("r", {})
 check("denied in the UI: the MCP answers needs_human, approval_state denied", r2.get("verdict") == "needs_human" and r2.get("approval_state") == "denied", r2)

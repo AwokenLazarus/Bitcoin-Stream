@@ -101,13 +101,13 @@ are in `approval.rs`. None of these methods is an MCP tool.
 |---|---|---|
 | `approvals` | | pending, approved (xbt402 grants) and expired approval tokens with dest, amount, memo, url, expiry |
 | `approval_status` | `token` | `pending`, `approved`, `used`, `denied`, `expired` or `unknown` |
-| `deny_approval` | `token`, `reason` | drops the token (no signature: the agent can only lose its own request) |
+| `deny_approval` | `token`, `reason`, `expiry`, `signature` | drops the token. AGP-063 W3: a live approval needs the human signature over `deny_message(token, expiry)`, so the agent cannot refuse for the owner; an expired one is dropped without one |
 | `policy_get` / `policy_validate` | / `policy` | the file, its SHA-256 and the values in force; the validator's `errors` (the engine's parse errors first) and `warnings` |
 | `policy_prepare` | `policy` | the canonical text, `prev_sha256`, `expiry`, the message to sign, and a diff; the human key is kept |
 | `policy_set` | `text`, `prev_sha256`, `expiry`, `signature` | writes policy.json atomically (the old file is kept as `.prev`) and puts it in force without a restart; start-only keys are reported in `pending_restart` |
-| `human_key_enroll` | `pubkey` | the first human key, only while none is enrolled (trust on first use) |
+| `human_key_enroll` | `pubkey`, `code` | the first human key, only while none is enrolled. AGP-063 W4: `code` is the one-time enrolment code the signer prints to stderr (the Umbrel app log, StartOS Logs) and writes to `.run/enroll-code` (0600); five wrong codes replace it |
 | `human_key_rotate` | `pubkey`, `expiry`, `signature` (by the current key) | the new human key |
-| `rotate_hot_key_signed` | `expiry`, `signature` | `rotate_hot_key`, logged under `human:rotate_signature` |
+| `rotate_hot_key_signed` | `expiry`, `signature` | `rotate_hot_key`, logged under `human:rotate_signature`. AGP-063 W3: `rotate_hot_key` itself is this method now |
 | `backup_export` | `backup_pass`, `expiry`, `signature` | policy, sealed keys, books and logs, plus the wrapping secret sealed under the backup passphrase |
 | `keystore_status`, `channel_reports` | | the wrapping-key source and mode; each close's report (AGP-029: cum, unpaidMsat, payeeFee, payeeNet) |
 
@@ -190,6 +190,18 @@ every call (shown on the lab, S12; over gRPC the caveat binds). So for this REST
 REST listener itself: bind `restlisten` to a private interface or loopback (with an SSH or WireGuard
 tunnel) and firewall it to the signer's host. The signer's own `max_sends_per_hour` is the rate limit;
 LND has none per macaroon.
+
+## Budget integrity and privileged methods (AGP-063)
+
+Every signature that raises the signed amount is booked as the signed delta (`xbt402:<chan>:<cum>`)
+before it is sent, never the seller's `charged`. The budget sums are held to that increase,
+including a channel's dust floor (`PolicyEngine::evaluate_booking`). `minCapacity` above the owner's cap is
+`deny/min_capacity`. A negative payment or amend is refused. `fund`, `open_channel`,
+`xbt402_attach` and `xbt402_sign_rollover` are bound to an issued key, the seller's verified payTo
+and the owner's bounds. `rotate_hot_key` and a live `deny_approval` need the human signature, and
+the first `human_key_enroll` needs the one-time code. Passphrase blobs use scrypt N=2^17 with
+`log_n`. Details, error codes and the wire changes are in the workspace README section
+"Agent-wallet budget integrity and privileged methods (AGP-063)".
 
 ## Files and durability (AGP-055)
 

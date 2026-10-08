@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{json, Value};
-use xbt_signer::approval::{backup_message, canonical_message, human_key_message, policy_message, rotate_message, sweep_message};
+use xbt_signer::approval::{backup_message, canonical_message, deny_message, human_key_message, policy_message, rotate_message, sweep_message};
 use xbt_wallet_ui::app::App;
 use xbt_wallet_ui::config::Config;
 
@@ -291,6 +291,25 @@ fn behind_a_proxy_prefix_and_the_peer_allowlist() {
     assert_eq!(B::new(&bx.base).get("/").status, 403, "only the configured peers");
 }
 
+/// AGP-063 W4: a public name pointed at the box (DNS rebinding) is refused, and so is a POST from a
+/// foreign origin; the box's own names, `null` and `XBT_UI_ALLOWED_HOSTS` are not.
+#[test]
+fn w4_a_rebound_host_and_a_foreign_origin_are_refused() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.setup_open = true);
+    let mut br = B::new(&bx.base);
+    assert_eq!(br.send("GET", "/login", None, &[("Host", "rebind.example:8480")]).status, 421);
+    for h in ["umbrel.local", "abcdefghijklmnop.onion:80", "xbt-wallet-ui:8480", "[::1]:8480", "10.21.0.4"] {
+        assert_ne!(br.send("GET", "/login", None, &[("Host", h)]).status, 421, "{h}");
+    }
+    let form = format!("password={}&password2={}", enc(PW), enc(PW));
+    assert_eq!(br.send("POST", "/setup-password", Some(&form), &[("Origin", "https://evil.example")]).status, 403);
+    assert_eq!(br.send("POST", "/setup-password", Some(&form), &[("Origin", "null")]).status, 303, "the UI's own no-referrer pages send null");
+    let allowed = vec!["wallet.example.com".to_string()];
+    assert!(xbt_wallet_ui::app::host_allowed("wallet.example.com:443", &allowed) && !xbt_wallet_ui::app::host_allowed("evil.example", &allowed));
+    assert!(xbt_wallet_ui::app::origin_allowed("https://wallet.example.com", &allowed) && !xbt_wallet_ui::app::origin_allowed("https://x.wallet.example.com", &allowed));
+}
+
 // --- actions against the signer -----------------------------------------------------------------------
 
 #[test]
@@ -329,6 +348,10 @@ fn approve_an_xbt402_call_in_the_ui_and_the_agent_s_retry_pays_and_deny_drops_on
     let r2 = bx.rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}));
     let t2 = r2["approval_token"].as_str().unwrap();
     let r = br.act("/approvals", "/deny", &[("token", t2), ("reason", "too much")]);
+    assert!(br.flash_after(&r).contains("human_sig"), "AGP-063 W3: a deny is signed like an approval");
+    let dexp = (xbt_wallet_ui::now() + 300).to_string();
+    let r = br.act("/approvals", "/deny", &[("token", t2), ("reason", "too much"), ("expiry", &dexp),
+                                            ("signature", &sig(&deny_message(t2, dexp.parse().unwrap())))]);
     assert_eq!(br.flash_after(&r), "Denied.");
     assert_eq!(bx.rig.call("approval_status", json!({"token": t2}))["state"], "denied");
     let hist = bx.rig.call("history", json!({"limit": 100}))["events"].to_string();
@@ -428,7 +451,10 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     assert!(setup.contains("id=\"keygen\"") && setup.contains("./human-key-enroll"));
     assert!(br.get("/").body.contains("No approval key is enrolled"));
     let pubhex = hex::encode(human().verifying_key().to_bytes());
-    let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex)]);
+    let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", "0000-0000-0000")]);
+    assert!(br.flash_after(&r).contains("enrolment code"), "AGP-063 W4: the code from the signer's log, not trust on first use");
+    let code = std::fs::read_to_string(bx.rig.root.join(".run/enroll-code")).unwrap();
+    let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", code.trim())]);
     assert_eq!(br.flash_after(&r), "Approval key enrolled.");
     let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex)]);
     assert!(br.flash_after(&r).contains("already enrolled"));
@@ -690,8 +716,9 @@ fn without_a_wait_the_mcp_answers_needs_human_at_once_and_a_deny_ends_a_wait() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    let dexp = xbt_wallet_ui::now() + 300;
     for t in &tokens {
-        br.act("/approvals", "/deny", &[("token", t)]);
+        br.act("/approvals", "/deny", &[("token", t), ("expiry", &dexp.to_string()), ("signature", &sig(&deny_message(t, dexp)))]);
     }
     let v: Value = serde_json::from_str(&t.join().unwrap().unwrap()).unwrap();
     assert_eq!((v["verdict"].as_str(), v["approval_state"].as_str()), (Some("needs_human"), Some("denied")), "{v}");

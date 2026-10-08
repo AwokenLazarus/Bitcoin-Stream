@@ -11,10 +11,12 @@ publish.workspace = true
 default = []
 # blocking HTTP client transport (ureq) for the payer
 http-client = ["dep:ureq"]
-# tiny_http server around Provider::serve
-http-server = ["dep:tiny_http", "dep:xbt-svc"]
+# std::net server around Provider::serve (header cap, read deadlines, connection limit)
+http-server = ["dep:xbt-svc"]
 # bitcoind JSON-RPC ChainBackend and Wallet (ureq)
 rpc = ["dep:ureq"]
+# fixed-nonce adaptor pre-sign, for the vector emitter only (nonce reuse leaks the key)
+vector-emitter = []
 
 [dependencies]
 xbt-primitives.workspace = true
@@ -28,7 +30,6 @@ base64.workspace = true
 getrandom = "0.2"
 indexmap = "2"
 ureq = { workspace = true, optional = true }
-tiny_http = { workspace = true, optional = true }
 # container plumbing for the xbt402-hub binary (AGP-038): data dir, secrets, health, proxy URLs
 xbt-svc = { workspace = true, optional = true }
 
@@ -36,3 +37,7 @@ xbt-svc = { workspace = true, optional = true }
 [[bin]]
 name = "xbt402-hub"
 required-features = ["rpc", "http-client", "http-server"]
+
+[[test]]
+name = "http_limits"
+required-features = ["http-client", "http-server"]

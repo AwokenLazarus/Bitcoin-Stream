@@ -53,6 +53,12 @@ impl Wallet for SignerMiningWallet {
         self.1.call("generatetoaddress", json!([1, self.2]))?;
         Ok(r)
     }
+
+    fn fund_channel(&self, origin: &str, params: &xbt402::channel::ChannelParams, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let r = self.0.fund_channel(origin, params, address, sats)?;
+        self.1.call("generatetoaddress", json!([1, self.2]))?;
+        Ok(r)
+    }
 }
 
 fn pct(xs: &mut [f64], q: f64) -> f64 {

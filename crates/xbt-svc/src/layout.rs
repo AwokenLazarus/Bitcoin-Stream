@@ -113,18 +113,62 @@ fn lchown(p: &Path, uid: u32) -> io::Result<()> {
     std::os::unix::fs::lchown(p, Some(uid), Some(uid))
 }
 
-/// Give `dir` and everything under it to `uid`, never following a symlink.
+/// Open `p` itself: O_NOFOLLOW refuses a symlink in its last component (ELOOP), O_NONBLOCK keeps
+/// a FIFO from blocking. AGP-063 K1: owner and mode then change through this fd, never by path.
 #[cfg(unix)]
-fn chown_tree(dir: &Path, uid: u32, changed: &mut u64) -> io::Result<()> {
-    let md = std::fs::symlink_metadata(dir)?;
+fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | if dir { libc::O_DIRECTORY } else { 0 };
+    std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p)
+}
+
+/// Where the entries of the directory open as `d` (at `path`) are named: through the fd on Linux
+/// (`/proc/self/fd/N`), so a parent swapped for a symlink after it was opened is never followed.
+#[cfg(unix)]
+fn entries_of(d: &std::fs::File, path: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let proc = PathBuf::from(format!("/proc/self/fd/{}", d.as_raw_fd()));
+        if proc.exists() {
+            return proc;
+        }
+    }
+    let _ = d;
+    path.to_path_buf()
+}
+
+/// Give the directory open as `d` (at `path`) and everything under it to `uid`. Directories are
+/// opened O_NOFOLLOW relative to their parent's fd and chowned through their own fd; anything else
+/// is lchowned in place, so no symlink is ever followed, even one swapped in during the walk.
+#[cfg(unix)]
+fn chown_tree(d: &std::fs::File, path: &Path, uid: u32, changed: &mut u64) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let md = d.metadata()?;
     if md.uid() != uid || md.gid() != uid {
-        lchown(dir, uid)?;
+        std::os::unix::fs::fchown(d, Some(uid), Some(uid))?;
         *changed += 1;
     }
-    if md.file_type().is_dir() {
-        for e in std::fs::read_dir(dir)? {
-            chown_tree(&e?.path(), uid, changed)?;
+    if !md.file_type().is_dir() {
+        return Ok(());
+    }
+    let base = entries_of(d, path);
+    for e in std::fs::read_dir(&base)? {
+        let name = e?.file_name();
+        let p = base.join(&name);
+        let m = std::fs::symlink_metadata(&p)?;
+        if m.file_type().is_dir() {
+            match open_nofollow(&p, true) {
+                Ok(c) => chown_tree(&c, &path.join(&name), uid, changed)?,
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+                    lchown(&p, uid)?;
+                    *changed += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        } else if m.uid() != uid || m.gid() != uid {
+            lchown(&p, uid)?;
+            *changed += 1;
         }
     }
     Ok(())
@@ -139,21 +183,30 @@ fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, Stri
     if created {
         std::fs::create_dir_all(dir).map_err(ctx)?;
     }
-    let (u0, g0, m0) = owner_mode(dir).map_err(ctx)?;
-    if std::fs::symlink_metadata(dir).map_err(ctx)?.file_type().is_symlink() {
-        return Err(format!("{}: is a symlink; refusing", dir.display()));
-    }
+    let f = match open_nofollow(dir, true) {
+        Ok(f) => f,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+            return Err(format!("{}: is a symlink or not a directory; refusing", dir.display()));
+        }
+        Err(e) => return Err(ctx(e)),
+    };
+    let (u0, g0, m0) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata().map_err(ctx)?;
+        (m.uid(), m.gid(), m.mode() & 0o7777)
+    };
     let mut changed = 0u64;
     if u0 != uid || g0 != uid {
         if recurse {
-            chown_tree(dir, uid, &mut changed).map_err(ctx)?;
+            chown_tree(&f, dir, uid, &mut changed).map_err(ctx)?;
         } else {
-            lchown(dir, uid).map_err(ctx)?;
+            std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
             changed = 1;
         }
     }
     if m0 != mode {
-        crate::set_mode(dir, mode).map_err(ctx)?;
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(ctx)?;
     }
     Ok(json!({"path": dir.display().to_string(), "uid": uid, "mode": format!("{mode:o}"), "created": created,
               "was": {"uid": u0, "gid": g0, "mode": format!("{m0:o}")}, "chowned": changed}))
@@ -164,12 +217,15 @@ fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, Stri
 #[cfg(unix)]
 fn put_secret(path: &Path, value: &[u8], uid: u32, mode: u32) -> Result<&'static str, String> {
     let ctx = |e: io::Error| format!("{}: {e}", path.display());
-    if let Ok(md) = std::fs::symlink_metadata(path) {
-        if md.file_type().is_file() && std::fs::read(path).map(|b| b == value).unwrap_or(false) {
-            let (u, g, m) = owner_mode(path).map_err(ctx)?;
-            if (u, g, m) != (uid, uid, mode) {
-                lchown(path, uid).map_err(ctx)?;
-                crate::set_mode(path, mode).map_err(ctx)?;
+    if let Ok(mut f) = open_nofollow(path, false) {
+        use std::os::unix::fs::MetadataExt;
+        let md = f.metadata().map_err(ctx)?;
+        let mut cur = vec![];
+        if md.file_type().is_file() && std::io::Read::read_to_end(&mut f, &mut cur).is_ok() && cur == value {
+            if (md.uid(), md.gid(), md.mode() & 0o7777) != (uid, uid, mode) {
+                use std::os::unix::fs::PermissionsExt;
+                std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
+                f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(ctx)?;
                 return Ok("fixed");
             }
             return Ok("unchanged");
@@ -420,6 +476,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("run/ui/mcp-http-token")).unwrap(), old, "agents keep their token");
         assert!(!root.join("mcp/secrets/mcp-http-token").exists() && !root.join("ui/secrets/mcp-http-token").exists(), "{r}");
         assert!(!r.to_string().contains(&old), "the report never holds a secret");
+    }
+
+    /// AGP-063 K1: the walk regroups everything under the tree and nothing a symlink in it points at.
+    #[test]
+    fn k1_chown_tree_regroups_the_tree_and_never_follows_a_symlink() {
+        let uid = me();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let other = status.lines().find_map(|l| l.strip_prefix("Groups:")).into_iter()
+            .flat_map(|g| g.split_whitespace().filter_map(|x| x.parse::<u32>().ok()).collect::<Vec<_>>()).find(|&g| g != uid);
+        let Some(g) = other else { return };
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (tree, outside) = (t.path().join("tree"), t.path().join("outside"));
+        std::fs::create_dir_all(tree.join("a")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(tree.join("a/f"), "x").unwrap();
+        std::fs::write(outside.join("v"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        for p in [tree.join("a/f"), outside.join("v"), outside.clone()] {
+            std::os::unix::fs::chown(&p, None, Some(g)).unwrap();
+        }
+        let mut changed = 0;
+        chown_tree(&open_nofollow(&tree, true).unwrap(), &tree, uid, &mut changed).unwrap();
+        assert_eq!(std::fs::metadata(tree.join("a/f")).unwrap().gid(), uid);
+        assert_eq!(std::fs::metadata(outside.join("v")).unwrap().gid(), g);
+        assert_eq!(std::fs::metadata(&outside).unwrap().gid(), g);
+        assert!(changed >= 1);
+        assert!(open_nofollow(&tree.join("link"), true).is_err());
     }
 
     fn init_as(root: &Path, names: &[String], prov: &Provision, uid: u32) -> Result<Value, String> {
