@@ -16,7 +16,7 @@
 //!   [`WorkConfig::carry_growth_blocks`] audited blocks, no new credit is extended until carry is
 //!   released. A call the held work would have paid is refused with `credit_cap`, `carry_cap` or
 //!   `carry_growing` (and the balances in `work`), never with a silent loss: the receipts stay held.
-//! * AGP-065 (Guida P): the audit takes the block from the provider's own node ([`ChainBlock`]) and
+//! * AGP-065 (review P): the audit takes the block from the provider's own node ([`ChainBlock`]) and
 //!   holds the statement to the Prime's pinned [`PrimeTerms`]; window starts must not go backwards
 //!   between audited blocks; a block with no statement is audited too ([`WorkProvider::audit_chain`]);
 //!   a reorg undoes what an orphaned audit released ([`WorkProvider::orphaned`]); payouts are split
@@ -440,7 +440,7 @@ impl WorkProvider {
         Ok(o)
     }
 
-    /// Audit `block` whether or not the Prime published a statement for it (Guida P4). A missing
+    /// Audit `block` whether or not the Prime published a statement for it (review P4). A missing
     /// statement for a coinbase that paid the identity fails the audit (the Prime paid as the pool
     /// but will not say for what) and distrusts the Prime; for one that paid nothing it records
     /// nothing and covers nothing, so the credit stays held. Returns None for that case.
@@ -485,7 +485,7 @@ impl WorkProvider {
         self.lock().audits.iter().filter_map(|a| Some((u32::try_from(a.get("height")?.as_u64()?).ok()?, a.get("blockHash")?.as_str()?.to_string()))).collect()
     }
 
-    /// The audited block at `height` left the chain (Guida P6): its verdict, carry and the credit it
+    /// The audited block at `height` left the chain (review P6): its verdict, carry and the credit it
     /// covered are undone (the spans it resolved are open again, counting against the caps). Returns
     /// the credit that is unaudited again, or None when no audit was recorded there.
     pub fn orphaned(&self, height: u32) -> Result<Option<u64>> {

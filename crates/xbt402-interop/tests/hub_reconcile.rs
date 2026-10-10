@@ -545,9 +545,12 @@ fn close_a_closing_ch2_is_not_live_and_a_refill_funds_the_next() {
 fn close_fields_round_trip() {
     let w = W::new();
     w.hub.close_ch2(&w.oc(), false).unwrap();
-    let rec = on_disk(&w._dir.0)["chans"][&w.origin].clone();
+    let mut rec = on_disk(&w._dir.0)["chans"][&w.origin].clone();
     assert_eq!((rec["state"].as_str(), rec["close_prev"].as_str()), (Some("closing"), Some("open")));
     assert!(rec.get("fund_txid").is_some() && rec.get("fund_vout").is_some());
-    let back = OutChannel::from_json(&rec).unwrap();
-    assert_eq!(back.to_json(), rec);
+    // the key is sealed on disk (AGP-073 K1); every other field round-trips
+    assert!(rec.as_object_mut().unwrap().remove("secret_sealed").is_some());
+    let mut back = OutChannel::from_json(&rec).unwrap().to_json();
+    back.as_object_mut().unwrap().remove("secret");
+    assert_eq!(back, rec);
 }

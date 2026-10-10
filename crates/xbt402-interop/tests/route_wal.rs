@@ -8,7 +8,7 @@
 //! * a write failure is a 500 `route_wal_failed` with no ROUTE-STATE, nothing billed;
 //! * the sync overlaps the handler; concurrent calls share syncs; compaction keeps the latest;
 //! * ROUTE-STATE's invoice is signed once per window.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::route::{call_auth, session_key, state_verify};
 use xbt402::route_seller::RouteOffer;
 use xbt402::wire::{b64json, request_digest_v2, unb64json};
+use xbt402_interop::crash_copy;
 use xbt402_interop::memnet::MemChain;
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
@@ -68,6 +69,7 @@ impl Default for Opts {
 /// A provider on disk that can be "crashed" (dropped without a save) and started again.
 struct BoxP {
     dir: TempDir,
+    gen: usize,
     chain: Arc<MemChain>,
     opts: Opts,
     handler: Arc<Mutex<H>>,
@@ -81,21 +83,27 @@ fn ok(_: &[u8]) -> HttpResponse {
 impl BoxP {
     fn new(opts: Opts, handler: H) -> Self {
         let dir = TempDir::new();
+        std::fs::create_dir_all(dir.0.join("g0")).unwrap();
         let chain = MemChain::new(1000);
         let handler = Arc::new(Mutex::new(handler));
-        let p = Self::make(&dir, &chain, &opts, &handler);
-        Self { dir, chain, opts, handler, p }
+        let p = Self::make(&dir.0.join("g0"), &chain, &opts, &handler);
+        Self { dir, gen: 0, chain, opts, handler, p }
     }
 
-    fn make(dir: &TempDir, chain: &Arc<MemChain>, opts: &Opts, handler: &Arc<Mutex<H>>) -> Arc<Provider> {
+    /// This run's files (each restart is a new process on a copy of the last one's disk).
+    fn cur(&self) -> PathBuf {
+        self.dir.0.join(format!("g{}", self.gen))
+    }
+
+    fn make(dir: &Path, chain: &Arc<MemChain>, opts: &Opts, handler: &Arc<Mutex<H>>) -> Arc<Provider> {
         let mut cfg = ProviderConfig::new(NET);
         cfg.close_margin = 36;
         cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 500, max_expiry_blocks: 8_640, close_margin: 36, ..FundingPolicy::default() };
         cfg.height_ttl = Duration::ZERO;
         if opts.wal {
-            cfg.route_wal = Some(dir.0.join("prov.route-wal"));
+            cfg.route_wal = Some(dir.join("prov.route-wal"));
         }
-        let ledger = Ledger::open(&dir.0.join("prov.jsonl")).unwrap();
+        let ledger = Ledger::open(&dir.join("prov.jsonl")).unwrap();
         let h = handler.clone();
         let p = Provider::new(chain.clone(), sk(0x5151), cfg, ledger, Box::new(|_, _| 1000),
                               Box::new(move |_, _, b| {
@@ -111,8 +119,14 @@ impl BoxP {
         Arc::new(p)
     }
 
+    /// The crash: the next process starts on the files as they are on disk now. The old provider
+    /// (and a call it still runs) keeps its own copy and its ledger lock (AGP-067), as a dead
+    /// process's writes never reach the new one.
     fn restart(&mut self) {
-        self.p = Self::make(&self.dir, &self.chain, &self.opts, &self.handler);
+        let new = self.dir.0.join(format!("g{}", self.gen + 1));
+        crash_copy(&self.cur(), &new).unwrap();
+        self.gen += 1;
+        self.p = Self::make(&new, &self.chain, &self.opts, &self.handler);
     }
 
     fn set_handler(&self, h: H) {
@@ -529,7 +543,7 @@ fn a_lost_log_does_not_restart_below_walv() {
     }
     b.wal_settle();
     let _other = Client::new(&b);                                      // a session open saves the routes file (walV 3)
-    std::fs::remove_file(b.dir.0.join("prov.route-wal")).unwrap();
+    std::fs::remove_file(b.cur().join("prov.route-wal")).unwrap();
     b.restart();
     assert!(b.p.routes().wal().unwrap().version() >= 3);
     assert_eq!(c.call(&b, b"x").status, 200);

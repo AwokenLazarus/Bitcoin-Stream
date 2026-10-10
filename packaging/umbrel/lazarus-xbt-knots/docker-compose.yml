@@ -18,6 +18,7 @@ services:
     command:
       - -datadir=/data
       - -conf=/etc/xbt/xbt.conf
+      - -includeconf=/etc/xbt/peers.conf
       - -rpcuser=${APP_XBT_KNOTS_RPC_USER}
       - -rpcpassword=${APP_XBT_KNOTS_RPC_PASS}
     volumes:

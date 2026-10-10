@@ -9,11 +9,14 @@
 //! * [`health`]: node sync status, the readiness file of a socket-only service, freshness checks.
 //! * [`proxy`]: base-path stripping and the public URL behind Umbrel `app_proxy`, StartOS and Tor.
 //! * [`probe`]: a minimal HTTP GET for `healthcheck` subcommands (images have no shell or curl).
+//! * [`http`]: the bounded HTTP/1.1 server every service listens with: header caps, head and body
+//!   deadlines, a connection limit, a fixed worker pool (review T1; AGP-068, AGP-072).
 //! * [`layout`]: the data dir's owners and modes, and `xbt-init`, which makes a bind mount or a
 //!   root-owned volume match them (Umbrel, StartOS; AGP-040).
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+pub mod http;
 pub mod layout;
 
 /// A non-empty, trimmed environment variable.

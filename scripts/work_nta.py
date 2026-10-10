@@ -628,7 +628,7 @@ def run():
         check(res.get("ok") is True and rep["carry"]["owedSats"] == 0,
               f"C: Rust audit PASS (paid {res.get('paidSats')} >= expected {res.get('expectedSats')}); the carry ledger is released "
               f"(owed {rep['carry']['owedSats']}, released {rep['carry']['releasedSats']})", audit=res)
-        # AGP-065 (Guida P2): the pass covers the B share, so it is credited outside the caps; the C share,
+        # AGP-065 (review P2): the pass covers the B share, so it is credited outside the caps; the C share,
         # mined at the block's height, is outside that bound and takes the cap
         check(rep["credit"]["frozen"] is None and rep["credit"]["heldWork"] == 0 and rep["credit"]["unauditedWork"] == 1,
               f"C: unfrozen; the audit covers the B share (credited outside the caps), the C share takes the cap of 1: {rep['credit']}")

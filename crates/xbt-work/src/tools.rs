@@ -108,7 +108,7 @@ pub fn chain_block(rpc: &Rpc, height: u32, identity: &str) -> Result<ChainBlock>
 
 /// The node's coinbase maturity (Knots `getdeploymentinfo`).
 pub fn maturity(rpc: &Rpc) -> Result<Maturity> {
-    Maturity::from_deployments(&rpc.call("getdeploymentinfo", json!([]))?)
+    Ok(Maturity::from_deployments(&rpc.call("getdeploymentinfo", json!([]))?)?)
 }
 
 /// What a coinbase pays `identity` (bech32 compared lower-case).
@@ -118,7 +118,7 @@ pub fn paid_to(outs: &[(String, u64)], identity: &str) -> u64 {
 
 /// The Prime's statement for a pool block (`GET <window_url>?height=H`): None when the Prime
 /// answers 404 (it has none for that height); any other status is an error, never "none"
-/// (Guida P4: an unreachable Prime must not look like a block with nothing to audit).
+/// (review P4: an unreachable Prime must not look like a block with nothing to audit).
 pub fn window(t: &dyn Transport, window_url: &str, height: u32) -> Result<Option<(SignedWindow, Vec<SignedDeferral>, Value)>> {
     let r = t.request("GET", &format!("{window_url}?height={height}"), b"", &[])?;
     match r.status {

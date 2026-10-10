@@ -560,8 +560,8 @@
    "method": "GET",
    "target": "/v1/share-change?window=7d",
    "body": "",
-   "req": "c2d714acb894bd4d2b24ea72dee340ec35f5a4abfa0ad0961fca2ff8ebca2be6",
-   "auth": "2ff001db77f58618dc619c3ede94040dde32487ca9b7b30ee703e0a18c365a1f"
+   "req": "bfd7c513fd23caff66f0ea04583c18b12905e2c661cd4b0ac8643cad6cd609d5",
+   "auth": "13dcd640250d4876ae185927b125d9e1a961903a5dc6e1cf78323ce8cdb759f7"
   },
   {
    "authKey": "7c849953f8efbbb87820e8103a1da456ceab94c1c686ff4d9087fa921e7dcb7c",
@@ -572,8 +572,8 @@
    "method": "GET",
    "target": "/v1/pools?window=7d",
    "body": "",
-   "req": "cc0a8a4ca98ff83897b9ad1f911ef4ab5a7c849d2cb848019ac5ba7a50b1a7e1",
-   "auth": "7a8f2d3024ea99c1db7bee437f8998247dcc0459720fbe292bf554221ce24efd"
+   "req": "193e83e4e9e75f913bc0f943d7b41abf11bc3f3af8a582682859cd161207028b",
+   "auth": "6be819a187168ff88c21f928997bbd4942bd04ced2027045c979e919c8e01548"
   },
   {
    "authKey": "7c849953f8efbbb87820e8103a1da456ceab94c1c686ff4d9087fa921e7dcb7c",
@@ -584,8 +584,8 @@
    "method": "POST",
    "target": "/v1/report",
    "body": "{\"window\":\"7d\"}",
-   "req": "0694a6912324e49ee90e944c88f44e1e413e655b2f4ff3d6897f9325d451e87c",
-   "auth": "fa0b3508c68d4eef0c7ec8093db48e0f988acb337e7d7303ecb66b12adc8f783"
+   "req": "012569f153c44c38fda75ff7d245663b117c685cf0a65b50523197582d9f1e76",
+   "auth": "20697cd7816e707c8c389eb7dbebc185413a14c08b10be3092a07b4229c2f1ff"
   }
  ],
  "audit": {

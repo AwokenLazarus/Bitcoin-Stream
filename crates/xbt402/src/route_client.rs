@@ -543,6 +543,9 @@ impl RoutePayer {
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
+        let mut p = p;
+        p.capacity = cap;
+        self.preflight(&p, &acc)?;
         let (txid, vout) = self.wallet.fund_channel(&self.hub_url, &p, &segwit_address(hrp, &p.spk())?, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.signer.attach(&self.hub_url, &p)?;
@@ -566,14 +569,39 @@ impl RoutePayer {
         Ok(out)
     }
 
-    fn post_open(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
-        let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
-        let mut c = json!({"txid": p.funding_txid(), "vout": p.funding_vout(), "capacity": p.capacity, "expiry": p.expiry,
-                           "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
+    /// ch1's `/open` channel object (no outpoint before the funding) and the hub's open URL.
+    fn open_req(&self, p: &ChannelParams, acc: &Value) -> (Value, String) {
+        let mut c = json!({"capacity": p.capacity, "expiry": p.expiry, "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk),
+                           "redeemScript": hex::encode(p.script())});
+        if p.funding.is_some() {
+            c["txid"] = p.funding_txid().into();
+            c["vout"] = p.funding_vout().into();
+        }
         if p.close_fee_payer != FeePayer::Payer {
             c["closeFeePayer"] = p.close_fee_payer.as_str().into();
         }
-        let open_url = format!("{}{}", self.hub_url, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+        (c, format!("{}{}", self.hub_url, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH)))
+    }
+
+    /// Ask the hub whether it opens ch1 on exactly these terms before anything is funded (review C2,
+    /// AGP-073; [`crate::client::Client`] does the same with a provider). A hub from before the
+    /// preflight answers `bad_request` (no outpoint): the open goes ahead.
+    fn preflight(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
+        let (c, open_url) = self.open_req(p, acc);
+        match self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "preflight": true, "channel": c})) {
+            Ok(r) if r.get("preflight") != Some(&Value::Bool(true)) => fail("bad_open", "the hub did not answer the open preflight"),
+            Ok(r) if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() => {
+                fail("bad_fee_payer", "the hub would open the channel with another closeFeePayer")
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.code == "bad_request" => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn post_open(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
+        let (c, open_url) = self.open_req(p, acc);
         let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
         if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() {
             return fail("bad_fee_payer", "the hub opened the channel with another closeFeePayer");

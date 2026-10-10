@@ -4,8 +4,12 @@
 //! JSON-lines log: `save` appends the changed rows and fsyncs, so a paid call costs O(1) writes
 //! whatever the number of channels; `open` replays the log (the last row per channel wins) and
 //! compacts it. A torn last line (a crash mid-write) is ignored: that row was never acknowledged.
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+//!
+//! One process at a time (review C5): `open` takes an exclusive lock on `<path>.lock` and holds it
+//! until the ledger is dropped. A second opener, in this process or another, gets `ledger_locked`:
+//! two providers on one file would each serve from their own copy and overwrite the other's rows.
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -129,11 +133,44 @@ impl ChannelState {
 pub struct Ledger {
     path: Option<PathBuf>,
     file: Option<File>,
+    _lock: Option<FileLock>,
     pub channels: IndexMap<String, ChannelState>,
 }
 
 fn io_err(e: std::io::Error) -> ChannelError {
     ChannelError::new("ledger_error", e.to_string())
+}
+
+/// An exclusive lock on a ledger, held until dropped (review C5).
+#[derive(Debug)]
+pub(crate) struct FileLock(#[allow(dead_code)] File);
+
+/// Lock the ledger at `path` for this process, or fail `ledger_locked` naming the holder's pid.
+/// The lock is on a sidecar `<path>.lock`, not the ledger itself: compaction renames a new file
+/// over the ledger, and a lock on the old inode would no longer exclude anyone.
+pub(crate) fn lock_ledger(path: &Path) -> Result<FileLock> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lp = PathBuf::from(name);
+    if let Some(d) = lp.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d).map_err(io_err)?;
+    }
+    let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lp).map_err(io_err)?;
+    match f.try_lock() {
+        Ok(()) => {
+            f.set_len(0).and_then(|_| f.rewind()).and_then(|_| writeln!(f, "{}", std::process::id())).map_err(io_err)?;
+            Ok(FileLock(f))
+        }
+        Err(TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            let _ = f.read_to_string(&mut holder);
+            let holder = holder.trim();
+            let who = if holder.is_empty() { "another opener".to_string() } else { format!("pid {holder}") };
+            Err(ChannelError::new("ledger_locked", format!("{} is open in {who} (lock {}): one provider per ledger file",
+                                                           path.display(), lp.display())))
+        }
+        Err(TryLockError::Error(e)) => Err(io_err(e)),
+    }
 }
 
 impl Ledger {
@@ -147,8 +184,10 @@ impl Ledger {
         self.path.as_deref()
     }
 
-    /// Replay and compact the log at `path` (created if missing).
+    /// Lock, replay and compact the log at `path` (created if missing). `ledger_locked` when
+    /// another open ledger holds it.
     pub fn open(path: &Path) -> Result<Self> {
+        let lock = lock_ledger(path)?;
         let mut channels = IndexMap::new();
         if path.exists() {
             let f = File::open(path).map_err(io_err)?;
@@ -159,7 +198,7 @@ impl Ledger {
                 channels.insert(st.params.channel_id(), st);
             }
         }
-        let mut l = Self { path: Some(path.to_path_buf()), file: None, channels };
+        let mut l = Self { path: Some(path.to_path_buf()), file: None, _lock: Some(lock), channels };
         l.compact()?;
         Ok(l)
     }

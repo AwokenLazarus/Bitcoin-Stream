@@ -1,12 +1,14 @@
 #!/bin/bash
 # AGP-030 verify: everything result.md reports, in one run, at this commit.
 #   scripts/mcp/verify_agp030.sh            (add CLAUDE=0 to skip the two real-Claude flagships, ~$0.25 each)
-# Needs: ~/xbt-rnd/xbt-063-agp-030 (xbt-063 branch agp-030) with its .venv (mcp 2.2.0), ~/xbt-rnd/b2 at
-# b4f2fe5, hermes on PATH, claude on PATH. Ports 33500-33599. Soak rules: CPUQuota 200%, 4G, nice 19, -j2.
+# Needs: ~/xbt-rnd/xbt-063 (xbt-063 master, the AGP-030 flagship on the merged B1/B2
+# pins) with its .venv (mcp 2.2.0), ~/xbt-rnd/b2 at master, hermes on PATH, claude on PATH. Ports
+# 33500-33599. Soak rules: CPUQuota 200%, 4G, nice 19, -j2. The two REAL CLAUDE steps need Claude
+# credit; CLAUDE=0 skips them.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
-X63=${XBT063:-$HOME/xbt-rnd/xbt-063-agp-030}
+X63=${XBT063:-$HOME/xbt-rnd/xbt-063}
 PY=$HOME/xbt-rnd/xbt-063/.venv/bin/python
 B2=${B2_TREE:-$HOME/xbt-rnd/b2}
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)
@@ -33,8 +35,8 @@ echo "AGP-030 verify: xbt-rs $(git rev-parse --short HEAD), xbt-063 $(git -C "$X
 step "build (release, -j2)" "${SOAK[@]}" cargo build -q -j2 --release -p xbt-wallet-mcp -p xbt-signer --bins
 step "cargo test --workspace" bash -c "${SOAK[*]} cargo test -q -j2 --workspace 2>&1 | grep -E '^test result' | awk '{p+=\$4; f+=\$6} END {print \"tests passed\", p, \"failed\", f; exit f>0}'"
 step "no serde_json arbitrary_precision" bash -c "! cargo tree -e features -i serde_json --workspace 2>/dev/null | grep -q arbitrary_precision"
-step "protocol conformance vs B2 (mock signer)" python3 scripts/mcp/mcp_conformance.py --py "$PY" --b2 "$B2" --rust target/release/xbt-wallet-mcp --out run/verify-mcp-conformance.json
-step "Python SDK streamable HTTP vs B2 stdio" python3 scripts/mcp/http_sdk_check.py --py "$PY" --b2 "$B2" --rust target/release/xbt-wallet-mcp
+step "protocol conformance vs B2 (mock signer)" env B1_ROOT="$HOME/xbt-rnd/b1" python3 scripts/mcp/mcp_conformance.py --py "$PY" --b2 "$B2" --rust target/release/xbt-wallet-mcp --out run/verify-mcp-conformance.json
+step "Python SDK streamable HTTP vs B2 stdio" env B1_ROOT="$HOME/xbt-rnd/b1" python3 scripts/mcp/http_sdk_check.py --py "$PY" --b2 "$B2" --rust target/release/xbt-wallet-mcp
 step "regtest conformance, both signers" env XBT063="$X63" scripts/mcp/regtest_conformance.sh
 step "scripted flagship, Rust MCP + Rust signer + local payer" flagship rust-rust-local FLAGSHIP_AGENT=script MCP_IMPL=rust SIGNER_IMPL=rust LOCAL_PAYER_TEST=1
 step "Hermes (MCP-level), Rust MCP" flagship hermes FLAGSHIP_AGENT=hermes MCP_IMPL=rust

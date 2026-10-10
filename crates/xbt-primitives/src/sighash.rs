@@ -40,18 +40,64 @@ impl ScriptType {
     }
 }
 
+/// The tapscript default codeseparator position: no OP_CODESEPARATOR executed.
+pub const NO_CODESEP: u32 = 0xFFFF_FFFF;
+/// The first byte of a taproot annex (BIP341).
+pub const ANNEX_TAG: u8 = 0x50;
+
+/// What a taproot spend commits to beyond the transaction: the annex (key and script path) and the
+/// position of the last executed OP_CODESEPARATOR (tapscript). Knots' REDUCED_DATA rule refuses any
+/// annex on mainnet until 2027-09-01 (interpreter.cpp:2149), so a signature over one does not verify
+/// there yet; it is here so a message is never built over a spend it does not describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendExt<'a> {
+    /// The whole annex, its 0x50 tag included (committed as SHA-256 of its compact-size serialization).
+    pub annex: Option<&'a [u8]>,
+    pub codesep_pos: u32,
+}
+
+impl Default for SpendExt<'_> {
+    fn default() -> Self {
+        Self { annex: None, codesep_pos: NO_CODESEP }
+    }
+}
+
 /// Port of Knots `UnifiedSighash` (B1 `tx.unified_sighash`): the 32-byte message a unified
-/// signature on input `index` signs. `script_code` is ignored for taproot key/script paths
-/// (a zero byte is committed instead); `leaf_hash` is required for tapscript.
+/// signature on input `index` signs, for a spend with no annex and no OP_CODESEPARATOR executed
+/// (see [`unified_sighash_ext`]). `script_code` is ignored for taproot key/script paths; `leaf_hash`
+/// is required for tapscript.
+///
+/// Script type 0 (bare and P2SH): `script_code` is the script from the last executed
+/// OP_CODESEPARATOR with every push of this signature already removed (Knots still runs
+/// FindAndDelete there, interpreter.cpp:345-349, and refuses the spend under CONST_SCRIPTCODE if it
+/// found one). Script type 1 (witness v0) takes the script code unaltered.
 pub fn unified_sighash(tx: &Tx, prevouts: &[TxOut], index: usize, script_type: ScriptType, script_code: &[u8],
                        hash_type: u8, leaf_hash: Option<&[u8; 32]>) -> Result<[u8; 32]> {
+    unified_sighash_ext(tx, prevouts, index, script_type, script_code, hash_type, leaf_hash, SpendExt::default())
+}
+
+/// [`unified_sighash`] for a spend with an annex (taproot and tapscript) or an executed
+/// OP_CODESEPARATOR (tapscript). Values the script type does not commit to are refused rather than
+/// ignored.
+#[allow(clippy::too_many_arguments)]
+pub fn unified_sighash_ext(tx: &Tx, prevouts: &[TxOut], index: usize, script_type: ScriptType, script_code: &[u8],
+                           hash_type: u8, leaf_hash: Option<&[u8; 32]>, ext: SpendExt<'_>) -> Result<[u8; 32]> {
     if prevouts.len() != tx.inputs.len() || index >= tx.inputs.len() {
         return Err(Error::Sighash("prevouts/inputs mismatch"));
+    }
+    let is_tr = matches!(script_type, ScriptType::Taproot | ScriptType::Tapscript);
+    if ext.annex.is_some() && !is_tr {
+        return Err(Error::Sighash("only a taproot spend has an annex"));
+    }
+    if ext.annex.is_some_and(|a| a.first() != Some(&ANNEX_TAG)) {
+        return Err(Error::Sighash("an annex starts with 0x50"));
+    }
+    if ext.codesep_pos != NO_CODESEP && script_type != ScriptType::Tapscript {
+        return Err(Error::Sighash("only tapscript commits to a codeseparator position"));
     }
     if hash_type & UNIFIED_FLAG == 0 {
         return Err(Error::Sighash("hash type lacks the 0x20 opt-in bit"));
     }
-    let is_tr = matches!(script_type, ScriptType::Taproot | ScriptType::Tapscript);
     let out_type = hash_type & 0x1F;
     let acp = hash_type & SIGHASH_ANYONECANPAY != 0;
     if is_tr && ((hash_type & !(0x1F | 0x80 | UNIFIED_FLAG)) != 0 || !(1..=3).contains(&out_type)) {
@@ -103,7 +149,15 @@ pub fn unified_sighash(tx: &Tx, prevouts: &[TxOut], index: usize, script_type: S
         m.extend_from_slice(&(index as u32).to_le_bytes());
     }
     if is_tr {
-        m.push(0x00);
+        match ext.annex {
+            Some(a) => {
+                m.push(0x01);
+                let mut s = Vec::with_capacity(a.len() + 9);
+                write_varbytes(&mut s, a);
+                m.extend_from_slice(&sha256(&s));
+            }
+            None => m.push(0x00),
+        }
     } else {
         write_varbytes(&mut m, script_code);
     }
@@ -115,7 +169,7 @@ pub fn unified_sighash(tx: &Tx, prevouts: &[TxOut], index: usize, script_type: S
         let leaf = leaf_hash.ok_or(Error::Sighash("tapscript needs leaf hash"))?;
         m.extend_from_slice(leaf);
         m.push(0x00);
-        m.extend_from_slice(&[0xFF; 4]);
+        m.extend_from_slice(&ext.codesep_pos.to_le_bytes());
     }
     Ok(tagged_hash("UnifiedSighash", &m))
 }

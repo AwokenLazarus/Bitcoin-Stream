@@ -2,11 +2,11 @@
 //! B2's `tests/_electrum_sim.py`).
 //!
 //! [`SimChain`] mines real v2 BLAKE2b headers at the regtest target from block 101 (the checkpoint)
-//! on, with real transactions (txid = hash of the raw bytes), Merkle roots and committed transaction
+//! on, above ten 80-byte v1 headers (91..=100, what the median-time rule needs), with real transactions (txid = hash of the raw bytes), Merkle roots and committed transaction
 //! counts. [`FakeElectrum`] serves it over TCP or TLS with the methods electrs serves (batches and
 //! notifications included) and can hide transactions, forge Merkle proofs, claim wrong heights,
 //! substitute transactions, invent mempool spends, serve another header chain, withhold blocks, lie
-//! about fees, or go down. [`TlsProxy`] puts TLS in front of any TCP Electrum server.
+//! about fees, claim an absurd tip, serve junk headers, answer slowly, or go down. [`TlsProxy`] puts TLS in front of any TCP Electrum server.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -18,7 +18,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{json, Value};
 use xbt_primitives::hash::{display_hex, hex32, sha256};
-use xbt_primitives::header::{self, merkle_root, parse_header, ChainRules, V2_FLAG};
+use xbt_primitives::header::{self, merkle_root, parse_header, v1_hash, ChainRules, PRIOR_HEADERS, V2_FLAG};
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 
 use crate::backend::scripthash;
@@ -65,6 +65,33 @@ pub fn mine_header(prev_display: [u8; 32], merkle_internal: [u8; 32], height: u3
     unreachable!()
 }
 
+/// An 80-byte v1 header (below the BLAKE2b switch nothing but its link and time is checked).
+pub fn v1_header(prev_display: [u8; 32], merkle_internal: [u8; 32], time: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(80);
+    b.extend(0x2000_0000u32.to_le_bytes());
+    let mut prev = prev_display;
+    prev.reverse();
+    b.extend(prev);
+    b.extend(merkle_internal);
+    b.extend(time.to_le_bytes());
+    b.extend(REGTEST_BITS.to_le_bytes());
+    b.extend(0u32.to_le_bytes());
+    b
+}
+
+/// A well-formed v2 header at `height` that links to nothing we have.
+pub fn junk_header(height: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 164];
+    b[..4].copy_from_slice(&(0x2000_0000u32 | V2_FLAG).to_le_bytes());
+    b[4..36].copy_from_slice(&[0xEE; 32]);
+    b[36..40].copy_from_slice(&height.to_le_bytes());
+    b[68..72].copy_from_slice(&(T0 + 60 * height).to_le_bytes());
+    b[72..76].copy_from_slice(&REGTEST_BITS.to_le_bytes());
+    b[108..110].copy_from_slice(&1u16.to_le_bytes());
+    b[128..132].copy_from_slice(&height.to_le_bytes());
+    b
+}
+
 /// Electrum's Merkle branch (display hex) for `txids[pos]` (txids in internal order).
 pub fn merkle_branch(txids: &[[u8; 32]], pos: usize) -> Vec<String> {
     let mut level = txids.to_vec();
@@ -94,8 +121,11 @@ pub fn coinbase(height: u32, salt: u8) -> Tx {
 }
 
 /// A chain from the checkpoint up: headers, blocks, transactions, a mempool.
+#[derive(Clone)]
 pub struct SimChain {
     pub salt: u8,
+    /// The v1 headers below the checkpoint (oldest first, the last one is the checkpoint's parent).
+    pub prior: Vec<Vec<u8>>,
     /// Raw headers, `headers[0]` at [`CHECKPOINT`].
     pub headers: Vec<Vec<u8>>,
     /// txids (display) per block, same indexing.
@@ -111,9 +141,16 @@ pub struct SimChain {
 impl SimChain {
     /// A chain up to `height` (>= 101).
     pub fn new(height: u32, salt: u8) -> Self {
-        let mut c = Self { salt, headers: vec![], blocks: vec![], txs: HashMap::new(), height_of: HashMap::new(),
+        let mut prior: Vec<Vec<u8>> = Vec::new();
+        let mut prev = [0xAB; 32];
+        for h in CHECKPOINT - PRIOR_HEADERS..CHECKPOINT {
+            let raw = v1_header(prev, [salt; 32], T0 + 60 * h);
+            prev = v1_hash(&raw).expect("80 bytes");
+            prior.push(raw);
+        }
+        let mut c = Self { salt, prior, headers: vec![], blocks: vec![], txs: HashMap::new(), height_of: HashMap::new(),
                            mempool: vec![], version: 0, faucet_n: 0 };
-        c.mine_one([0xAB; 32]);
+        c.mine_one(prev);
         c.mine(height - CHECKPOINT);
         c
     }
@@ -124,6 +161,11 @@ impl SimChain {
 
     pub fn header(&self, height: u32) -> Option<&Vec<u8>> {
         height.checked_sub(CHECKPOINT).and_then(|i| self.headers.get(i as usize))
+    }
+
+    /// A header below the checkpoint.
+    pub fn prior_header(&self, height: u32) -> Option<&Vec<u8>> {
+        height.checked_sub(CHECKPOINT - PRIOR_HEADERS).and_then(|i| self.prior.get(i as usize)).filter(|_| height < CHECKPOINT)
     }
 
     pub fn hash_at(&self, height: u32) -> [u8; 32] {
@@ -283,6 +325,12 @@ pub struct Knobs {
     pub refuse_broadcast: Option<String>,
     /// Stop answering requests (connection stays open: the client times out).
     pub mute: bool,
+    /// `headers.subscribe` answers with this header (and the height it commits) instead of the tip.
+    pub fake_tip: Option<Vec<u8>>,
+    /// Serve [`junk_header`]s above this height, as many as asked for.
+    pub junk_above: Option<u32>,
+    /// Sleep this long before answering each `blockchain.block.headers`.
+    pub delay_headers_ms: u64,
 }
 
 enum SLink {
@@ -532,6 +580,11 @@ impl FakeElectrum {
             "server.version" => Ok(json!(["FakeElectrum 0.1", "1.8"])),
             "server.ping" => Ok(Value::Null),
             "blockchain.headers.subscribe" => {
+                if let Some(raw) = self.knobs().fake_tip.clone() {
+                    let h = parse_header(&raw).map_err(|e| e.to_string())?.height;
+                    *tip_sub = Some(h);
+                    return Ok(json!({"height": h, "hex": hex::encode(raw)}));
+                }
                 let (h, hex) = self.tip();
                 *tip_sub = Some(h);
                 Ok(json!({"height": h, "hex": hex}))
@@ -541,21 +594,38 @@ impl FakeElectrum {
                 if self.knobs().refuse_headers_above.map(|r| h > r).unwrap_or(false) {
                     return Err("header unavailable".into());
                 }
+                if self.knobs().junk_above.map(|j| h > j).unwrap_or(false) {
+                    return Ok(json!(hex::encode(junk_header(h))));
+                }
                 let hs = self.headers_view();
-                h.checked_sub(CHECKPOINT).and_then(|i| hs.get(i as usize)).map(|r| json!(hex::encode(r)))
-                    .ok_or_else(|| format!("height {h} not found"))
+                h.checked_sub(CHECKPOINT).and_then(|i| hs.get(i as usize)).cloned()
+                    .or_else(|| lock(&self.chain).prior_header(h).cloned())
+                    .map(|r| json!(hex::encode(r))).ok_or_else(|| format!("height {h} not found"))
             }
             "blockchain.block.headers" => {
                 let (start, count) = (u(0), u(1).min(2016));
                 let hs = self.headers_view();
-                let refuse = self.knobs().refuse_headers_above;
+                let (refuse, junk, delay) = { let k = self.knobs(); (k.refuse_headers_above, k.junk_above, k.delay_headers_ms) };
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+                let prior = lock(&self.chain).prior.clone();
                 let mut blob = vec![];
                 let mut n = 0;
-                for h in start..start + count {
+                for h in start..start.saturating_add(count) {
                     if refuse.map(|r| h > r).unwrap_or(false) {
                         break;
                     }
-                    match h.checked_sub(CHECKPOINT).and_then(|i| hs.get(i as usize)) {
+                    if junk.map(|j| h > j).unwrap_or(false) {
+                        blob.extend_from_slice(&junk_header(h));
+                        n += 1;
+                        continue;
+                    }
+                    let r = match h.checked_sub(CHECKPOINT) {
+                        Some(i) => hs.get(i as usize),
+                        None => h.checked_sub(CHECKPOINT - PRIOR_HEADERS).and_then(|i| prior.get(i as usize)),
+                    };
+                    match r {
                         Some(r) => {
                             blob.extend_from_slice(r);
                             n += 1;
@@ -640,14 +710,9 @@ impl TlsProxy {
                     let _ = up_r.set_read_timeout(Some(Duration::from_millis(10)));
                     let mut up_w = up;
                     let (mut b1, mut b2) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
-                    loop {
-                        match link.recv(&mut b1) {
-                            Ok(Some(d)) => {
-                                if !d.is_empty() && up_w.write_all(&d).is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Some(d)) = link.recv(&mut b1) {
+                        if !d.is_empty() && up_w.write_all(&d).is_err() {
+                            break;
                         }
                         match up_r.read(&mut b2) {
                             Ok(0) => break,

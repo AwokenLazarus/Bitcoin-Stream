@@ -1,4 +1,11 @@
 //! Chains, their bech32 prefixes, and the CAIP-2 network id xbt402 uses.
+//!
+//! CAIP-2 `bip122` names a chain by the first 32 hex characters of its genesis block hash. XBT's id
+//! is keyed to block 961640 instead, the first BLAKE2b block. XBT shares genesis and everything up
+//! to 961631 with Bitcoin, and 961632..=961639 (still SHA-256d) with the BIP-110 chain that stayed
+//! on SHA-256d, so a genesis-keyed id would be Bitcoin's own (`bip122:000000000019d6689c085ae165831e93`)
+//! and a payment requirement could not say which chain it means. 961640 is the first block only XBT
+//! has; it is also the light client's default trust anchor.
 use crate::error::{Error, Result};
 
 /// The first BLAKE2b block on XBT mainnet: the anchor of the mainnet network id.

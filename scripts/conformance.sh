@@ -10,7 +10,7 @@
 # Runs under the soak rules (CPUQuota 200%, 4G, nice 19). Env: XBT402_B1, XBT402_B2.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-068}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 export XBT402_B1=$B1
 B2=${XBT402_B2:-$HOME/xbt-rnd/b2}
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)

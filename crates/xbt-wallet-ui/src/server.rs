@@ -1,7 +1,7 @@
-//! The HTTP server: tiny_http on a few threads, requests reduced to [`Req`], answers as [`Resp`]
-//! with the security headers on every response.
+//! The HTTP server: [`xbt_svc::http`] (header caps, read deadlines, a connection limit) with a few
+//! handlers at once, requests reduced to [`Req`], answers as [`Resp`] with the security headers on every
+//! response the app makes.
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::Arc;
 
 use crate::app::App;
@@ -125,57 +125,39 @@ pub fn security_headers(r: &mut Resp) {
     }
 }
 
-fn serve_one(app: &App, mut rq: tiny_http::Request) {
-    let peer = rq.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    let url = rq.url().to_string();
-    let (raw_path, q) = url.split_once('?').unwrap_or((&url, ""));
-    let mut headers = HashMap::new();
-    for h in rq.headers() {
-        headers.insert(h.field.as_str().as_str().to_ascii_lowercase(), h.value.as_str().to_string());
+struct Ui(Arc<App>);
+
+impl xbt_svc::http::Handler for Ui {
+    fn body_limit(&self, _method: &str, _target: &str) -> usize {
+        MAX_BODY
     }
-    let mut body = Vec::new();
-    let too_big = rq.body_length().is_some_and(|n| n > MAX_BODY) || {
-        let _ = rq.as_reader().take(MAX_BODY as u64 + 1).read_to_end(&mut body);
-        body.len() > MAX_BODY
-    };
-    let mut resp = if too_big {
-        Resp::text(413, "text/plain", "request too large")
-    } else {
-        let req = Req { method: rq.method().as_str().to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body, peer };
-        app.handle(req)
-    };
-    security_headers(&mut resp);
-    let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);
-    for (k, v) in resp.headers {
-        if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-            out.add_header(h);
-        }
+
+    fn handle(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
+        let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
+        let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+        let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: rq.body, peer };
+        let mut resp = self.0.handle(req);
+        security_headers(&mut resp);
+        xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
-    let _ = rq.respond(out);
 }
 
-/// A running server (tests); stops when dropped.
+/// A running server; stops when dropped.
 pub struct Running {
     pub addr: std::net::SocketAddr,
-    server: Arc<tiny_http::Server>,
+    stop: xbt_svc::http::Stop,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.server.unblock();
+        self.stop.stop();
     }
 }
 
 pub fn spawn(app: Arc<App>) -> Result<Running, String> {
-    let server = Arc::new(tiny_http::Server::http(&app.cfg.bind).map_err(|e| format!("bind {}: {e}", app.cfg.bind))?);
-    let addr = server.server_addr().to_ip().ok_or("not an IP listener")?;
-    for _ in 0..app.cfg.threads.max(1) {
-        let (s, a) = (server.clone(), app.clone());
-        std::thread::spawn(move || {
-            while let Ok(rq) = s.recv() {
-                serve_one(&a, rq);
-            }
-        });
-    }
-    Ok(Running { addr, server })
+    let listener = std::net::TcpListener::bind(&app.cfg.bind).map_err(|e| format!("bind {}: {e}", app.cfg.bind))?;
+    let threads = app.cfg.threads;
+    let run = xbt_svc::http::serve(Arc::new(Ui(app)), listener, threads).map_err(|e| format!("serve: {e}"))?;
+    Ok(Running { addr: run.addr, stop: run.stopper() })
 }

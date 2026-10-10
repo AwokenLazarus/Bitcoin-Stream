@@ -20,7 +20,9 @@
 //! node's anchor block), `XBT_HUB_BIND`, `XBT_HUB_PORT`, `XBT_HUB_DATADIR`, `XBT_HUB_CONNECT` (comma
 //! separated), `XBT_HUB_JSON` (HubConfig fields), `XBT_HUB_WATCH_INTERVAL`, `XBT_HUB_THREADS`). Node
 //! credentials: `node.cookie`, else the secret `node-rpc-auth` (`user:password`). The payTo key:
-//! `pay_to_key_file`, else the secret `hub-payto-key` (generated 0600 on first run). Behind a proxy:
+//! `pay_to_key_file`, else the secret `hub-payto-key` (generated 0600 on first run). The key that
+//! seals the ch2 keys in the state file (AGP-073): `wrap_key_file`, else the secret `hub-wrap-key`
+//! (generated likewise), else `<datadir>/hub-wrap-key`. Behind a proxy:
 //! `XBT_BASE_PATH`, `XBT_PUBLIC_URL` (the 402's `resource.url` base), `XBT_TRUST_FORWARDED=1`
 //! (`X-Forwarded-Proto/Host/Prefix`). `GET /healthz`: the process; `GET /readyz`: the node reachable
 //! and synced. AGP-042: `/readyz` also reports the node wallet named `hub` (created and loaded on
@@ -34,6 +36,7 @@ use serde_json::{json, Value};
 use xbt402::adaptor::Sc;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
 use xbt402::hub::{HubConfig, RouteHub};
+use xbt402::hub_keys::{WrapKey, WRAP_KEY_FILE};
 use xbt402::provider::HttpResponse;
 use xbt402::rpc::Rpc;
 use xbt_svc::{env, env_bool, health, probe, proxy, DataDir, Mode, Secrets};
@@ -98,7 +101,7 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
         let defaults = [("bind", json!("0.0.0.0")), ("port", json!(9480)),
                         ("datadir", json!(d.component(xbt_svc::HUB).join("state").to_string_lossy()))];
         for (k, v) in defaults {
-            if conf.get(k).map_or(true, Value::is_null) {
+            if conf.get(k).is_none_or(Value::is_null) {
                 conf[k] = v;
             }
         }
@@ -110,6 +113,30 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
 /// `XBT_HUB_THREADS` is read with `as_u64`); anything else numeric is a float (`XBT_HUB_WATCH_INTERVAL=0.5`).
 fn env_number(v: &str) -> Option<Value> {
     v.parse::<u64>().map(Value::from).ok().or_else(|| v.parse::<f64>().ok().filter(|f| f.is_finite()).map(Value::from))
+}
+
+/// The key that seals the ch2 keys in `ch2.json` (AGP-073 K1): `wrap_key_file`, else the secret
+/// `hub-wrap-key` (generated 0600 on first run in a container), else `<datadir>/hub-wrap-key`.
+fn wrap_key(conf: &Value, secrets: &Secrets, container: bool, datadir: &std::path::Path) -> WrapKey {
+    if let Some(f) = conf.get("wrap_key_file").and_then(Value::as_str) {
+        return WrapKey::load_or_create(&expand(f)).unwrap_or_else(|e| die(format!("wrap_key_file: {e}")));
+    }
+    let found = if container || env("XBT_SECRETS_DIR").is_some() {
+        Some(secrets.get_or_create(WRAP_KEY_FILE, || xbt_svc::to_hex(&xbt_svc::random_bytes(32)).into_bytes()).unwrap_or_else(|e| die(e)))
+    } else {
+        secrets.get(WRAP_KEY_FILE).unwrap_or_else(|e| die(e))
+    };
+    match found {
+        Some(s) => {
+            eprintln!("xbt402-hub: ch2 wrap key from {}", s.origin);
+            WrapKey::parse(&s.bytes).unwrap_or_else(|e| die(format!("{WRAP_KEY_FILE}: {e}")))
+        }
+        None => {
+            let p = datadir.join(WRAP_KEY_FILE);
+            eprintln!("xbt402-hub: ch2 wrap key {} (beside the state it seals: set wrap_key_file to keep it apart)", p.display());
+            WrapKey::load_or_create(&p).unwrap_or_else(|e| die(format!("{e}")))
+        }
+    }
 }
 
 fn bind_addr(conf: &Value) -> String {
@@ -302,8 +329,10 @@ fn main() {
     if let Some(a) = &receive_address {
         eprintln!("xbt402-hub: fund the hub wallet '{wallet_name}' at {a}");
     }
+    let wrap = wrap_key(&conf, &secrets, data.is_some(), &datadir);
     let rpc = Arc::new(rpc);
-    let hub = RouteHub::new(rpc.clone(), rpc.clone(), Box::new(wallet.clone()), Box::new(UreqTransport::default()), secret, &network, Some(&datadir), cfg)
+    let hub = RouteHub::new_with_wrap_key(rpc.clone(), rpc.clone(), Box::new(wallet.clone()), Box::new(UreqTransport::default()), secret, &network,
+                                          Some(&datadir), cfg, Some(wrap))
         .unwrap_or_else(|e| die(format!("{e}")));
     // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037); bech32, whatever the
     // wallet's default address type (a legacy default made every refund fail, AGP-044)

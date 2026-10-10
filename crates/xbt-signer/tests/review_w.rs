@@ -1,4 +1,4 @@
-//! AGP-063 (Guida W): the seller does not decide the budget (W1), minCapacity cannot raise the cap
+//! AGP-063 (review W): the seller does not decide the budget (W1), minCapacity cannot raise the cap
 //! (W2), a process on the agent socket cannot send coins anywhere but the seller's verified terms
 //! nor refuse or rotate for the human (W3), nor enrol its own approval key (W4); the library payer
 //! never signs below its watermark.

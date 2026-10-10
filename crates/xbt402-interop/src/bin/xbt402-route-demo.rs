@@ -1,5 +1,5 @@
 //! The AGP-021 demo scenarios, all Rust, on regtest (a port of B1 `scripts/demo_route.py`; run by
-//! `scripts/route_interop.sh`). Real HTTP (tiny_http + ureq) between every party.
+//! `scripts/route_interop.sh`). Real HTTP (xbt-svc's server + ureq) between every party.
 //!
 //! 1 client (LocalSigner), 1 hub, 4 providers: operator 1 runs A and B under ONE payTo key (two
 //! provider processes: each its own ledger, origin and sessions), C and D are separate operators. The

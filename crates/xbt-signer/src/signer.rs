@@ -235,7 +235,8 @@ pub struct Signer {
     pub ln_error: Option<String>,
     pub ln_book: LnBook,
     /// AGP-049: channel funding verdicts from our own node, per funding outpoint (final ones only).
-    pub(crate) ln_funding: Mutex<HashMap<String, crate::ln_funding::Funding>>,
+    /// Funding verdicts by funding, with the hash of the block each was reached on (AGP-066).
+    pub(crate) ln_funding: Mutex<HashMap<String, (String, crate::ln_funding::Funding)>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
 }
@@ -811,7 +812,8 @@ impl Signer {
         }
         // AGP-048: a Lightning payment a crash or a timeout left in flight (AGP-049: or one released as
         // never sent, which the node may still record late)
-        if self.ln.is_some() && (!self.ln_book.in_flight().is_empty() || !self.ln_book.watched(self.engine.now()).is_empty()) {
+        if self.ln.is_some() && (!self.ln_book.in_flight().is_empty() || !self.ln_book.watched(self.engine.now(), self.height_safe()).is_empty()
+                                 || self.ln_book.halted().is_some()) {
             let _g = self.lock();
             let _c = sigaudit::context(Some("watcher"), Some("watcher:ln_reconcile"));
             for r in self.ln_reconcile_locked() {
@@ -1444,6 +1446,9 @@ impl Signer {
             self.engine.audit.append(json!({"type": "decision", "verdict": "deny", "rule": "approval_bind",
                                             "reason": "signature fields do not match pending approval", "dest": dest, "amount_sats": amount, "ts": ts_value(now)}));
             return Ok(deny("approval_bind", "signature fields do not match the pending approval"));
+        }
+        if payload.get("kind").and_then(Value::as_str) == Some("ln_resume") {
+            return self.ln_resume(&token, &payload);
         }
         if matches!(payload.get("kind").and_then(Value::as_str), Some("xbt402") | Some("ln")) {
             return self.grant_xbt402(&token, &payload);

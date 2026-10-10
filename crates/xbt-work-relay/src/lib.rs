@@ -18,7 +18,7 @@
 //! (`<dir>/<lookup[..2]>/<lookup>`, 0600), which survives a restart and needs no in-memory index.
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -477,24 +477,36 @@ impl Relay {
     }
 }
 
-fn respond(req: tiny_http::Request, r: Resp, head: bool) {
-    let len = r.body.len();
-    let mut resp = tiny_http::Response::from_data(if head { vec![] } else { r.body }).with_status_code(r.status);
-    for (k, v) in [("Content-Type", r.content_type), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")] {
-        if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-            resp.add_header(h);
-        }
+impl From<Resp> for xbt_svc::http::Response {
+    fn from(r: Resp) -> Self {
+        let headers = [("Content-Type", r.content_type), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")];
+        Self::new(r.status, headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), r.body)
     }
-    if head {
-        if let Ok(h) = tiny_http::Header::from_bytes(&b"Content-Length"[..], len.to_string().as_bytes()) {
-            resp.add_header(h);
-        }
-    }
-    let _ = req.respond(resp);
 }
 
-fn headers_of(req: &tiny_http::Request) -> Vec<(String, String)> {
-    req.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect()
+/// The read-only listener. A body is read only up to a blob, so a misdirected push still gets its 405.
+struct Public(Arc<Relay>);
+
+impl xbt_svc::http::Handler for Public {
+    fn body_limit(&self, _method: &str, _target: &str) -> usize {
+        BLOB_LEN
+    }
+
+    fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        self.0.public(&req.method, &req.target, &req.headers, req.peer.map(|a| a.ip())).into()
+    }
+}
+
+struct Push(Arc<Relay>);
+
+impl xbt_svc::http::Handler for Push {
+    fn body_limit(&self, _method: &str, _target: &str) -> usize {
+        BLOB_LEN
+    }
+
+    fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        self.0.push(&req.method, &req.target, &req.headers, &req.body).into()
+    }
 }
 
 /// The running listeners.
@@ -504,54 +516,20 @@ pub struct Running {
     pub threads: Vec<JoinHandle<()>>,
 }
 
-fn bound(s: &tiny_http::Server) -> io::Result<SocketAddr> {
-    s.server_addr().to_ip().ok_or_else(|| io::Error::other("not an IP listener"))
+fn listen(addr: &str) -> io::Result<TcpListener> {
+    TcpListener::bind(addr).map_err(|e| io::Error::new(e.kind(), format!("{addr}: {e}")))
 }
 
-/// Serve `relay` on `public` (GET) and, unless None, `push` (PUT/POST/DELETE), `threads` workers
-/// each; also sweeps expired entries every `sweep` (when the store has a TTL).
+/// Serve `relay` on `public` (GET) and, unless None, `push` (PUT/POST/DELETE), on
+/// [`xbt_svc::http`] with `threads` handlers at once (at most 4 for pushes); also sweeps expired entries
+/// every `sweep` (when the store has a TTL).
 pub fn serve(relay: Arc<Relay>, public: &str, push: Option<&str>, threads: usize, sweep: Duration) -> io::Result<Running> {
-    let ps = Arc::new(tiny_http::Server::http(public).map_err(|e| io::Error::other(format!("{public}: {e}")))?);
-    let mut out = Running { public: bound(&ps)?, push: None, threads: vec![] };
-    for _ in 0..threads.max(1) {
-        let (s, r) = (ps.clone(), relay.clone());
-        out.threads.push(std::thread::spawn(move || {
-            for req in s.incoming_requests() {
-                let headers = headers_of(&req);
-                let method = req.method().to_string();
-                let resp = r.public(&method, req.url(), &headers, req.remote_addr().map(|a| a.ip()));
-                respond(req, resp, method == "HEAD");
-            }
-        }));
-    }
+    let p = xbt_svc::http::serve(Arc::new(Public(relay.clone())), listen(public)?, threads.max(1))?;
+    let mut out = Running { public: p.addr, push: None, threads: p.threads };
     if let Some(addr) = push {
-        let qs = Arc::new(tiny_http::Server::http(addr).map_err(|e| io::Error::other(format!("{addr}: {e}")))?);
-        out.push = Some(bound(&qs)?);
-        for _ in 0..threads.clamp(1, 4) {
-            let (s, r) = (qs.clone(), relay.clone());
-            out.threads.push(std::thread::spawn(move || {
-                for mut req in s.incoming_requests() {
-                    let headers = headers_of(&req);
-                    let method = req.method().to_string();
-                    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Transfer-Encoding")) {
-                        respond(req, Resp::text(501, "transfer-encoding not supported\n"), false);
-                        continue;
-                    }
-                    if req.body_length().unwrap_or(0) > BLOB_LEN {
-                        respond(req, Resp::text(413, "bad length\n"), false);
-                        continue;
-                    }
-                    let mut body = Vec::with_capacity(BLOB_LEN);
-                    if req.as_reader().take(BLOB_LEN as u64 + 1).read_to_end(&mut body).is_err() {
-                        respond(req, Resp::text(400, "bad body\n"), false);
-                        continue;
-                    }
-                    let url = req.url().to_string();
-                    let resp = r.push(&method, &url, &headers, &body);
-                    respond(req, resp, false);
-                }
-            }));
-        }
+        let q = xbt_svc::http::serve(Arc::new(Push(relay.clone())), listen(addr)?, threads.clamp(1, 4))?;
+        out.push = Some(q.addr);
+        out.threads.extend(q.threads);
     }
     if relay.store.ttl_secs > 0 {
         let r = relay.clone();

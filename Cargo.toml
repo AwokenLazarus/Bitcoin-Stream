@@ -5,7 +5,8 @@ members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop", "c
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+# 1.89: std `File::try_lock`, the ledger file lock (AGP-067)
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -22,7 +23,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 base64 = "0.22"
 ureq = "2.12"
-tiny_http = "0.12"
 xbt-primitives = { path = "crates/xbt-primitives" }
 xbt402 = { path = "crates/xbt402" }
 xbt-signer = { path = "crates/xbt-signer" }

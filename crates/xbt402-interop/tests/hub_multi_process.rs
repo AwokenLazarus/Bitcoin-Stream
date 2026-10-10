@@ -11,7 +11,7 @@
 //!     lock; the hub now waits for `settle_lock_multiple` × the largest lock, and the provider's
 //!     zero-conf cap follows;
 //!   4 the refusal detail reaches the client.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use xbt402::route::*;
 use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::LocalSigner;
+use xbt402_interop::crash_copy;
 use xbt402_interop::memnet::{ChainWallet, LagChain, MemChain, MemNet, NetTransport};
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
@@ -98,13 +99,13 @@ fn hub_cfg(extra: &Value) -> HubConfig {
     HubConfig::from_json(&c).unwrap()
 }
 
-fn new_hub(w_chain: &Arc<MemChain>, view: &Arc<LagChain>, lagging: bool, net: &Arc<MemNet>, dir: &TempDir, extra: &Value) -> Arc<RouteHub> {
+fn new_hub(w_chain: &Arc<MemChain>, view: &Arc<LagChain>, lagging: bool, net: &Arc<MemNet>, dir: &Path, extra: &Value) -> Arc<RouteHub> {
     let wallet = Box::new(ChainWallet(w_chain.clone()));
     let http = Box::new(NetTransport(net.clone()));
     let h = if lagging {
-        RouteHub::new(view.clone(), view.clone(), wallet, http, sk(0x4B4B), NET, Some(&dir.0.join("hub")), hub_cfg(extra))
+        RouteHub::new(view.clone(), view.clone(), wallet, http, sk(0x4B4B), NET, Some(dir), hub_cfg(extra))
     } else {
-        RouteHub::new(w_chain.clone(), w_chain.clone(), wallet, http, sk(0x4B4B), NET, Some(&dir.0.join("hub")), hub_cfg(extra))
+        RouteHub::new(w_chain.clone(), w_chain.clone(), wallet, http, sk(0x4B4B), NET, Some(dir), hub_cfg(extra))
     };
     Arc::new(h.unwrap())
 }
@@ -112,7 +113,7 @@ fn new_hub(w_chain: &Arc<MemChain>, view: &Arc<LagChain>, lagging: bool, net: &A
 fn world(n: usize, kw: Kw) -> W {
     let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
     let view = LagChain::new(chain.clone());
-    let hub = new_hub(&chain, &view, kw.lagging, &net, &dir, &kw.hub);
+    let hub = new_hub(&chain, &view, kw.lagging, &net, &dir.0.join("hub"), &kw.hub);
     net.add(HUB, hub.clone());
     let origins: Vec<String> = (0..n).map(|i| format!("http://m{i}.test")).collect();
     let mut provs = vec![];
@@ -345,7 +346,8 @@ fn the_liquidity_cap_counts_every_process() {
 #[test]
 fn the_book_survives_a_restart_per_origin() {
     let w = world(2, Kw::default());
-    let h2 = new_hub(&w.chain, &w.view, false, &w.net, &w.dir, &json!({}));
+    crash_copy(&w.dir.0.join("hub"), &w.dir.0.join("hub-restarted")).unwrap();
+    let h2 = new_hub(&w.chain, &w.view, false, &w.net, &w.dir.0.join("hub-restarted"), &json!({}));
     assert_eq!(h2.routing_extra().unwrap()["providers"], json!(w.origins));
     assert_eq!(h2.connect(&w.origins[1], None, None).unwrap().origin, w.origins[1]);
     assert_eq!(h2.connect(&w.origins[0], None, None).unwrap().origin, w.origins[0]);

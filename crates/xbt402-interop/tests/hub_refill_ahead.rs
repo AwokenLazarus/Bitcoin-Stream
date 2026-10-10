@@ -28,6 +28,7 @@ use xbt402::route::*;
 use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::LocalSigner;
+use xbt402_interop::crash_copy;
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
@@ -201,9 +202,9 @@ struct W {
     dir: TempDir,
 }
 
-fn new_hub(node: &Arc<Node>, purse: &Arc<Purse>, net: &Arc<MemNet>, dir: &TempDir, extra: &Value) -> Arc<RouteHub> {
+fn new_hub(node: &Arc<Node>, purse: &Arc<Purse>, net: &Arc<MemNet>, dir: &std::path::Path, extra: &Value) -> Arc<RouteHub> {
     Arc::new(RouteHub::new(node.clone(), node.clone(), Box::new(PurseRef(purse.clone())), Box::new(NetTransport(net.clone())), sk(0x4B4B), NET,
-                           Some(&dir.0.join("hub")), hub_cfg(extra)).unwrap())
+                           Some(dir), hub_cfg(extra)).unwrap())
 }
 
 fn world(kw: Kw) -> W {
@@ -211,7 +212,7 @@ fn world(kw: Kw) -> W {
     let node = Arc::new(Node { chain: chain.clone(), down: AtomicBool::new(false), race: AtomicBool::new(false) });
     let pnode = Arc::new(Node { chain: chain.clone(), down: AtomicBool::new(false), race: AtomicBool::new(false) });
     let purse = Arc::new(Purse { chain: chain.clone(), funded: Mutex::new(vec![]), mode: AtomicU8::new(0) });
-    let hub = new_hub(&node, &purse, &net, &dir, &kw.hub);
+    let hub = new_hub(&node, &purse, &net, &dir.0.join("hub"), &kw.hub);
     net.add(HUB, hub.clone());
     let mut cfg = ProviderConfig::new(NET);
     cfg.close_margin = 36;
@@ -751,7 +752,8 @@ fn the_book_keeps_the_next_ch2_over_a_restart() {
     w.block();
     w.block();
     let nxt = w.nxt().unwrap();
-    let h2 = new_hub(&w.node, &w.purse, &w.net, &w.dir, &ahead(json!({})));
+    crash_copy(&w.dir.0.join("hub"), &w.dir.0.join("hub-restarted")).unwrap();
+    let h2 = new_hub(&w.node, &w.purse, &w.net, &w.dir.0.join("hub-restarted"), &ahead(json!({})));
     let got: Vec<(String, String, String)> = h2.next_channels().iter().map(|(k, c)| (k.clone(), c.state.clone(), c.params.channel_id())).collect();
     assert_eq!(got, vec![(O.to_string(), "open".to_string(), nxt.params.channel_id())]);
     assert_eq!((h2.committed_sat(), h2.watch_tick()), (2 * CAP, vec![]));

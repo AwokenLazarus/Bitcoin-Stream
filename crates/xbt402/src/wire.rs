@@ -62,7 +62,7 @@ pub fn unb64json(s: &str) -> Result<Value> {
 }
 
 /// The v1 binding `sha256(method | target | body)` hex. Its fields run together and it binds no
-/// origin (Guida T2); xbt402 uses [`request_digest_v2`]. Only the xbt-work scheme still binds requests
+/// origin (review T2); xbt402 uses [`request_digest_v2`]. Only the xbt-work scheme still binds requests
 /// with it, because its published vectors (XBT-053) do.
 pub fn request_digest_v1(method: &str, target: &str, body: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -135,7 +135,7 @@ fn tagged(tag: &str) -> Sha256 {
     h
 }
 
-/// Which request a payment or receipt is for (AGP-068, Guida T2): hex of
+/// Which request a payment or receipt is for (AGP-068, review T2): hex of
 /// `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`,
 /// `f(x) = LE64(len(x)) ‖ x`, the URL split by [`request_url`]. `url` is the absolute URL the payer
 /// sent the request to; the server rebuilds it from its public scheme, the `Host` header and the
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn no_two_requests_share_a_v2_digest() {
-        // Chris's pair, and the same request at another scheme, host or port
+        // the reviewer's pair, and the same request at another scheme, host or port
         assert_ne!(request_digest_v2("GET", "/q?a|b", b""), request_digest_v2("GET", "/q?a", b"b|"));
         assert_eq!(request_digest_v1("GET", "/q?a|b", b""), request_digest_v1("GET", "/q?a", b"b|"), "the v1 collision");
         let base = request_digest_v2("GET", "https://api.example/v1/q", b"");

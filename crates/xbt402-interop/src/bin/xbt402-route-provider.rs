@@ -1,8 +1,13 @@
 //! A Rust provider selling a routed path on a regtest node, for route_interop.sh.
 //!
-//! xbt402-route-provider --port P --rpc-port R --cookie PATH --secret HEX --amsat N
+//! xbt402-route-provider --port P --rpc-port R --cookie PATH --amsat N [--secret HEX]
 //!                       [--window 1.0] [--lock-wait 3.0] [--ttl 8.0] [--settle-multiple 20] [--ledger FILE]
 //!                       [--zero-conf-max SAT] [--watch-secs 5] [--route-wal FILE] [--settle-lock-multiple 4]
+//!                       [--data-dir DIR]
+//! `--data-dir` (AGP-075, as AGP-067 C4 for xbt402-rust-provider): the payTo key (`DIR/payto.key`,
+//! or `--secret HEX`) and the ledger (`DIR/channels.jsonl`, or `--ledger FILE`) persist in it
+//! (default `./xbt402-route-provider-data`); the ledger is locked to one process, so two providers
+//! need two data dirs.
 //! `--zero-conf-max` (AGP-053): the cap on an unconfirmed rollover child (0: never; default: 2 ×
 //! settleMultiple × closeFee). `--route-wal` (AGP-054): the provider's RouteWal (each call's meter
 //! durable before its ROUTE-STATE leaves, written ahead while the handler runs). `--settle-lock-multiple`
@@ -15,7 +20,7 @@ use serde_json::json;
 use xbt402::adaptor::Sc;
 use xbt402::funding::FundingPolicy;
 use xbt402::ledger::Ledger;
-use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
+use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig};
 use xbt402::route_seller::RouteOffer;
 use xbt402::rpc::Rpc;
 use xbt_primitives::network::network_id;
@@ -41,11 +46,13 @@ fn main() {
     cfg.height_ttl = Duration::from_millis(500);
     cfg.settle_lock_multiple = f("--settle-lock-multiple", cfg.settle_lock_multiple as f64) as u64;
     cfg.route_wal = arg("--route-wal").map(std::path::PathBuf::from);
-    let ledger = match arg("--ledger") {
-        Some(p) => Ledger::open(std::path::Path::new(&p)).expect("ledger"),
-        None => Ledger::in_memory(),
+    let data = std::path::PathBuf::from(arg("--data-dir").unwrap_or_else(|| "xbt402-route-provider-data".into()));
+    let ledger = Ledger::open(&arg("--ledger").map(std::path::PathBuf::from).unwrap_or_else(|| data.join("channels.jsonl")))
+        .unwrap_or_else(|e| panic!("ledger: {e}"));
+    let secret = match arg("--secret") {
+        Some(h) => Sc::from_hex_mod_n(&h).and_then(|s| s.secret()).expect("secret"),
+        None => load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| panic!("payTo key: {e}")),
     };
-    let secret = Sc::from_hex_mod_n(&arg("--secret").expect("--secret")).and_then(|s| s.secret()).expect("secret");
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let s2 = served.clone();
     let prov = Provider::new(Arc::new(rpc), secret, cfg, ledger, Box::new(|_, _| 1000), Box::new(move |_, _, _| {

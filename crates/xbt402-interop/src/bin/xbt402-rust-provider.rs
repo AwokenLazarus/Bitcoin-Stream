@@ -4,6 +4,11 @@
 //! xbt402-rust-provider --port P --rpc-port R --cookie PATH [--close-fee-payer payer|payee]
 //!                      [--conditional PATH:PRICE:PLAINTEXT] [--ledger FILE] [--price SAT]
 //!                      [--bind ADDR] [--rpc-host HOST]   (default 127.0.0.1; the container test, AGP-038)
+//!                      [--data-dir DIR]
+//!
+//! AGP-067 (review C4): the payTo key (`DIR/payto.key`) and the ledger (`DIR/channels.jsonl`, or
+//! `--ledger FILE`) persist in `--data-dir` (default `./xbt402-rust-provider-data`); the ledger is
+//! locked to one process, so two providers need two data dirs.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,10 +16,9 @@ use serde_json::json;
 use xbt402::channel::FeePayer;
 use xbt402::funding::ChainBackend;
 use xbt402::ledger::Ledger;
-use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
+use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig};
 use xbt402::rpc::Rpc;
 use xbt_primitives::network::network_id;
-use xbt_primitives::secp256k1::SecretKey;
 
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
@@ -32,13 +36,10 @@ fn main() {
         cfg.close_fee_payer = FeePayer::Payee;
     }
     let price: u64 = arg("--price").map(|p| p.parse().expect("price")).unwrap_or(150);
-    let ledger = match arg("--ledger") {
-        Some(p) => Ledger::open(std::path::Path::new(&p)).expect("ledger"),
-        None => Ledger::in_memory(),
-    };
-    let mut sk = [0u8; 32];
-    getrandom_fill(&mut sk);
-    let secret = SecretKey::from_slice(&sk).expect("key");
+    let data = std::path::PathBuf::from(arg("--data-dir").unwrap_or_else(|| "xbt402-rust-provider-data".into()));
+    let ledger = Ledger::open(&arg("--ledger").map(std::path::PathBuf::from).unwrap_or_else(|| data.join("channels.jsonl")))
+        .unwrap_or_else(|e| panic!("ledger: {e}"));
+    let secret = load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| panic!("payTo key: {e}"));
     let chain: Arc<dyn ChainBackend> = Arc::new(rpc.clone());
     let prov = Arc::new(Provider::new(chain, secret, cfg, ledger, Box::new(move |_, _| price),
                                       Box::new(|m, p, b| HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())],
@@ -63,9 +64,4 @@ fn main() {
     for h in hs {
         let _ = h.join();
     }
-}
-
-fn getrandom_fill(b: &mut [u8]) {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(b)).expect("urandom");
 }

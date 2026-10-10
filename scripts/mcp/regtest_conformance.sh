@@ -1,7 +1,7 @@
 #!/bin/bash
 # AGP-030: MCP conformance on regtest, B2's Python MCP vs the Rust xbt-wallet-mcp, on BOTH signers.
 #
-# For each signer (B2's Python signer, the Rust xbt-signer), xbt-063's flagship (branch agp-030) runs
+# For each signer (B2's Python signer, the Rust xbt-signer), xbt-063's flagship (master) runs
 # twice with the scripted agent in conformance mode (MCP_CONFORMANCE=1): once driven through B2's MCP,
 # once through the Rust MCP. In each run every read, and every call the signer never sees, also goes
 # to the other server at the same wallet state and must be equal; then regtest_diff.py compares the two
@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
-XBT063=${XBT063:-$HOME/xbt-rnd/xbt-063-agp-030}
+XBT063=${XBT063:-$HOME/xbt-rnd/xbt-063}
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=$ROOT/run/mcp-regtest/$STAMP
 mkdir -p "$OUT"

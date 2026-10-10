@@ -1,4 +1,4 @@
-//! Guida review (AGP-065): the pay-with-work audit independent of the Prime. P1-P4 were written
+//! external review (AGP-065): the pay-with-work audit independent of the Prime. P1-P4 were written
 //! against the AGP-043 API first and failed there; they keep their names.
 use std::sync::Arc;
 
@@ -211,7 +211,7 @@ fn p6_issuance_is_limited_per_client() {
 /// on disk.
 #[test]
 fn p6_concurrent_writes_keep_the_newest_state() {
-    let dir = std::env::temp_dir().join(format!("xbt-work-guida-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("xbt-work-review-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("state.json");
     let _ = std::fs::remove_file(&path);

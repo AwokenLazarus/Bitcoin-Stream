@@ -44,7 +44,7 @@ CLI=("$XBT_BIN/bitcoin-cli" -regtest -datadir="$XBT402_DATADIR" -rpcport=$XBT402
 COOKIE=$XBT402_DATADIR/regtest/.cookie
 
 echo "== provider"
-"$BIN/xbt402-rust-provider" --port $P_PROV --rpc-port $XBT402_RPCPORT --cookie "$COOKIE" --price 150 >"$R/provider.log" 2>&1 & PIDS+=($!)
+"$BIN/xbt402-rust-provider" --port $P_PROV --rpc-port $XBT402_RPCPORT --cookie "$COOKIE" --price 150 --data-dir "$R/provider-data" >"$R/provider.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 100); do curl -s -o /dev/null "http://127.0.0.1:$P_PROV/x402/supported" && break; sleep 0.1; done
 
 echo "== the human's key (on 'another device'), the signer's root and policy"

@@ -5,17 +5,27 @@
 //! A header is accepted by [`HeaderChain`] only when:
 //! * it is a v2 header (164 bytes, bit 31 of the version set) whose committed height is its height;
 //! * it links to its parent by hash;
+//! * the top two bits of its flags are clear (Knots `bad-flags-highbits`) and its version without
+//!   bit 31 is at least 4 (Knots `bad-version`, BIP34/65/66 are buried far below any checkpoint);
+//! * at a pinned height ([`ChainRules::pins`], mainnet: Knots' assumevalid block 964264) its hash is
+//!   the pinned one (Knots `checkpoint-mismatch`);
 //! * its BLAKE2b block hash meets the target its nBits encode, within powLimit;
-//! * its nBits follow Knots' `pow.cpp`: unchanged inside a 2016-block period and, at a period
-//!   boundary, exactly `CalculateNextWorkRequired` when the period's first header is known, else
-//!   within `PermittedDifficultyTransition`'s 4x bounds; regtest allows the parent's nBits or
-//!   powLimit;
-//! * its time is above the median of the 11 before it and at most 2 h in the future.
+//! * its nBits follow Knots' `pow.cpp` `GetNextWorkRequired`: unchanged inside a 2016-block period
+//!   and, at a period boundary, exactly `CalculateNextWorkRequired` when the period's first header
+//!   is known, else within `PermittedDifficultyTransition`'s 4x bounds; on a min-difficulty chain
+//!   (regtest) powLimit after a 20-minute gap, else the walk back to the last block that was not a
+//!   min-difficulty block;
+//! * its time is above the median of the 11 before it (the 10 headers below the checkpoint are
+//!   fetched, hash-linked back from it, so this holds from the first header) and at most 2 h in
+//!   the future.
 //!
-//! Of competing branches the one with the most work wins (first seen wins a tie).
+//! Of competing branches the one with the most work wins (first seen wins a tie). Testnet3,
+//! testnet4 (BIP94, XBT Blake2bHeight 150308) and signet have no rules here: [`ChainRules::for_chain`]
+//! refuses them, so a light client on those chains fails closed at construction.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use ruint::aliases::{U256, U512};
+pub use ruint::aliases::{U256, U512};
 
 use crate::encode::Reader;
 use crate::error::{Error, Result};
@@ -28,9 +38,43 @@ pub const V2_SIZE: usize = 164;
 pub const FLAG_USE_TIME_OFFSET: u8 = 0x04;
 pub const MEDIAN_SPAN: usize = 11;
 pub const MAX_FUTURE_S: u64 = 2 * 60 * 60;
-/// Mainnet's pinned checkpoint: the first BLAKE2b block.
+/// Knots `bad-flags-highbits`: the top two flag bits are reserved for a future hard fork.
+pub const FLAGS_RESERVED: u8 = 0xC0;
+/// Knots `bad-version`: below 4 is refused once BIP34/66/65 are active (far below 961640).
+pub const MIN_VERSION: u32 = 4;
+/// Headers below the checkpoint a chain holds (hash-linked back from it), so the median-time rule
+/// applies from the first header above it.
+pub const PRIOR_HEADERS: u32 = MEDIAN_SPAN as u32 - 1;
+/// Mainnet's trust anchor: the first BLAKE2b block, also the xbt402 network anchor
+/// ([`crate::network::MAINNET_ANCHOR_HASH`]).
 pub const MAINNET_CHECKPOINT: (u32, &str) =
     (961_640, "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb");
+/// Chainwork from genesis at [`MAINNET_CHECKPOINT`] (Knots `getblockheader`, 2026-10-08).
+pub const MAINNET_CHECKPOINT_CHAINWORK: &str = "00000000000000000000000000000000000000013e002762b0a1ae991b033e89";
+/// Knots mainnet `nMinimumChainWork` (`src/kernel/chainparams.cpp:149`, v29.4.2.knots20260508). It
+/// is exactly the chainwork of block 964264, Knots' `defaultAssumeValid` (`getblockheader`).
+pub const MAINNET_MIN_CHAIN_WORK: &str = "00000000000000000000000000000000000000013e00277374c9f9eeadc70200";
+/// Hashes every mainnet chain must have at these heights: Knots mainnet `defaultAssumeValid`
+/// (`src/kernel/chainparams.cpp:150`, block 964264). Moved forward with each release.
+pub const MAINNET_PINS: &[(u32, &str)] = &[(964_264, "0000000000000078ed1e20cac1acf78df6d1060c78059fb6331e17141c881fc8")];
+
+/// A 256-bit chainwork as `getblockheader` prints it (64 hex digits).
+pub fn parse_chainwork(hex64: &str) -> Result<U512> {
+    let v = U256::from_str_radix(hex64, 16).map_err(|_| herr(format!("chainwork {hex64:?} is not hex")))?;
+    Ok(U512::from(v))
+}
+
+/// The work a mainnet chain must show above the checkpoint `cp`: Knots' `nMinimumChainWork` minus
+/// the chainwork at `cp`. Zero for an anchor at or above the last pin (it is past the minimum
+/// already); None for an older anchor whose chainwork this release does not know.
+pub fn mainnet_min_work_above(cp: (u32, &[u8; 32])) -> Option<U512> {
+    let min = parse_chainwork(MAINNET_MIN_CHAIN_WORK).ok()?;
+    if cp.0 == MAINNET_CHECKPOINT.0 && hex::encode(cp.1) == MAINNET_CHECKPOINT.1 {
+        return Some(min.saturating_sub(parse_chainwork(MAINNET_CHECKPOINT_CHAINWORK).ok()?));
+    }
+    let last_pin = MAINNET_PINS.iter().map(|p| p.0).max().unwrap_or(0);
+    (cp.0 >= last_pin).then_some(U512::ZERO)
+}
 
 fn herr(s: impl Into<String>) -> Error {
     Error::Header(s.into())
@@ -208,10 +252,14 @@ pub fn v2_stages(b: &[u8]) -> Result<V2Stages> {
     Ok(V2Stages { xor_key_hash, mask, h1, h2, blake2b_1, asic_input: asic, blake2b_2, block_hash })
 }
 
-/// A parsed v2 header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed v2 header (or, below a checkpoint, a v1 header: see [`parse_prior`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Header {
     pub raw: Vec<u8>,
+    /// The version field as on the wire (bit 31 set on a v2 header).
+    pub version: u32,
+    /// The v2 flags byte (0 on a v1 header).
+    pub flags: u8,
     /// Block hash, big-endian (display order, as Knots prints it).
     pub hash: [u8; 32],
     /// Parent hash, display order.
@@ -254,6 +302,8 @@ pub fn parse_header(b: &[u8]) -> Result<Header> {
     merkle_root.copy_from_slice(&b[36..68]);
     Ok(Header {
         raw: b.to_vec(),
+        version: u32_at(b, 0),
+        flags,
         hash: st.block_hash,
         prev,
         merkle_root,
@@ -262,6 +312,29 @@ pub fn parse_header(b: &[u8]) -> Result<Header> {
         height: u32_at(b, 128),
         txcount: u16::from_le_bytes([b[108], b[109]]),
     })
+}
+
+/// A header below a checkpoint, at `height`: v2 (its committed height must be `height`) or v1
+/// (80 bytes, SHA-256d, no committed height). Nothing but its link and time matter: it is trusted
+/// because it hashes to the parent the checkpoint (or the header above it) names.
+pub fn parse_prior(b: &[u8], height: u32) -> Result<Header> {
+    if header_size(b)? == V2_SIZE {
+        let h = parse_header(b)?;
+        if h.height != height {
+            return Err(herr(format!("header {height} commits height {}", h.height)));
+        }
+        return Ok(h);
+    }
+    if b.len() != V1_SIZE {
+        return Err(herr(format!("a v1 header is {V1_SIZE} bytes, got {}", b.len())));
+    }
+    let mut prev = [0u8; 32];
+    prev.copy_from_slice(&b[4..36]);
+    prev.reverse();
+    let mut merkle_root = [0u8; 32];
+    merkle_root.copy_from_slice(&b[36..68]);
+    Ok(Header { raw: b.to_vec(), version: u32_at(b, 0), flags: 0, hash: v1_hash(b)?, prev, merkle_root,
+                time: u32_at(b, 68), bits: u32_at(b, 72), height, txcount: 0 })
 }
 
 /// The SHA-256d hash (display order) of a v1 (80-byte) header.
@@ -361,8 +434,12 @@ pub struct ChainRules {
     pub pow_limit: U256,
     pub interval: u32,
     pub timespan: u64,
+    /// `nPowTargetSpacing`.
+    pub spacing: u64,
     pub allow_min_difficulty: bool,
     pub no_retargeting: bool,
+    /// (height, display-order hash) every accepted chain has (Knots' checkpoint lock-in).
+    pub pins: Vec<(u32, [u8; 32])>,
 }
 
 impl ChainRules {
@@ -372,8 +449,12 @@ impl ChainRules {
             pow_limit: U256::from(0xFFFF_u64) << 208,
             interval: 2016,
             timespan: 14 * 24 * 60 * 60,
+            spacing: 10 * 60,
             allow_min_difficulty: false,
             no_retargeting: false,
+            pins: MAINNET_PINS.iter()
+                .map(|(h, x)| (*h, crate::hash::hex32(x).expect("MAINNET_PINS are 64-hex constants")))
+                .collect(),
         }
     }
 
@@ -383,11 +464,14 @@ impl ChainRules {
             pow_limit: U256::from(0x7F_FFFF_u64) << 232,
             interval: 2016,
             timespan: 14 * 24 * 60 * 60,
+            spacing: 10 * 60,
             allow_min_difficulty: true,
             no_retargeting: true,
+            pins: Vec::new(),
         }
     }
 
+    /// Main and regtest. Testnet3, testnet4 (BIP94) and signet are refused: fail closed.
     pub fn for_chain(chain: &str) -> Result<Self> {
         match chain {
             "main" => Ok(Self::main()),
@@ -396,20 +480,53 @@ impl ChainRules {
         }
     }
 
+    /// Knots `GetNextWorkRequired` for the child of `parent` with time `child_time`. `ancestor(h)`
+    /// returns our header at height `h` when we hold it. Where the walk back on a min-difficulty
+    /// chain runs past what we hold, the earliest header held stands in for Knots' genesis stop;
+    /// on regtest (genesis at powLimit, no retargeting) every block is powLimit either way.
+    pub fn next_bits_with<'a>(&self, parent: &'a Header, child_time: u32,
+                              ancestor: impl Fn(u32) -> Option<&'a Header>) -> Result<Allowed> {
+        let pl_bits = target_to_bits(self.pow_limit);
+        let boundary = (parent.height as u64 + 1).is_multiple_of(self.interval as u64);
+        if !boundary && self.allow_min_difficulty {
+            if child_time as u64 > parent.time as u64 + 2 * self.spacing {
+                return Ok(Allowed::Exact(vec![pl_bits]));
+            }
+            let mut p = parent;
+            while !p.height.is_multiple_of(self.interval) && p.bits == pl_bits {
+                match p.height.checked_sub(1).and_then(&ancestor) {
+                    Some(a) => p = a,
+                    None => break,
+                }
+            }
+            return Ok(Allowed::Exact(vec![p.bits]));
+        }
+        if self.no_retargeting {
+            return Ok(Allowed::Exact(vec![parent.bits]));
+        }
+        let first_time = if boundary {
+            (parent.height + 1).checked_sub(self.interval).and_then(&ancestor).map(|f| f.time)
+        } else {
+            None
+        };
+        self.next_bits(parent, first_time)
+    }
+
     fn scaled(&self, target: U256, span: u64) -> U256 {
         let t = U512::from(target) * U512::from(span) / U512::from(self.timespan);
         let pl = U512::from(self.pow_limit);
         U256::from(if t < pl { t } else { pl })
     }
 
-    /// The nBits a child of `parent` may carry (`first_time`: the time of the period's first
-    /// header, when it is known).
+    /// The nBits a child of `parent` may carry on a retargeting chain (`first_time`: the time of the
+    /// period's first header, when it is known). On a min-difficulty chain this is only the loose
+    /// bound {parent, powLimit}; [`Self::next_bits_with`] is the exact rule validation uses.
     pub fn next_bits(&self, parent: &Header, first_time: Option<u32>) -> Result<Allowed> {
         let pl_bits = target_to_bits(self.pow_limit);
         if self.allow_min_difficulty || self.no_retargeting {
             return Ok(Allowed::Exact(vec![parent.bits, pl_bits]));
         }
-        if (parent.height as u64 + 1) % self.interval as u64 != 0 {
+        if !(parent.height as u64 + 1).is_multiple_of(self.interval as u64) {
             return Ok(Allowed::Exact(vec![parent.bits]));
         }
         let pt = bits_to_target(parent.bits)?;
@@ -505,13 +622,16 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 
 // --- the header chain -----------------------------------------------------------------------
 
-/// Result of [`HeaderChain::connect`].
+/// Result of [`HeaderChain::connect`] and [`HeaderChain::adopt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectResult {
     pub adopted: bool,
     pub tip: u32,
     pub reorg: u32,
 }
+
+/// The current unix time (the 2 h future rule).
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Headers from a pinned checkpoint to the most-work tip seen, each one verified. Optionally
 /// persisted (the raw headers, re-verified on load).
@@ -521,16 +641,131 @@ pub struct HeaderChain {
     cp_height: u32,
     cp_hash: [u8; 32],
     path: Option<PathBuf>,
-    clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    clock: Clock,
+    /// The headers below the checkpoint ([`PRIOR_HEADERS`], fewer only near genesis), oldest first.
+    prior: Vec<Header>,
     headers: Vec<Header>,
     work: Vec<U512>,
+}
+
+/// Headers validated on top of one of ours without holding the chain: made by
+/// [`HeaderChain::branch`], grown by [`Branch::extend`] as each chunk arrives, applied by
+/// [`HeaderChain::adopt`].
+pub struct Branch {
+    rules: ChainRules,
+    clock: Clock,
+    /// Our headers up to the fork point (contiguous, as far back as the rules look), then the new ones.
+    known: Vec<Header>,
+    base_len: usize,
+    /// (height, hash) of the fork point.
+    base: (u32, [u8; 32]),
+    /// Work above the checkpoint at the branch tip.
+    work: U512,
+}
+
+impl Branch {
+    pub fn fork_height(&self) -> u32 {
+        self.base.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.known.len() - self.base_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn tip_height(&self) -> u32 {
+        self.base.0 + self.len() as u32
+    }
+
+    /// Work above the checkpoint at the branch tip.
+    pub fn work(&self) -> U512 {
+        self.work
+    }
+
+    fn at(&self, height: u32) -> Option<&Header> {
+        let first = self.known.first()?.height;
+        self.known.get(height.checked_sub(first)? as usize).filter(|h| h.height == height)
+    }
+
+    /// Validate `raws` in order on top of the branch. The first invalid header stops it: the
+    /// headers before it stay (they carry real work), it and the rest are dropped, and its reason
+    /// is the error.
+    pub fn extend<R: AsRef<[u8]>>(&mut self, raws: &[R]) -> Result<()> {
+        for raw in raws {
+            let raw = raw.as_ref();
+            if header_size(raw)? != V2_SIZE {
+                return Err(herr(format!("block {} is a v1 header above the BLAKE2b checkpoint", self.tip_height() as u64 + 1)));
+            }
+            let h = parse_header(raw)?;
+            self.validate(&h)?;
+            self.work += work_of(h.bits)?;
+            self.known.push(h);
+        }
+        Ok(())
+    }
+
+    fn validate(&self, h: &Header) -> Result<()> {
+        let parent = self.known.last().ok_or_else(|| herr("a branch has its fork point"))?;
+        let n = parent.height as u64 + 1;
+        if h.prev != parent.hash {
+            return Err(herr(format!("block {n} does not link to {}", parent.hash_hex())));
+        }
+        if h.height as u64 != n {
+            return Err(herr(format!("block {n} commits height {}", h.height)));
+        }
+        if h.flags & FLAGS_RESERVED != 0 {
+            return Err(herr(format!("block {n}: bad-flags-highbits (flags {:02x})", h.flags)));
+        }
+        if h.version & !V2_FLAG < MIN_VERSION {
+            return Err(herr(format!("block {n}: bad-version ({:08x})", h.version)));
+        }
+        if let Some((_, pin)) = self.rules.pins.iter().find(|p| p.0 == h.height) {
+            if &h.hash != pin {
+                return Err(herr(format!("block {n}: checkpoint-mismatch, {} is pinned", hex::encode(pin))));
+            }
+        }
+        check_pow(h, &self.rules)?;
+        match self.rules.next_bits_with(parent, h.time, |x| self.at(x))? {
+            Allowed::Exact(v) => {
+                if !v.contains(&h.bits) {
+                    return Err(herr(format!("block {n}: nBits {:08x}, expected {:?}", h.bits,
+                                            v.iter().map(|b| format!("{b:08x}")).collect::<Vec<_>>())));
+                }
+            }
+            Allowed::Range(lo, hi) => {
+                let t = h.target()?;
+                if t < lo || t > hi {
+                    return Err(herr(format!("block {n}: nBits {:08x} outside the permitted retarget", h.bits)));
+                }
+            }
+        }
+        // GetMedianTimePast: the 11 before it, fewer only near genesis
+        let prior = &self.known[self.known.len().saturating_sub(MEDIAN_SPAN)..];
+        let mut times: Vec<u32> = prior.iter().map(|x| x.time).collect();
+        times.sort_unstable();
+        let mtp = times[times.len() / 2];
+        if h.time <= mtp {
+            return Err(herr(format!("block {n}: time {} not above the median {mtp}", h.time)));
+        }
+        if h.time as u64 > (self.clock)() + MAX_FUTURE_S {
+            return Err(herr(format!("block {n}: time {} is more than 2 h in the future", h.time)));
+        }
+        Ok(())
+    }
 }
 
 impl HeaderChain {
     /// `checkpoint` = (height, display hex hash). `path` persists the chain; `clock` gives the
     /// current unix time (the 2 h future rule).
     pub fn new(chain: &str, checkpoint: (u32, &str), path: Option<&Path>,
-               clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Result<Self> {
+               clock: impl Fn() -> u64 + Send + Sync + 'static) -> Result<Self> {
+        Self::with_clock(chain, checkpoint, path, Arc::new(clock))
+    }
+
+    pub fn with_clock(chain: &str, checkpoint: (u32, &str), path: Option<&Path>, clock: Clock) -> Result<Self> {
         let mut c = Self {
             rules: ChainRules::for_chain(chain)?,
             chain: chain.to_string(),
@@ -538,6 +773,7 @@ impl HeaderChain {
             cp_hash: crate::hash::hex32(checkpoint.1)?,
             path: path.map(Path::to_path_buf),
             clock,
+            prior: Vec::new(),
             headers: Vec::new(),
             work: Vec::new(),
         };
@@ -547,9 +783,18 @@ impl HeaderChain {
 
     /// A chain with the system clock.
     pub fn with_system_clock(chain: &str, checkpoint: (u32, &str), path: Option<&Path>) -> Result<Self> {
-        Self::new(chain, checkpoint, path, Box::new(|| {
+        Self::new(chain, checkpoint, path, || {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-        }))
+        })
+    }
+
+    pub fn checkpoint(&self) -> (u32, [u8; 32]) {
+        (self.cp_height, self.cp_hash)
+    }
+
+    /// How many headers below the checkpoint [`Self::set_checkpoint`] needs.
+    pub fn prior_needed(&self) -> u32 {
+        PRIOR_HEADERS.min(self.cp_height)
     }
 
     pub fn ready(&self) -> bool {
@@ -580,8 +825,31 @@ impl HeaderChain {
         self.work.last().copied().unwrap_or(U512::ZERO)
     }
 
-    /// The checkpoint header itself: its hash must be the pinned one.
-    pub fn set_checkpoint(&mut self, raw: &[u8]) -> Result<()> {
+    /// Why this chain is not believable yet, or None: it must reach every pinned height above the
+    /// checkpoint, carry `min_work_above` the checkpoint, and with `floor = (spacing_s, slack)` its
+    /// tip may not trail the newest pinned block it holds (or the checkpoint) by more than `slack`
+    /// blocks at one block per `spacing_s` since that block's time.
+    pub fn implausible(&self, min_work_above: U512, floor: Option<(u64, u32)>) -> Option<String> {
+        let Some(tip) = self.tip() else { return Some("no verified headers yet".into()) };
+        let tip_h = tip.height;
+        if let Some((h, _)) = self.rules.pins.iter().find(|(h, _)| *h > self.cp_height && tip_h < *h) {
+            return Some(format!("tip {tip_h} is below the pinned block {h}"));
+        }
+        let work = self.total_work();
+        if work < min_work_above {
+            return Some(format!("work above the checkpoint {work:#x} is below the minimum {min_work_above:#x}"));
+        }
+        let (spacing, slack) = floor?;
+        let base = self.rules.pins.iter().filter_map(|(h, _)| self.at(*h)).max_by_key(|h| h.height).or_else(|| self.headers.first())?;
+        let expected = base.height as u64 + ((self.clock)().saturating_sub(base.time as u64)) / spacing.max(1);
+        ((tip_h as u64 + slack as u64) < expected).then(|| {
+            format!("tip {tip_h} is implausibly low: block {expected} expected by now at one per {spacing} s from block {}", base.height)
+        })
+    }
+
+    /// The checkpoint header, whose hash must be the pinned one, and the [`Self::prior_needed`]
+    /// headers below it (oldest first), each hash-linked to the one above it.
+    pub fn set_checkpoint<R: AsRef<[u8]>>(&mut self, raw: &[u8], prior: &[R]) -> Result<()> {
         let h = parse_header(raw)?;
         if h.hash != self.cp_hash {
             return Err(herr(format!("checkpoint {} hashes to {}, not the pinned {}", self.cp_height, h.hash_hex(), hex::encode(self.cp_hash))));
@@ -590,7 +858,24 @@ impl HeaderChain {
             return Err(herr(format!("checkpoint commits height {}, not {}", h.height, self.cp_height)));
         }
         check_pow(&h, &self.rules)?;
+        let want = self.prior_needed() as usize;
+        if prior.len() != want {
+            return Err(herr(format!("the checkpoint needs the {want} headers below it, got {}", prior.len())));
+        }
+        let mut below = Vec::with_capacity(want);
+        let mut child = h.prev;
+        for (i, r) in prior.iter().enumerate().rev() {
+            let height = self.cp_height - (want - i) as u32;
+            let p = parse_prior(r.as_ref(), height)?;
+            if p.hash != child {
+                return Err(herr(format!("header {height} is not the parent of header {}", height + 1)));
+            }
+            child = p.prev;
+            below.push(p);
+        }
+        below.reverse();
         if self.headers.is_empty() {
+            self.prior = below;
             self.headers = vec![h];
             self.work = vec![U512::ZERO];
             self.save();
@@ -598,92 +883,54 @@ impl HeaderChain {
         Ok(())
     }
 
-    fn ancestor<'a>(&'a self, height: u32, ancestors: &'a [Header]) -> Option<&'a Header> {
-        ancestors.iter().rev().find(|a| a.height == height).or_else(|| if height >= self.cp_height { self.at(height) } else { None })
+    /// A branch to grow on our header at `fork_height` (see [`Branch`]).
+    pub fn branch(&self, fork_height: u32) -> Result<Branch> {
+        let i0 = fork_height.checked_sub(self.cp_height).map(|i| i as usize).filter(|&i| i < self.headers.len())
+            .ok_or_else(|| herr(format!("no header of ours at {fork_height} to build on")))?;
+        // back far enough for a retarget's first header, the min-difficulty walk and the median
+        let back = (self.rules.interval as usize).max(MEDIAN_SPAN);
+        let start = (i0 + 1).saturating_sub(back);
+        let mut known = Vec::with_capacity(back);
+        if start == 0 {
+            let more = back - (i0 + 1);
+            known.extend_from_slice(&self.prior[self.prior.len().saturating_sub(more)..]);
+        }
+        known.extend_from_slice(&self.headers[start..=i0]);
+        Ok(Branch { rules: self.rules.clone(), clock: self.clock.clone(), base_len: known.len(), known,
+                    base: (fork_height, self.headers[i0].hash), work: self.work[i0] })
     }
 
-    fn validate(&self, parent: &Header, h: &Header, ancestors: &[Header]) -> Result<()> {
-        if h.prev != parent.hash {
-            return Err(herr(format!("block {} does not link to {}", parent.height as u64 + 1, parent.hash_hex())));
-        }
-        if h.height as u64 != parent.height as u64 + 1 {
-            return Err(herr(format!("block {} commits height {}", parent.height as u64 + 1, h.height)));
-        }
-        check_pow(h, &self.rules)?;
-        let mut first_time = None;
-        if !(self.rules.allow_min_difficulty || self.rules.no_retargeting) && h.height % self.rules.interval == 0 {
-            if let Some(first) = h.height.checked_sub(self.rules.interval) {
-                first_time = self.ancestor(first, ancestors).map(|f| f.time);
-            }
-        }
-        match self.rules.next_bits(parent, first_time)? {
-            Allowed::Exact(v) => {
-                if !v.contains(&h.bits) {
-                    return Err(herr(format!("block {}: nBits {:08x}, expected {:?}", h.height, h.bits,
-                                            v.iter().map(|b| format!("{b:08x}")).collect::<Vec<_>>())));
-                }
-            }
-            Allowed::Range(lo, hi) => {
-                let t = h.target()?;
-                if t < lo || t > hi {
-                    return Err(herr(format!("block {}: nBits {:08x} outside the permitted retarget", h.height, h.bits)));
-                }
-            }
-        }
-        let prior = &ancestors[ancestors.len().saturating_sub(MEDIAN_SPAN)..];
-        if prior.len() == MEDIAN_SPAN {
-            let mut times: Vec<u32> = prior.iter().map(|x| x.time).collect();
-            times.sort_unstable();
-            let mtp = times[MEDIAN_SPAN / 2];
-            if h.time <= mtp {
-                return Err(herr(format!("block {}: time {} not above the median {mtp}", h.height, h.time)));
-            }
-        }
-        if h.time as u64 > (self.clock)() + MAX_FUTURE_S {
-            return Err(herr(format!("block {}: time {} is more than 2 h in the future", h.height, h.time)));
-        }
-        Ok(())
-    }
-
-    /// Headers `fork_height+1..` that build on our header at `fork_height`. The branch replaces
-    /// ours above `fork_height` only if it has more work.
-    pub fn connect<R: AsRef<[u8]>>(&mut self, fork_height: u32, raws: &[R]) -> Result<ConnectResult> {
-        let base = self.at(fork_height).cloned().ok_or_else(|| herr(format!("no header of ours at {fork_height} to build on")))?;
-        let i0 = (fork_height - self.cp_height) as usize;
-        let start = (i0 + 1).saturating_sub(self.rules.interval as usize);
-        let mut ancestors: Vec<Header> = self.headers[start..=i0].to_vec();
-        let base_len = ancestors.len();
-        let mut work = self.work[i0];
-        let mut parent = base;
-        for raw in raws {
-            let raw = raw.as_ref();
-            if header_size(raw)? != V2_SIZE {
-                return Err(herr(format!("block {} is a v1 header above the BLAKE2b checkpoint", parent.height as u64 + 1)));
-            }
-            let h = parse_header(raw)?;
-            self.validate(&parent, &h, &ancestors)?;
-            work += work_of(h.bits)?;
-            ancestors.push(h.clone());
-            parent = h;
-        }
-        let branch = ancestors.split_off(base_len);
+    /// Apply a branch: it replaces ours above its fork point only if it has more work and the fork
+    /// point is still ours (if another branch moved our chain under it, the next sync redoes it).
+    pub fn adopt(&mut self, b: Branch) -> Result<ConnectResult> {
         let tip = self.tip_height()?;
-        if branch.is_empty() || work <= self.total_work() {
+        let still_ours = self.at(b.base.0).map(|h| h.hash) == Some(b.base.1);
+        if b.is_empty() || !still_ours || b.work <= self.total_work() {
             return Ok(ConnectResult { adopted: false, tip, reorg: 0 });
         }
+        let i0 = (b.base.0 - self.cp_height) as usize;
         let reorg = (self.headers.len() - 1 - i0) as u32;
+        let branch = &b.known[b.base_len..];
         let mut cum = self.work[i0];
         let mut works = Vec::with_capacity(branch.len());
-        for h in &branch {
+        for h in branch {
             cum += work_of(h.bits)?;
             works.push(cum);
         }
         self.headers.truncate(i0 + 1);
-        self.headers.extend(branch);
+        self.headers.extend_from_slice(branch);
         self.work.truncate(i0 + 1);
         self.work.extend(works);
         self.save();
         Ok(ConnectResult { adopted: true, tip: self.tip_height()?, reorg })
+    }
+
+    /// Headers `fork_height+1..` that build on our header at `fork_height`, all or nothing. The
+    /// branch replaces ours above `fork_height` only if it has more work.
+    pub fn connect<R: AsRef<[u8]>>(&mut self, fork_height: u32, raws: &[R]) -> Result<ConnectResult> {
+        let mut b = self.branch(fork_height)?;
+        b.extend(raws)?;
+        self.adopt(b)
     }
 
     fn meta_path(&self) -> Option<PathBuf> {
@@ -696,30 +943,36 @@ impl HeaderChain {
             let _ = std::fs::create_dir_all(d);
         }
         let tmp = p.with_extension("tmp");
-        let blob: Vec<u8> = self.headers.iter().flat_map(|h| h.raw.iter().copied()).collect();
+        let blob: Vec<u8> = self.prior.iter().chain(&self.headers).flat_map(|h| h.raw.iter().copied()).collect();
         if std::fs::write(&tmp, blob).and_then(|_| std::fs::rename(&tmp, p)).is_ok() {
             let tip = self.cp_height + self.headers.len() as u32 - 1;
             let _ = std::fs::write(meta, format!(
-                "{{\"chain\": \"{}\", \"checkpoint\": [{}, \"{}\"], \"tip\": {}}}",
-                self.chain, self.cp_height, hex::encode(self.cp_hash), tip));
+                "{{\"chain\": \"{}\", \"checkpoint\": [{}, \"{}\"], \"prior\": {}, \"tip\": {}}}",
+                self.chain, self.cp_height, hex::encode(self.cp_hash), self.prior.len(), tip));
         }
     }
 
+    /// A store without the headers below the checkpoint (older releases) is ignored: the chain is
+    /// fetched again.
     fn load(&mut self) {
         let (Some(p), Some(meta)) = (self.path.clone(), self.meta_path()) else { return };
         let (Ok(blob), Ok(m)) = (std::fs::read(&p), std::fs::read_to_string(&meta)) else { return };
-        let want = format!("\"checkpoint\": [{}, \"{}\"]", self.cp_height, hex::encode(self.cp_hash));
+        let want = format!("\"checkpoint\": [{}, \"{}\"], \"prior\": {}, ", self.cp_height, hex::encode(self.cp_hash), self.prior_needed());
         if !m.contains(&format!("\"chain\": \"{}\"", self.chain)) || !m.contains(&want) {
             return;
         }
+        let n = self.prior_needed() as usize;
         let ok = (|| -> Result<()> {
             let raws = split_headers(&blob)?;
-            let Some((first, rest)) = raws.split_first() else { return Ok(()) };
-            self.set_checkpoint(first)?;
-            self.connect(self.cp_height, rest)?;
+            if raws.len() <= n {
+                return Ok(());
+            }
+            self.set_checkpoint(raws[n], &raws[..n])?;
+            self.connect(self.cp_height, &raws[n + 1..])?;
             Ok(())
         })();
         if ok.is_err() {
+            self.prior.clear();
             self.headers.clear();
             self.work.clear();
         }
@@ -739,6 +992,18 @@ mod tests {
         assert!(bits_to_target(0xFF12_3456).is_err());
         assert_eq!(bits_to_target(0x0100_0000).unwrap(), U256::ZERO);
         assert_eq!(work_of(0x1D00_FFFF).unwrap(), U512::from(0x1_0001_0001_u64));
+    }
+
+    #[test]
+    fn mainnet_minimum_work() {
+        let cp = crate::hash::hex32(MAINNET_CHECKPOINT.1).unwrap();
+        // nMinimumChainWork (= chainwork of 964264) minus the chainwork of 961640
+        let above = mainnet_min_work_above((MAINNET_CHECKPOINT.0, &cp)).unwrap();
+        assert_eq!(above, U512::from(0x0010_c428_4b55_92c3_c377_u128));
+        assert_eq!(mainnet_min_work_above((964_264, &[0; 32])), Some(U512::ZERO));
+        assert_eq!(mainnet_min_work_above((962_000, &[0; 32])), None, "an older anchor of unknown chainwork");
+        assert!(parse_chainwork("zz").is_err());
+        assert_eq!(ChainRules::main().pins.len(), MAINNET_PINS.len());
     }
 
     #[test]

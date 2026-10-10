@@ -6,14 +6,15 @@
 # v0.21.3-beta-blake2b.13; bitcoind-sha + lnd-sha = stock Core and lnd on a SHA-256 regtest), cloned
 # read-only under run/. Scenarios: scripts/ln_rail/drive.py (S1-S9 AGP-048, S10-S15 AGP-049: funding
 # proven from the transaction, the exposure cap, the macaroon IP caveat, watchtowers, the rate limit,
-# HTLC CLTV locks); report run/ln_rail_regtest.json.
+# HTLC CLTV locks; S16-S18 AGP-066: lookup by payment hash, the macaroon allowlist, plain http only on
+# loopback); report run/ln_rail_regtest.json.
 #
 # Regtest only: no mainnet LN node is contacted. Ports 34781, 34791, 34793 (loopback; AGP-049's
 # 34700-34799), compose project agp049ln, container CPU caps (scripts/ln_rail/compose.ln_rail.yml),
 # host builds at nice 19 -j4. The lab's containers and volumes are removed on exit (LN_RAIL_KEEP=1
 # keeps them). LN_RAIL_GOCACHE: a Go build cache to reuse (default run/gocache).
 #
-#   scripts/ln_rail_regtest.sh            build what is missing, run S1-S15, tear down
+#   scripts/ln_rail_regtest.sh            build what is missing, run S1-S18, tear down
 set -euo pipefail
 lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."

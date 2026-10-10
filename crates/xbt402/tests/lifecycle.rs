@@ -347,13 +347,16 @@ fn provider_restarts_from_its_ledger() {
             c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
         }
     }
+    // the crash: the client's transport held the first provider (and its ledger lock)
+    let channels = c.channels.clone();
+    drop(c);
     let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::open(&path).unwrap());
-    let chan = c.channels[O].payer.params.channel_id();
+    let chan = channels[O].payer.params.channel_id();
     let st = prov.channel_state(&chan).unwrap();
     assert_eq!((st.seq, st.spent_msat), (4, 600_000));
     // the client continues against the restarted provider
     let mut c2 = Client::new(ClientConfig::new(NET), Box::new(Local(prov.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)));
-    c2.channels = c.channels.clone();
+    c2.channels = channels;
     assert_eq!(c2.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
     assert_eq!(c2.close(O).unwrap()["cum"], "750");
     let _ = std::fs::remove_dir_all(dir);
@@ -696,7 +699,7 @@ fn close_channel_refuses_a_channel_with_a_call_in_flight() {
     assert_eq!(prov.close_channel(&chan).unwrap()["cum"], "1200");
 }
 
-// --- AGP-068: request binding and receipts (Guida T2, T4) ------------------------------------
+// --- AGP-068: request binding and receipts (review T2, T4) ------------------------------------
 
 /// The request binding of `method url body` (the digest `payload.auth` and `receipt.req` carry).
 fn req(method: &str, url: &str, body: &[u8]) -> String {
@@ -798,7 +801,7 @@ fn a_seq_spent_on_a_refusal_survives_a_restart() {
     let h = paid_header(&ch, 7, "0", None, "GET", &format!("{O}/v1/q"), b"");
     let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{O}/v1/q"), None);
     assert_eq!(error_of(&r), "insufficient_payment");
-    drop(prov);
+    drop((prov, c));
     let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::open(&path).unwrap());
     assert_eq!(prov.channel_state(&chan).unwrap().seq, 7, "the refused call's seq was only in memory");
     let r = prov.serve("GET", "/v1/q", &h, b"", &format!("{O}/v1/q"), None);

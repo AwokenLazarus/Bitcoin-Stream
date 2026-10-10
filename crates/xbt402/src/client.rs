@@ -293,11 +293,13 @@ impl ClientLedger for MemoryClientLedger {
 /// compacted again (a fsynced rewrite, then an atomic rename) once the appended lines outgrow the
 /// live records (AGP-044: a [`RoutePayer`](crate::route_client::RoutePayer) saves its meters per
 /// call). Created mode 0600 on Unix: records of channels whose keys this client holds carry the
-/// payer secret.
+/// payer secret. Locked like the provider's ledger (review C5): a second opener of the same file
+/// gets `ledger_locked`.
 #[derive(Debug)]
 pub struct FileClientLedger {
     path: PathBuf,
     inner: Mutex<LedgerFile>,
+    _lock: crate::ledger::FileLock,
 }
 
 #[derive(Debug)]
@@ -367,15 +369,16 @@ fn rewrite(path: &Path, recs: &indexmap::IndexMap<String, Value>) -> Result<u64>
 }
 
 impl FileClientLedger {
-    /// Replay and compact the log at `path` (created if missing).
+    /// Lock, replay and compact the log at `path` (created if missing).
     pub fn open(path: &Path) -> Result<Self> {
+        let lock = crate::ledger::lock_ledger(path)?;
         let recs = replay(path)?;
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).map_err(ledger_io)?;
         }
         let compacted = rewrite(path, &recs)?;
         let file = private_file(path, true).map_err(ledger_io)?;
-        Ok(Self { path: path.to_path_buf(), inner: Mutex::new(LedgerFile { file, recs, appended: 0, compacted }) })
+        Ok(Self { path: path.to_path_buf(), inner: Mutex::new(LedgerFile { file, recs, appended: 0, compacted }), _lock: lock })
     }
 
     pub fn path(&self) -> &Path {
@@ -608,7 +611,9 @@ impl Client {
     }
 
     fn expiry_blocks(&self, ex: &Value) -> Result<u32> {
-        let lo = ex_u64(ex, "minExpiryBlocks")? + 6;
+        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
+        // default margin is 36
+        let lo = (ex_u64(ex, "minExpiryBlocks")? + 6).max(ex_u64(ex, "minExpiryBlocks")? + 36);
         let hi = ex_u64(ex, "maxExpiryBlocks")?.saturating_sub(1);
         u32::try_from((self.cfg.expiry_blocks as u64).max(lo).min(hi)).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
     }
@@ -627,6 +632,13 @@ impl Client {
         let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let addr = segwit_address(self.hrp(), &p.spk())?;
+        let open_url = format!("{origin}{}", ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let mut c = json!({"capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
+                           "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
+        if fee_payer != FeePayer::Payer {
+            c["closeFeePayer"] = fee_payer.as_str().into();
+        }
+        self.preflight(&open_url, &c, fee_payer)?;
         let (txid, vout) = self.wallet.fund_channel(origin, &p, &addr, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.opened_sats += cap;
@@ -635,12 +647,8 @@ impl Client {
         if let Some(cb) = &self.on_refund {
             cb(&refund_hex, expiry);
         }
-        let mut c = json!({"txid": txid, "vout": vout, "capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
-                           "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
-        if fee_payer != FeePayer::Payer {
-            c["closeFeePayer"] = fee_payer.as_str().into();
-        }
-        let open_url = format!("{origin}{}", ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        c["txid"] = txid.into();
+        c["vout"] = vout.into();
         let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
         if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer.as_str() {
             // a provider that did not take our terms would refuse every state we sign
@@ -648,6 +656,23 @@ impl Client {
         }
         Ok(ClientChannel { payer, origin: origin.into(), accepted: acc.clone(), refund_hex, auth_key, price,
                            slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] })
+    }
+
+    /// Ask the provider whether it opens a channel on exactly these terms before anything is funded
+    /// (review C2): a refusal after funding locks the capacity until expiry. A provider from before
+    /// the preflight answers `bad_request` (no outpoint), having passed the terms it checks before
+    /// the outpoint: that alone lets the open go ahead.
+    fn preflight(&self, open_url: &str, channel: &Value, fee_payer: FeePayer) -> Result<()> {
+        let req = json!({"x402Version": 2, "network": self.cfg.network, "preflight": true, "channel": channel});
+        match self.post(open_url, &req) {
+            Ok(r) if r.get("preflight") != Some(&Value::Bool(true)) => fail("bad_open", "the provider did not answer the open preflight"),
+            Ok(r) if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer.as_str() => {
+                fail("bad_fee_payer", "the provider would open the channel with another closeFeePayer")
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.code == "bad_request" => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// `bind`: where the request goes, `origin + path` ([`request_digest_v2`]); a close's payload
@@ -903,21 +928,25 @@ impl Client {
             return fail("exhausted", "not enough leftover to roll into a new channel");
         }
         let chan = p.channel_id();
+        // the txid of the tx we sign (segwit: the witness is not in it), so the next channel we bind
+        // is the one that tx funds, never an outpoint the provider names (review C3)
+        let txid = p.rollover_tx(owed, &next.spk(), next_cap)?.txid();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let sig = hex::encode(ch.payer.sign_rollover_next(owed, &next, next_cap)?);
         let body = json!({"chan": chan, "amount": owed, "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry,
                           "payerSpk": hex::encode(&next.payer_spk)}, "sig": sig});
         let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;
-        let txid = r.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
-        if r.get("nextChan").and_then(Value::as_str) != Some(format!("{txid}:1").as_str())
-            || py_u64(r.get("nextCapacity")) != Some(next_cap)
-        {
-            return fail("bad_rollover", "the provider's rollover differs from the one we signed");
-        }
         let np = next.with_funding(&txid, 1, next_cap)?;
         let (payer, refund_hex, auth_key) = self.bind_key(&next_origin, np, secret)?;
         if let Some(cb) = &self.on_refund {
+            // before the reply is judged: the provider may have broadcast the one tx we signed
             cb(&refund_hex, expiry);
+        }
+        if r.get("txid").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() != Some(txid.as_str())
+            || r.get("nextChan").and_then(Value::as_str).map(str::to_ascii_lowercase) != Some(format!("{txid}:1"))
+            || py_u64(r.get("nextCapacity")) != Some(next_cap)
+        {
+            return fail("bad_rollover", format!("the provider's rollover differs from the one we signed (tx {txid})"));
         }
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let mut next_ch = ClientChannel { payer, origin: origin.into(), accepted: ch.accepted.clone(), refund_hex,

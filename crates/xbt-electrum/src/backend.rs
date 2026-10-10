@@ -1,17 +1,23 @@
 //! The light chain backend: the node calls of the xbt402 client path answered from Electrum
 //! servers and verified against our own BLAKE2b header chain (a port of B2 `agentwallet/electrum.py`,
 //! AGP-024; the threat model is in the crate docs and `docs/B2_CHAIN_BACKEND.md`).
+//!
+//! No network read happens under the shared state lock: requests run unlocked and the lock is taken
+//! only to read or record what they returned. Servers sync in parallel; header chunks are checked as
+//! they arrive (the first bad header ends that server's sync, the valid headers before it count).
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use xbt402::funding::{ChainBackend, UtxoInfo};
 use xbt_primitives::address::segwit_address;
 use xbt_primitives::hash::{hex32, sha256};
-use xbt_primitives::header::{self, merkle_root_from_proof, parse_header, split_headers, HeaderChain, MAINNET_CHECKPOINT};
+use xbt_primitives::header::{self, merkle_root_from_proof, parse_header, split_headers, ChainRules, Clock, HeaderChain,
+                             MAINNET_CHECKPOINT, U512};
 use xbt_primitives::network::Chain;
 use xbt_primitives::tx::Tx;
 
@@ -24,6 +30,9 @@ pub const HEADERS_CHUNK: u32 = 2016;
 pub const CHUNKS_PER_BATCH: u32 = 4;
 /// A mainnet tip older than this means every server is behind, or withholding blocks.
 pub const STALE_TIP_S: u64 = 3 * 60 * 60;
+/// A claimed tip is believed up to one block per this many seconds since our tip's time (a quarter
+/// of the target spacing), plus [`HEADERS_CHUNK`]; headers above that are not fetched.
+pub const TIP_CAP_SPACING_S: u64 = 150;
 /// Node RPCs a light client cannot answer: the node wallet, blocks, mining.
 pub const NODE_ONLY: &[&str] = &[
     "getbalances", "getbalance", "sendtoaddress", "listunspent", "createrawtransaction", "fundrawtransaction",
@@ -52,12 +61,52 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// `localhost`, 127.0.0.0/8, `::1` or an IPv4-mapped loopback address.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match h.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => a.is_loopback(),
+        Ok(IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().map(|m| m.is_loopback()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// When the verified chain is believable (see [`HeaderChain::implausible`]): until it is, every
+/// chain answer fails with [`Kind::Implausible`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plausibility {
+    /// Work the chain must carry above the checkpoint.
+    pub min_work_above: U512,
+    /// The tip may trail one block per `floor_spacing_s` since the newest pinned block we hold (or
+    /// the checkpoint) by at most `floor_slack` blocks.
+    pub floor_spacing_s: u64,
+    pub floor_slack: u32,
+}
+
+impl Plausibility {
+    /// Mainnet from `checkpoint`: Knots' nMinimumChainWork less the checkpoint's chainwork (zero for
+    /// a checkpoint of unknown chainwork, which still has to reach the pinned block 964264), and a
+    /// floor of one block per 600 s with 2016 blocks of slack.
+    pub fn mainnet(checkpoint: (u32, &[u8; 32])) -> Self {
+        Self {
+            min_work_above: header::mainnet_min_work_above(checkpoint).unwrap_or(U512::ZERO),
+            floor_spacing_s: 600,
+            floor_slack: HEADERS_CHUNK,
+        }
+    }
+}
+
 /// How the backend is set up.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
-    /// `tcp://host:port` or `ssl://host:port` (certificates verified).
+    /// `ssl://host:port` (certificates verified) or `tcp://host:port`; on mainnet `tcp://` only to a
+    /// loopback host.
     pub servers: Vec<String>,
-    /// `main`, `test`, `testnet4`, `signet` or `regtest`: a light client does not ask a node.
+    /// `main` or `regtest` (testnet3, testnet4 and signet have no header rules here and are refused):
+    /// a light client does not ask a node.
     pub chain: String,
     /// `(height, block hash)`. Mainnet defaults to 961640, the first BLAKE2b block; other chains must set it.
     pub checkpoint: Option<(u32, String)>,
@@ -71,6 +120,24 @@ pub struct Config {
     pub sync_interval: Duration,
     /// Extra CA certificates (PEM) for `ssl://` servers, besides the Mozilla roots.
     pub extra_ca: Vec<PathBuf>,
+    /// None: [`Plausibility::mainnet`] on mainnet, no check elsewhere.
+    pub plausibility: Option<Plausibility>,
+    /// A claimed tip is believed up to one block per this many seconds since our tip's time, plus
+    /// [`HEADERS_CHUNK`]. None: [`TIP_CAP_SPACING_S`] on mainnet, no cap elsewhere (regtest mines
+    /// blocks as fast as it is asked to).
+    pub tip_cap_spacing_s: Option<u64>,
+    /// The current unix time (the 2 h future rule, the tip cap, the height floor); None: the system clock.
+    pub clock: Option<Clock>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config").field("servers", &self.servers).field("chain", &self.chain)
+            .field("checkpoint", &self.checkpoint).field("store_path", &self.store_path).field("timeout", &self.timeout)
+            .field("min_servers", &self.min_servers).field("sync_interval", &self.sync_interval)
+            .field("extra_ca", &self.extra_ca).field("plausibility", &self.plausibility)
+            .field("tip_cap_spacing_s", &self.tip_cap_spacing_s).field("clock", &self.clock.as_ref().map(|_| "custom")).finish()
+    }
 }
 
 impl Config {
@@ -84,6 +151,9 @@ impl Config {
             min_servers: None,
             sync_interval: Duration::from_secs(1),
             extra_ca: Vec::new(),
+            plausibility: None,
+            tip_cap_spacing_s: None,
+            clock: None,
         }
     }
 
@@ -197,8 +267,6 @@ struct Signal {
 
 struct Inner {
     headers: HeaderChain,
-    /// The pinned checkpoint (height, display-order hash).
-    cp: (u32, [u8; 32]),
     last_sync: Option<Instant>,
     watched: BTreeSet<String>,
     txs: HashMap<String, Tx>,
@@ -236,6 +304,9 @@ impl Inner {
     }
 }
 
+/// (the server that claimed it, the height it claimed; 0 or less = its mempool)
+type Claims = Vec<(Arc<Connection>, i64)>;
+
 enum SyncFail {
     OffCheckpoint(String),
     Other(String),
@@ -261,6 +332,14 @@ pub struct ElectrumBackend {
     pub min_servers: usize,
     sync_interval: Duration,
     signal: Arc<Signal>,
+    /// The pinned checkpoint (height, display-order hash).
+    cp: (u32, [u8; 32]),
+    rules: ChainRules,
+    plausibility: Option<Plausibility>,
+    tip_cap_spacing_s: Option<u64>,
+    clock: Clock,
+    /// Held by the one sync in flight; callers with a verified chain do not wait for it.
+    sync_gate: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -270,13 +349,22 @@ impl ElectrumBackend {
             return err(Kind::BadRequest, "no Electrum servers configured");
         }
         let chain = Chain::from_name(&cfg.chain).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?;
+        let addrs = cfg.servers.iter().map(|u| crate::conn::parse_server(u)).collect::<Result<Vec<_>>>()?;
+        if chain == Chain::Main {
+            if let Some((u, _)) = cfg.servers.iter().zip(&addrs).find(|(_, a)| !a.tls && !is_loopback_host(&a.host)) {
+                return err(Kind::BadRequest, format!("{u}: mainnet needs ssl:// (TLS); plain tcp:// only to a loopback host"));
+            }
+        }
         let (cp_h, cp_hash) = match cfg.checkpoint.clone() {
             Some(cp) => cp,
             None if chain == Chain::Main => (MAINNET_CHECKPOINT.0, MAINNET_CHECKPOINT.1.to_string()),
             None => return err(Kind::BadRequest, format!("a {} light backend needs a pinned checkpoint", cfg.chain)),
         };
-        let headers = HeaderChain::with_system_clock(&cfg.chain, (cp_h, &cp_hash), cfg.store_path.as_deref())
+        let cp = (cp_h, hex32(&cp_hash).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?);
+        let clock: Clock = cfg.clock.clone().unwrap_or_else(|| Arc::new(now_s));
+        let headers = HeaderChain::with_clock(&cfg.chain, (cp_h, &cp_hash), cfg.store_path.as_deref(), clock.clone())
             .map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?;
+        let plausibility = cfg.plausibility.clone().or_else(|| (chain == Chain::Main).then(|| Plausibility::mainnet((cp.0, &cp.1))));
         let signal = Arc::new(Signal { tip_dirty: AtomicBool::new(true), changed: Mutex::new(false), cv: Condvar::new() });
         let notify: Notify = {
             let s = signal.clone();
@@ -288,8 +376,7 @@ impl ElectrumBackend {
                 s.cv.notify_all();
             })
         };
-        let needs_tls = cfg.servers.iter().any(|u| crate::conn::parse_server(u).map(|a| a.tls).unwrap_or(false));
-        let tls = if needs_tls {
+        let tls = if addrs.iter().any(|a| a.tls) {
             Some(tls_config(&cfg.extra_ca.iter().map(PathBuf::as_path).collect::<Vec<_>>())?)
         } else {
             None
@@ -307,9 +394,14 @@ impl ElectrumBackend {
             min_servers,
             sync_interval: cfg.sync_interval,
             signal,
+            cp,
+            rules: headers.rules.clone(),
+            plausibility,
+            tip_cap_spacing_s: cfg.tip_cap_spacing_s.or((chain == Chain::Main).then_some(TIP_CAP_SPACING_S)),
+            clock,
+            sync_gate: Mutex::new(()),
             inner: Mutex::new(Inner {
                 headers,
-                cp: (cp_h, hex32(&cp_hash).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?),
                 last_sync: None,
                 watched: BTreeSet::new(),
                 txs: HashMap::new(),
@@ -321,6 +413,15 @@ impl ElectrumBackend {
     }
 
     // --- plumbing ------------------------------------------------------------------------------
+
+    /// The shared state, briefly: never hold it across a request.
+    fn st(&self) -> MutexGuard<'_, Inner> {
+        lock(&self.inner)
+    }
+
+    fn flag(&self, url: &str, reason: impl Into<String>) {
+        self.st().flag(url, reason);
+    }
 
     /// `f` on every connection, in parallel.
     fn each<T: Send>(conns: &[Arc<Connection>], f: impl Fn(&Connection) -> T + Sync) -> Vec<T> {
@@ -334,26 +435,29 @@ impl ElectrumBackend {
     }
 
     /// The connected servers (connecting the others first); an error below `min_servers`.
-    fn live(&self, inner: &mut Inner) -> Result<Vec<Arc<Connection>>> {
+    fn live(&self) -> Result<Vec<Arc<Connection>>> {
         let down: Vec<Arc<Connection>> = self.conns.iter().filter(|c| !c.connected()).cloned().collect();
-        let watched: Vec<(String, Value)> = inner.watched.iter()
-            .map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
-        let results = Self::each(&down, |c| -> Result<()> {
-            c.connect()?;
-            for r in c.subscribe_many(&watched)? {
-                r?;
-            }
-            Ok(())
-        });
-        for (c, r) in down.iter().zip(results) {
-            match r {
-                Ok(()) => {
-                    let (server, proto) = c.server_info();
-                    let st = inner.servers.entry(c.url.clone()).or_default();
-                    st.server = server;
-                    st.proto = proto;
+        if !down.is_empty() {
+            let watched: Vec<(String, Value)> = self.st().watched.iter()
+                .map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
+            let results = Self::each(&down, |c| -> Result<()> {
+                c.connect()?;
+                for r in c.subscribe_many(&watched)? {
+                    r?;
                 }
-                Err(e) => inner.flag(&c.url, format!("unreachable: {e}")),
+                Ok(())
+            });
+            let mut i = self.st();
+            for (c, r) in down.iter().zip(results) {
+                match r {
+                    Ok(()) => {
+                        let (server, proto) = c.server_info();
+                        let st = i.servers.entry(c.url.clone()).or_default();
+                        st.server = server;
+                        st.proto = proto;
+                    }
+                    Err(e) => i.flag(&c.url, format!("unreachable: {e}")),
+                }
             }
         }
         let live: Vec<Arc<Connection>> = self.conns.iter().filter(|c| c.connected()).cloned().collect();
@@ -364,9 +468,9 @@ impl ElectrumBackend {
         Ok(live)
     }
 
-    fn ask(inner: &mut Inner, c: &Connection, method: &str, params: Value) -> Result<Value> {
+    fn ask(&self, c: &Connection, method: &str, params: Value) -> Result<Value> {
         c.request(method, params).map_err(|e| {
-            inner.flag(&c.url, format!("{method}: {e}"));
+            self.flag(&c.url, format!("{method}: {e}"));
             e
         })
     }
@@ -374,48 +478,81 @@ impl ElectrumBackend {
     // --- headers -------------------------------------------------------------------------------
 
     /// Bring our header chain up to the most-work tip any live server shows. Returns our tip.
+    /// With a verified chain, a call that finds another sync in flight answers from the chain as it
+    /// is rather than wait for it.
     pub fn sync(&self, force: bool) -> Result<u32> {
-        let mut inner = lock(&self.inner);
-        self.sync_locked(&mut inner, force)
-    }
-
-    fn sync_locked(&self, inner: &mut Inner, force: bool) -> Result<u32> {
-        let due = inner.last_sync.map(|t| t.elapsed() >= self.sync_interval).unwrap_or(true);
-        if force || due || self.signal.tip_dirty.load(Ordering::SeqCst) || !inner.headers.ready() {
-            self.signal.tip_dirty.store(false, Ordering::SeqCst);
-            let mut off_chain = Vec::new();
-            for c in self.live(inner)? {
-                match self.sync_from(inner, &c) {
-                    Ok(()) => {}
-                    Err(SyncFail::OffCheckpoint(e)) => {
-                        inner.flag(&c.url, format!("headers: {e}"));
-                        off_chain.push(format!("{}: {e}", c.url));
-                    }
-                    Err(SyncFail::Other(e)) => inner.flag(&c.url, format!("headers: {e}")),
+        let (ready, due) = {
+            let i = self.st();
+            (i.headers.ready(), i.last_sync.map(|t| t.elapsed() >= self.sync_interval).unwrap_or(true))
+        };
+        if force || due || !ready || self.signal.tip_dirty.load(Ordering::SeqCst) {
+            let gate = if ready {
+                match self.sync_gate.try_lock() {
+                    Ok(g) => Some(g),
+                    Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                    Err(TryLockError::WouldBlock) => None,
                 }
-            }
-            inner.last_sync = Some(Instant::now());
-            if inner.headers.ready() {
-                let Inner { headers, servers, .. } = &mut *inner;
-                for st in servers.values_mut() {
-                    if let (Some(t), Some(th)) = (st.tip, st.tip_hash.as_ref()) {
-                        st.on_best_chain = Some(headers.at(t).map(|h| &h.hash_hex() == th).unwrap_or(false));
-                    }
-                }
-            } else if !off_chain.is_empty() {
-                let (cp_h, cp) = (inner.cp.0, hex::encode(inner.cp.1));
-                return err(Kind::CheckpointMismatch, format!("no server is on the {} checkpoint {cp_h}:{}.. ({})",
-                                                             self.chain, &cp[..16], off_chain.join("; ")));
+            } else {
+                Some(lock(&self.sync_gate))
+            };
+            if let Some(_g) = gate {
+                self.sync_now()?;
             }
         }
-        if !inner.headers.ready() {
+        self.believable()
+    }
+
+    fn sync_now(&self) -> Result<()> {
+        self.signal.tip_dirty.store(false, Ordering::SeqCst);
+        let live = self.live()?;
+        let results = Self::each(&live, |c| self.sync_from(c));
+        let mut i = self.st();
+        let mut off_chain = Vec::new();
+        for (c, r) in live.iter().zip(results) {
+            match r {
+                Ok(()) => {}
+                Err(SyncFail::OffCheckpoint(e)) => {
+                    i.flag(&c.url, format!("headers: {e}"));
+                    off_chain.push(format!("{}: {e}", c.url));
+                }
+                Err(SyncFail::Other(e)) => i.flag(&c.url, format!("headers: {e}")),
+            }
+        }
+        i.last_sync = Some(Instant::now());
+        if i.headers.ready() {
+            let Inner { headers, servers, .. } = &mut *i;
+            for st in servers.values_mut() {
+                if let (Some(t), Some(th)) = (st.tip, st.tip_hash.as_ref()) {
+                    st.on_best_chain = Some(headers.at(t).map(|h| &h.hash_hex() == th).unwrap_or(false));
+                }
+            }
+        } else if !off_chain.is_empty() {
+            let cp = hex::encode(self.cp.1);
+            return err(Kind::CheckpointMismatch, format!("no server is on the {} checkpoint {}:{}.. ({})",
+                                                         self.chain, self.cp.0, &cp[..16], off_chain.join("; ")));
+        }
+        Ok(())
+    }
+
+    /// Our tip, if the chain can be answered from.
+    fn believable(&self) -> Result<u32> {
+        let i = self.st();
+        if !i.headers.ready() {
             return err(Kind::NotFound, "no Electrum server served the pinned checkpoint");
         }
-        Ok(inner.tip_height())
+        if let Some(why) = self.implausible(&i) {
+            return err(Kind::Implausible, format!("the verified chain is not believable yet: {why}"));
+        }
+        Ok(i.tip_height())
     }
 
-    fn header_at(inner: &mut Inner, c: &Connection, height: u32) -> std::result::Result<header::Header, SyncFail> {
-        let v = Self::ask(inner, c, "blockchain.block.header", json!([height]))?;
+    fn implausible(&self, i: &Inner) -> Option<String> {
+        let p = self.plausibility.as_ref()?;
+        i.headers.implausible(p.min_work_above, Some((p.floor_spacing_s, p.floor_slack)))
+    }
+
+    fn header_at(&self, c: &Connection, height: u32) -> std::result::Result<header::Header, SyncFail> {
+        let v = self.ask(c, "blockchain.block.header", json!([height]))?;
         let raw = hex::decode(v.as_str().unwrap_or("")).map_err(|_| SyncFail::Other("block.header: not hex".into()))?;
         let h = parse_header(&raw)?;
         if h.height != height {
@@ -424,7 +561,28 @@ impl ElectrumBackend {
         Ok(h)
     }
 
-    fn sync_from(&self, inner: &mut Inner, c: &Connection) -> std::result::Result<(), SyncFail> {
+    /// The checkpoint header and the headers below it that the median-time rule needs.
+    fn fetch_checkpoint(&self, c: &Connection) -> std::result::Result<(), SyncFail> {
+        let off = |e: String| SyncFail::OffCheckpoint(e);
+        let (cp, n) = (self.cp.0, self.st().headers.prior_needed());
+        let raw = match self.header_at(c, cp) {
+            Ok(h) => h.raw,
+            Err(SyncFail::Other(e)) | Err(SyncFail::OffCheckpoint(e)) => return Err(off(e)),
+        };
+        let mut prior: Vec<Vec<u8>> = Vec::new();
+        if n > 0 {
+            let a = self.ask(c, "blockchain.block.headers", json!([cp - n, n])).map_err(|e| off(e.msg))?;
+            let blob = hex::decode(a.get("hex").and_then(Value::as_str).unwrap_or("")).map_err(|_| off("block.headers: not hex".into()))?;
+            prior = split_headers(&blob).map_err(|e| off(e.to_string()))?.into_iter().map(<[u8]>::to_vec).collect();
+        }
+        let mut i = self.st();
+        if !i.headers.ready() {
+            i.headers.set_checkpoint(&raw, &prior).map_err(|e| off(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn sync_from(&self, c: &Connection) -> std::result::Result<(), SyncFail> {
         let tip = c.subscribe("blockchain.headers.subscribe", json!([])).map_err(|e| SyncFail::Other(e.msg))?;
         let th = tip.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok())
             .ok_or_else(|| SyncFail::Other("headers.subscribe: no height".into()))?;
@@ -432,45 +590,61 @@ impl ElectrumBackend {
             .map_err(|_| SyncFail::Other("headers.subscribe: not hex".into()))?;
         let tip_h = parse_header(&tip_raw)?;
         {
-            let st = inner.servers.entry(c.url.clone()).or_default();
+            let mut i = self.st();
+            let st = i.servers.entry(c.url.clone()).or_default();
             st.tip = Some(th);
             st.tip_hash = Some(tip_h.hash_hex());
         }
-        let cp = inner.cp.0;
+        let cp = self.cp.0;
         if th < cp {
             return Err(SyncFail::OffCheckpoint(format!("server tip {th} is below the checkpoint {cp}")));
         }
         if tip_h.height != th {
             return Err(SyncFail::Other(format!("tip at {th} commits height {}", tip_h.height)));
         }
-        if !inner.headers.ready() {
-            let raw = match Self::header_at(inner, c, cp) {
-                Ok(h) => h.raw,
-                Err(SyncFail::Other(e)) | Err(SyncFail::OffCheckpoint(e)) => return Err(SyncFail::OffCheckpoint(e)),
-            };
-            inner.headers.set_checkpoint(&raw).map_err(|e| SyncFail::OffCheckpoint(e.to_string()))?;
+        let ready = self.st().headers.ready();
+        header::check_pow(&tip_h, &self.rules).map_err(|e| {
+            // before we hold a chain, a tip outside our powLimit is another chain
+            let why = format!("tip at {th}: {e}");
+            if ready { SyncFail::Other(why) } else { SyncFail::OffCheckpoint(why) }
+        })?;
+        if !ready {
+            self.fetch_checkpoint(c)?;
         }
-        if inner.headers.at(th).map(|h| h.hash == tip_h.hash).unwrap_or(false) {
-            return Ok(()); // its tip is on our chain already
+        let (ours, our_time, on_ours) = {
+            let i = self.st();
+            let t = i.headers.tip().map(|h| h.time as u64).unwrap_or(0);
+            (i.tip_height(), t, i.headers.at(th).map(|h| h.hash == tip_h.hash).unwrap_or(false))
+        };
+        if on_ours {
+            return Ok(());
+        }
+        let elapsed = (self.clock)().saturating_sub(our_time);
+        let cap = self.tip_cap_spacing_s.map_or(u32::MAX, |s| {
+            (ours as u64 + elapsed / s.max(1) + HEADERS_CHUNK as u64).min(u32::MAX as u64) as u32
+        });
+        let end = th.min(cap);
+        if th > cap {
+            self.flag(&c.url, format!("headers: claims tip {th}, beyond the plausible {cap}: nothing above it is fetched"));
         }
         // the highest height where the server agrees with us (the checkpoint at worst)
-        let ours = inner.tip_height();
-        let (mut h, mut step) = (th.min(ours), 1u32);
+        let (mut h, mut step) = (end.min(ours), 1u32);
         while h > cp {
-            let theirs = Self::header_at(inner, c, h)?;
-            if inner.headers.at(h).map(|m| m.hash == theirs.hash).unwrap_or(false) {
+            let theirs = self.header_at(c, h)?;
+            if self.st().headers.at(h).map(|m| m.hash == theirs.hash).unwrap_or(false) {
                 break;
             }
             h = h.saturating_sub(step).max(cp);
             step = step.saturating_mul(2);
         }
-        let mut raws: Vec<Vec<u8>> = Vec::new();
+        let mut b = self.st().headers.branch(h)?;
         let mut start = h + 1;
-        'fetch: while start <= th {
+        let mut bad = None;
+        'fetch: while start <= end {
             let mut reqs = Vec::new();
             let mut s = start;
-            while s <= th && (reqs.len() as u32) < CHUNKS_PER_BATCH {
-                let n = HEADERS_CHUNK.min(th - s + 1);
+            while s <= end && (reqs.len() as u32) < CHUNKS_PER_BATCH {
+                let n = HEADERS_CHUNK.min(end - s + 1);
                 reqs.push(("blockchain.block.headers".to_string(), json!([s, n])));
                 s += n;
             }
@@ -481,16 +655,24 @@ impl ElectrumBackend {
                     .map_err(|_| SyncFail::Other("block.headers: not hex".into()))?;
                 let chunk = split_headers(&blob)?;
                 if chunk.is_empty() {
-                    break 'fetch; // withheld: connect what we have, most work still decides
+                    break 'fetch; // withheld: keep what we have, most work still decides
                 }
-                start += chunk.len() as u32;
-                raws.extend(chunk.into_iter().map(<[u8]>::to_vec));
+                let before = b.len();
+                let r = b.extend(&chunk);
+                start += (b.len() - before) as u32;
+                if let Err(e) = r {
+                    bad = Some(e);
+                    break 'fetch;
+                }
             }
         }
-        if !raws.is_empty() {
-            inner.headers.connect(h, &raws)?;
+        if !b.is_empty() {
+            self.st().headers.adopt(b)?;
         }
-        if start <= th {
+        if let Some(e) = bad {
+            return Err(SyncFail::Other(format!("block.headers: {e} (the headers before it were kept)")));
+        }
+        if start <= end {
             // most work still decides; this server just cannot back the tip it claims
             return Err(SyncFail::Other(format!("withheld headers: served up to {}, claims tip {th}", start - 1)));
         }
@@ -499,8 +681,7 @@ impl ElectrumBackend {
 
     /// `(height, display hex)` of the pinned checkpoint.
     pub fn checkpoint(&self) -> (u32, String) {
-        let i = lock(&self.inner);
-        (i.cp.0, hex::encode(i.cp.1))
+        (self.cp.0, hex::encode(self.cp.1))
     }
 
     // --- verified transactions -----------------------------------------------------------------
@@ -512,39 +693,43 @@ impl ElectrumBackend {
         (tx.to_hex() == s.to_ascii_lowercase() && tx.txid() == txid).then_some(tx)
     }
 
-    fn fetch_tx(&self, inner: &mut Inner, txid: &str) -> Result<Option<Tx>> {
+    fn fetch_tx(&self, txid: &str) -> Result<Option<Tx>> {
         let txid = txid.to_ascii_lowercase();
-        if let Some(t) = inner.txs.get(&txid) {
+        if let Some(t) = self.st().txs.get(&txid) {
             return Ok(Some(t.clone()));
         }
-        for c in self.live(inner)? {
+        for c in self.live()? {
             // "not found" is an answer, not a fault
             let Ok(raw) = c.request("blockchain.transaction.get", json!([txid])) else { continue };
             match Self::verify_raw(&txid, &raw) {
                 Some(tx) => {
-                    inner.txs.insert(txid, tx.clone());
+                    self.st().txs.insert(txid, tx.clone());
                     return Ok(Some(tx));
                 }
-                None => inner.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &txid[..16.min(txid.len())])),
+                None => self.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &txid[..16.min(txid.len())])),
             }
         }
         Ok(None)
     }
 
     /// Several transactions: one batch to the first live server, then one by one for the rest.
-    fn fetch_txs(&self, inner: &mut Inner, txids: &[String]) -> Result<()> {
-        let missing: Vec<String> = txids.iter().filter(|t| !inner.txs.contains_key(*t)).cloned().collect();
+    fn fetch_txs(&self, txids: &[String]) -> Result<()> {
+        let missing: Vec<String> = {
+            let i = self.st();
+            txids.iter().filter(|t| !i.txs.contains_key(*t)).cloned().collect()
+        };
         if missing.len() > 1 {
-            if let Some(c) = self.live(inner)?.first().cloned() {
+            if let Some(c) = self.live()?.first().cloned() {
                 let reqs: Vec<(String, Value)> = missing.iter().map(|t| ("blockchain.transaction.get".to_string(), json!([t]))).collect();
                 if let Ok(answers) = c.batch(&reqs) {
+                    let mut i = self.st();
                     for (t, a) in missing.iter().zip(answers) {
                         let Ok(raw) = a else { continue };
                         match Self::verify_raw(t, &raw) {
                             Some(tx) => {
-                                inner.txs.insert(t.clone(), tx);
+                                i.txs.insert(t.clone(), tx);
                             }
-                            None => inner.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &t[..16])),
+                            None => i.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &t[..16])),
                         }
                     }
                 }
@@ -554,16 +739,17 @@ impl ElectrumBackend {
     }
 
     /// txid -> [(server, claimed height)], the union over every live server.
-    fn history(&self, inner: &mut Inner, spk: &[u8]) -> Result<HashMap<String, Vec<(Arc<Connection>, i64)>>> {
+    fn history(&self, spk: &[u8]) -> Result<HashMap<String, Claims>> {
         let sh = scripthash(spk);
-        let live = self.live(inner)?;
+        let live = self.live()?;
         let answers = Self::each(&live, |c| c.request("blockchain.scripthash.get_history", json!([sh])));
-        let mut out: HashMap<String, Vec<(Arc<Connection>, i64)>> = HashMap::new();
+        let mut out: HashMap<String, Claims> = HashMap::new();
+        let mut i = self.st();
         for (c, a) in live.iter().zip(answers) {
             let hist = match a {
                 Ok(h) => h,
                 Err(e) => {
-                    inner.flag(&c.url, format!("get_history: {e}"));
+                    i.flag(&c.url, format!("get_history: {e}"));
                     continue;
                 }
             };
@@ -572,21 +758,29 @@ impl ElectrumBackend {
                     (Some(t), Some(h)) if t.len() == 64 && t.chars().all(|x| x.is_ascii_hexdigit()) => {
                         out.entry(t.to_ascii_lowercase()).or_default().push((c.clone(), h));
                     }
-                    _ => inner.flag(&c.url, "get_history: malformed entry"),
+                    _ => i.flag(&c.url, "get_history: malformed entry"),
                 }
             }
         }
         Ok(out)
     }
 
+    /// A cached proof, if its block is still on our best chain (dropped if it was reorged out).
+    fn cached_conf(&self, txid: &str) -> Option<TxStatus> {
+        let mut i = self.st();
+        let c = i.conf.get(txid).copied()?;
+        if i.conf_holds(&c) {
+            return Some(TxStatus::Confirmed { height: c.0, block_hash: c.1 });
+        }
+        i.conf.remove(txid);
+        None
+    }
+
     /// Confirmed once a Merkle proof ties `txid` to our header at a claimed height; Mempool if
     /// only mempool claims remain; None if no claim holds.
-    fn confirmed(&self, inner: &mut Inner, txid: &str, claims: &[(Arc<Connection>, i64)]) -> Result<Option<TxStatus>> {
-        if let Some(c) = inner.conf.get(txid).copied() {
-            if inner.conf_holds(&c) {
-                return Ok(Some(TxStatus::Confirmed { height: c.0, block_hash: c.1 }));
-            }
-            inner.conf.remove(txid); // reorged out: prove it again
+    fn confirmed(&self, txid: &str, claims: &[(Arc<Connection>, i64)]) -> Result<Option<TxStatus>> {
+        if let Some(st) = self.cached_conf(txid) {
+            return Ok(Some(st));
         }
         let txid_b = hex32(txid).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?;
         let mut tried = BTreeSet::new();
@@ -600,14 +794,13 @@ impl ElectrumBackend {
             if !tried.insert((c.url.clone(), height)) {
                 continue;
             }
-            if inner.headers.at(height).is_none() {
-                self.sync_locked(inner, true)?;
-                if inner.headers.at(height).is_none() {
-                    continue; // a height beyond our best chain: not proven
-                }
+            let mut hdr = self.st().headers.at(height).cloned();
+            if hdr.is_none() {
+                self.sync(true)?;
+                hdr = self.st().headers.at(height).cloned();
             }
-            let hdr = inner.headers.at(height).expect("checked").clone();
-            let m = match Self::ask(inner, c, "blockchain.transaction.get_merkle", json!([txid, height])) {
+            let Some(hdr) = hdr else { continue }; // a height beyond our best chain: not proven
+            let m = match self.ask(c, "blockchain.transaction.get_merkle", json!([txid, height])) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -616,22 +809,26 @@ impl ElectrumBackend {
             });
             let pos = m.get("pos").and_then(Value::as_u64);
             let (Some(branch), Some(pos)) = (branch, pos) else {
-                inner.flag(&c.url, format!("get_merkle {}@{height}: malformed", &txid[..16]));
+                self.flag(&c.url, format!("get_merkle {}@{height}: malformed", &txid[..16]));
                 continue;
             };
             let root = match merkle_root_from_proof(&txid_b, &branch, pos, Some(hdr.txcount as u32)) {
                 Ok(r) => r,
                 Err(e) => {
-                    inner.flag(&c.url, format!("get_merkle {}@{height}: {e}", &txid[..16]));
+                    self.flag(&c.url, format!("get_merkle {}@{height}: {e}", &txid[..16]));
                     continue;
                 }
             };
             let bh = m.get("block_height").and_then(Value::as_u64).unwrap_or(height as u64);
             if root != hdr.merkle_root || bh != height as u64 {
-                inner.flag(&c.url, format!("get_merkle {}@{height}: proof does not reach our header", &txid[..16]));
+                self.flag(&c.url, format!("get_merkle {}@{height}: proof does not reach our header", &txid[..16]));
                 continue;
             }
-            inner.conf.insert(txid.to_string(), (height, hdr.hash));
+            let mut i = self.st();
+            if !i.conf_holds(&(height, hdr.hash)) {
+                continue; // reorged out while we asked
+            }
+            i.conf.insert(txid.to_string(), (height, hdr.hash));
             return Ok(Some(TxStatus::Confirmed { height, block_hash: hdr.hash }));
         }
         Ok(mempool.then_some(TxStatus::Mempool))
@@ -643,18 +840,16 @@ impl ElectrumBackend {
             .take(2).map(|o| o.script_pubkey.clone()).collect()
     }
 
-    fn locate(&self, inner: &mut Inner, txid: &str) -> Result<(Option<Tx>, Option<TxStatus>)> {
+    fn locate(&self, txid: &str) -> Result<(Option<Tx>, Option<TxStatus>)> {
         let txid = txid.to_ascii_lowercase();
-        let Some(tx) = self.fetch_tx(inner, &txid)? else { return Ok((None, None)) };
-        if let Some(c) = inner.conf.get(&txid).copied() {
-            if inner.conf_holds(&c) {
-                return Ok((Some(tx), Some(TxStatus::Confirmed { height: c.0, block_hash: c.1 })));
-            }
+        let Some(tx) = self.fetch_tx(&txid)? else { return Ok((None, None)) };
+        if let Some(st) = self.cached_conf(&txid) {
+            return Ok((Some(tx), Some(st)));
         }
         for spk in Self::index_spks(&tx) {
-            let hist = self.history(inner, &spk)?;
+            let hist = self.history(&spk)?;
             if let Some(claims) = hist.get(&txid) {
-                let st = self.confirmed(inner, &txid, claims)?;
+                let st = self.confirmed(&txid, claims)?;
                 return Ok((Some(tx), st));
             }
         }
@@ -663,17 +858,17 @@ impl ElectrumBackend {
 
     /// (spending txid, its status) from the union of the script's histories: the spend parsed
     /// from the spending transaction itself. A mempool spend is returned only with `mempool`.
-    fn spender(&self, inner: &mut Inner, txid: &str, vout: u32, spk: &[u8], mempool: bool) -> Result<Option<(String, TxStatus)>> {
-        let hist = self.history(inner, spk)?;
+    fn spender(&self, txid: &str, vout: u32, spk: &[u8], mempool: bool) -> Result<Option<(String, TxStatus)>> {
+        let hist = self.history(spk)?;
         let others: Vec<String> = hist.keys().filter(|t| t.as_str() != txid).cloned().collect();
-        self.fetch_txs(inner, &others)?;
+        self.fetch_txs(&others)?;
         let mut found = None;
         for t in others {
-            let Some(stx) = self.fetch_tx(inner, &t)? else { continue };
+            let Some(stx) = self.fetch_tx(&t)? else { continue };
             if !stx.inputs.iter().any(|i| i.prevout.txid_hex() == txid && i.prevout.vout == vout) {
                 continue;
             }
-            match self.confirmed(inner, &t, &hist[&t])? {
+            match self.confirmed(&t, &hist[&t])? {
                 Some(st @ TxStatus::Confirmed { .. }) => return Ok(Some((t, st))),
                 Some(TxStatus::Mempool) if mempool => found = Some((t, TxStatus::Mempool)),
                 _ => {}
@@ -690,18 +885,16 @@ impl ElectrumBackend {
 
     /// Our header at `height` (display hex hash).
     pub fn block_hash(&self, height: u32) -> Result<String> {
-        let mut i = lock(&self.inner);
-        let tip = self.sync_locked(&mut i, false)?;
-        i.headers.at(height).map(|h| h.hash_hex()).ok_or_else(|| {
-            ElectrumError::new(Kind::NotFound, format!("Block height {height} out of range (verified chain {}..{tip})", i.cp.0))
+        let tip = self.sync(false)?;
+        self.st().headers.at(height).map(|h| h.hash_hex()).ok_or_else(|| {
+            ElectrumError::new(Kind::NotFound, format!("Block height {height} out of range (verified chain {}..{tip})", self.cp.0))
         })
     }
 
     /// The transaction and where it is. None if no server shows it (or no claim about it holds).
     pub fn transaction(&self, txid: &str) -> Result<Option<(Tx, TxStatus)>> {
-        let mut i = lock(&self.inner);
-        self.sync_locked(&mut i, false)?;
-        Ok(match self.locate(&mut i, txid)? {
+        self.sync(false)?;
+        Ok(match self.locate(txid)? {
             (Some(tx), Some(st)) => Some((tx, st)),
             _ => None,
         })
@@ -710,20 +903,20 @@ impl ElectrumBackend {
     /// `gettxout`. An output counts as spent only when a confirmed spend is proven: a spend seen
     /// only in a mempool never hides it (so a lying server cannot talk a payer out of a refund).
     pub fn tx_out(&self, txid: &str, vout: u32, include_mempool: bool) -> Result<Option<TxOutInfo>> {
-        let mut i = lock(&self.inner);
         let txid = txid.to_ascii_lowercase();
-        self.sync_locked(&mut i, false)?;
-        let (Some(tx), Some(st)) = self.locate(&mut i, &txid)? else { return Ok(None) };
+        self.sync(false)?;
+        let (Some(tx), Some(st)) = self.locate(&txid)? else { return Ok(None) };
         let Some(out) = tx.outputs.get(vout as usize).cloned() else { return Ok(None) };
         if st == TxStatus::Mempool && !include_mempool {
             return Ok(None);
         }
-        if self.spender(&mut i, &txid, vout, &out.script_pubkey, false)?.is_some() {
+        if self.spender(&txid, vout, &out.script_pubkey, false)?.is_some() {
             return Ok(None);
         }
+        let i = self.st();
         let tip = i.tip_height();
         let confirmations = match st {
-            TxStatus::Confirmed { height, .. } => tip + 1 - height,
+            TxStatus::Confirmed { height, .. } => (tip + 1).saturating_sub(height),
             TxStatus::Mempool => 0,
         };
         Ok(Some(TxOutInfo {
@@ -738,23 +931,22 @@ impl ElectrumBackend {
     /// `gettxspendingprevout` for one outpoint: the spending txid, mempool spends included (a
     /// hint for the watcher; [`Self::tx_out`] is what decides).
     pub fn spending_tx(&self, txid: &str, vout: u32) -> Result<Option<(String, TxStatus)>> {
-        let mut i = lock(&self.inner);
         let txid = txid.to_ascii_lowercase();
-        self.sync_locked(&mut i, false)?;
-        let Some(tx) = self.fetch_tx(&mut i, &txid)? else { return Ok(None) };
+        self.sync(false)?;
+        let Some(tx) = self.fetch_tx(&txid)? else { return Ok(None) };
         let Some(out) = tx.outputs.get(vout as usize) else { return Ok(None) };
         let spk = out.script_pubkey.clone();
-        self.spender(&mut i, &txid, vout, &spk, true)
+        self.spender(&txid, vout, &spk, true)
     }
 
     /// Broadcast to every live server. Ok once one accepts it (and answers with its txid).
     pub fn broadcast(&self, hex_tx: &str) -> Result<String> {
         let tx = Tx::parse_hex(hex_tx).map_err(|e| ElectrumError::new(Kind::BadRequest, format!("TX decode failed: {e}")))?;
         let txid = tx.txid();
-        let mut i = lock(&self.inner);
-        let live = self.live(&mut i)?;
+        let live = self.live()?;
         let answers = Self::each(&live, |c| c.request("blockchain.transaction.broadcast", json!([hex_tx])));
         let (mut errors, mut accepted) = (Vec::new(), false);
+        let mut i = self.st();
         for (c, a) in live.iter().zip(answers) {
             match a {
                 Ok(v) if v.as_str().map(str::to_ascii_lowercase).as_deref() == Some(txid.as_str()) => accepted = true,
@@ -773,38 +965,40 @@ impl ElectrumBackend {
     /// `scantxoutset raw(spk)`: the script's confirmed, proven, unspent coins, from the union of
     /// every server's unspent list.
     pub fn unspent(&self, spk: &[u8]) -> Result<Vec<Utxo>> {
-        let mut i = lock(&self.inner);
-        self.sync_locked(&mut i, false)?;
+        self.sync(false)?;
         let sh = scripthash(spk);
-        let live = self.live(&mut i)?;
+        let live = self.live()?;
         let answers = Self::each(&live, |c| c.request("blockchain.scripthash.listunspent", json!([sh])));
-        let mut claims: HashMap<(String, u32), Vec<(Arc<Connection>, i64)>> = HashMap::new();
-        for (c, a) in live.iter().zip(answers) {
-            let Ok(list) = a else { continue };
-            for u in list.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                match (u.get("tx_hash").and_then(Value::as_str), u.get("tx_pos").and_then(Value::as_u64), u.get("height").and_then(Value::as_i64)) {
-                    (Some(t), Some(n), Some(h)) if t.len() == 64 && n <= u32::MAX as u64 => {
-                        claims.entry((t.to_ascii_lowercase(), n as u32)).or_default().push((c.clone(), h));
+        let mut claims: HashMap<(String, u32), Claims> = HashMap::new();
+        {
+            let mut i = self.st();
+            for (c, a) in live.iter().zip(answers) {
+                let Ok(list) = a else { continue };
+                for u in list.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                    match (u.get("tx_hash").and_then(Value::as_str), u.get("tx_pos").and_then(Value::as_u64), u.get("height").and_then(Value::as_i64)) {
+                        (Some(t), Some(n), Some(h)) if t.len() == 64 && n <= u32::MAX as u64 => {
+                            claims.entry((t.to_ascii_lowercase(), n as u32)).or_default().push((c.clone(), h));
+                        }
+                        _ => i.flag(&c.url, "listunspent: malformed entry"),
                     }
-                    _ => i.flag(&c.url, "listunspent: malformed entry"),
                 }
             }
         }
         let mut keys: Vec<(String, u32)> = claims.keys().cloned().collect();
         keys.sort();
         let txids: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
-        self.fetch_txs(&mut i, &txids)?;
+        self.fetch_txs(&txids)?;
         let mut out = Vec::new();
         for (txid, n) in keys {
-            let Some(tx) = self.fetch_tx(&mut i, &txid)? else { continue };
+            let Some(tx) = self.fetch_tx(&txid)? else { continue };
             match tx.outputs.get(n as usize) {
                 Some(o) if o.script_pubkey == spk => {}
                 _ => continue,
             }
-            let Some(TxStatus::Confirmed { height, block_hash }) = self.confirmed(&mut i, &txid, &claims[&(txid.clone(), n)])? else {
+            let Some(TxStatus::Confirmed { height, block_hash }) = self.confirmed(&txid, &claims[&(txid.clone(), n)])? else {
                 continue; // the UTXO set holds confirmed coins only
             };
-            if self.spender(&mut i, &txid, n, spk, false)?.is_some() {
+            if self.spender(&txid, n, spk, false)?.is_some() {
                 continue;
             }
             out.push(Utxo { txid, vout: n, value: tx.outputs[n as usize].value.max(0) as u64, script_pubkey: spk.to_vec(), height,
@@ -815,11 +1009,11 @@ impl ElectrumBackend {
 
     /// Unverifiable: the median of the servers' answers.
     pub fn estimate_fee(&self, blocks: u32) -> Result<FeeEstimate> {
-        let mut i = lock(&self.inner);
-        let live = self.live(&mut i)?;
+        let live = self.live()?;
         let answers = Self::each(&live, |c| c.request("blockchain.estimatefee", json!([blocks])));
         let mut fees = Vec::new();
         let mut any = false;
+        let mut i = self.st();
         for (c, a) in live.iter().zip(answers) {
             match a.map(|v| v.as_f64()) {
                 Ok(Some(f)) if f.is_finite() => {
@@ -849,12 +1043,15 @@ impl ElectrumBackend {
     /// Subscribe every live server to these scripts: a change (a close, a refund, a funding
     /// confirming) wakes [`Self::wait_for_change`]. Returns how many scripts are watched.
     pub fn watch(&self, spks: &[&[u8]]) -> Result<usize> {
-        let mut i = lock(&self.inner);
-        let new: Vec<String> = spks.iter().map(|s| scripthash(s)).filter(|sh| !i.watched.contains(sh)).collect();
+        let new: Vec<String> = {
+            let i = self.st();
+            spks.iter().map(|s| scripthash(s)).filter(|sh| !i.watched.contains(sh)).collect()
+        };
         if !new.is_empty() {
             let reqs: Vec<(String, Value)> = new.iter().map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
-            let live = self.live(&mut i)?;
+            let live = self.live()?;
             let answers = Self::each(&live, |c| c.subscribe_many(&reqs));
+            let mut i = self.st();
             for (c, a) in live.iter().zip(answers) {
                 match a {
                     Ok(rs) => {
@@ -869,7 +1066,7 @@ impl ElectrumBackend {
             }
             i.watched.extend(new);
         }
-        Ok(i.watched.len())
+        Ok(self.st().watched.len())
     }
 
     /// Block until a subscribed script or the tip changes, or `timeout`. True if something did.
@@ -879,11 +1076,11 @@ impl ElectrumBackend {
         std::mem::replace(&mut *g, false)
     }
 
-    /// Checkpoint, tip, tip age, each server's tip and whether it is on our best chain, errors, the
-    /// scripts watched and the last verification failures.
+    /// Checkpoint, tip, tip age, whether the chain is believable yet (and why not), each server's tip
+    /// and whether it is on our best chain, errors, the scripts watched and the last verification failures.
     pub fn status(&self) -> Value {
-        let i = lock(&self.inner);
-        let (cp_h, cp) = i.cp;
+        let i = self.st();
+        let (cp_h, cp) = self.cp;
         let tip = i.headers.tip();
         let tip_age = tip.map(|t| now_s().saturating_sub(t.time as u64));
         let servers: Vec<Value> = self.conns.iter().map(|c| {
@@ -893,16 +1090,18 @@ impl ElectrumBackend {
         }).collect();
         let flags: Vec<Value> = i.flags.iter().rev().take(10).rev()
             .map(|f| json!({"server": f.server, "reason": f.reason, "t": f.t})).collect();
+        let implausible = if i.headers.ready() { self.implausible(&i) } else { None };
         json!({"backend": "electrum", "chain": self.chain, "checkpoint": [cp_h, hex::encode(cp)],
                "tip": tip.map(|_| i.tip_height()), "tip_hash": tip.map(|t| t.hash_hex()), "tip_age_s": tip_age,
                "tip_stale": tip_age.map(|a| self.chain == "main" && a > STALE_TIP_S).unwrap_or(false),
+               "implausible": implausible,
                "min_servers": self.min_servers, "watched_scripts": i.watched.len(), "servers": servers,
                "verification_failures": flags})
     }
 
     /// Every verification failure so far (at most the last 50).
     pub fn flags(&self) -> Vec<Flag> {
-        lock(&self.inner).flags.iter().cloned().collect()
+        self.st().flags.iter().cloned().collect()
     }
 
     pub fn close(&self) {
@@ -947,7 +1146,7 @@ impl ElectrumBackend {
             TxStatus::Confirmed { height, block_hash } => {
                 d["blockhash"] = hex::encode(block_hash).into();
                 d["height"] = height.into();
-                d["confirmations"] = (tip + 1 - height).into();
+                d["confirmations"] = (tip + 1).saturating_sub(height).into();
             }
             TxStatus::Mempool => d["confirmations"] = 0.into(),
         }
@@ -981,16 +1180,17 @@ impl ElectrumBackend {
             "getblockheader" => {
                 let hash = hex32(arg(0).as_str().unwrap_or("")).map_err(|_| bad("block hash"))?;
                 let verbose = arg(1).as_bool().unwrap_or(true);
-                let mut i = lock(&self.inner);
-                let tip = self.sync_locked(&mut i, false)?;
+                self.sync(false)?;
+                let i = self.st();
+                let tip = i.tip_height();
                 let height = i.headers.height_of(&hash).ok_or_else(|| ElectrumError::new(Kind::NotFound, "Block not found"))?;
-                let h = i.headers.at(height).expect("height_of");
+                let h = i.headers.at(height).ok_or_else(|| ElectrumError::new(Kind::NotFound, "Block not found"))?;
                 if !verbose {
                     return Ok(hex::encode(&h.raw).into());
                 }
                 let mut root = h.merkle_root;
                 root.reverse();
-                let mut d = json!({"hash": h.hash_hex(), "height": height, "confirmations": tip + 1 - height, "time": h.time,
+                let mut d = json!({"hash": h.hash_hex(), "height": height, "confirmations": (tip + 1).saturating_sub(height), "time": h.time,
                                    "bits": format!("{:08x}", h.bits), "nTx": h.txcount, "merkleroot": hex::encode(root)});
                 if let Some(prev) = height.checked_sub(1).and_then(|ph| i.headers.at(ph)) {
                     d["previousblockhash"] = prev.hash_hex().into();
@@ -1040,7 +1240,7 @@ impl ElectrumBackend {
                 if !verbose {
                     return Ok(tx.to_hex().into());
                 }
-                let tip = lock(&self.inner).tip_height();
+                let tip = self.st().tip_height();
                 Ok(self.verbose(&tx, st, tip))
             }
             "sendrawtransaction" => Ok(self.broadcast(arg(0).as_str().ok_or_else(|| bad("hex"))?)?.into()),
@@ -1062,7 +1262,7 @@ impl ElectrumBackend {
                                              "blockhash": u.block_hash}));
                     }
                 }
-                let i = lock(&self.inner);
+                let i = self.st();
                 Ok(json!({"success": true, "height": i.tip_height(), "bestblock": i.headers.tip().map(|h| h.hash_hex()),
                           "unspents": unspents, "total_amount": total as f64 / SATS}))
             }

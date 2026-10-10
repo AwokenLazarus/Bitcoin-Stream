@@ -16,6 +16,7 @@
 //! * [`signer`]: the [`signer::StateSigner`] seam, so the payer's keys can live in another
 //!   process (B2's signer, `xbt-signer`); [`signer::LocalSigner`] keeps them in memory.
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
+//! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
 //! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
@@ -28,8 +29,10 @@ pub mod conditional;
 pub mod error;
 pub mod funding;
 pub mod hub;
+pub mod hub_keys;
 pub mod json;
 pub mod ledger;
+pub mod maturity;
 pub mod provider;
 pub mod route;
 pub mod route_client;

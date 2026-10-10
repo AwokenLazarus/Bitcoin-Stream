@@ -259,7 +259,7 @@ impl RouteWal {
                 continue;
             };
             let rec = WalRecord { v, seq, calls, acc, us: r.get("us").and_then(Value::as_f64).unwrap_or(0.0) };
-            if out.get(sid).map_or(true, |o| v > o.v) {
+            if out.get(sid).is_none_or(|o| v > o.v) {
                 out.insert(sid.to_string(), rec);
             }
         }

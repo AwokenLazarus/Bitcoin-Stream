@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 /// What `rail=ln` needs, and nothing else (the README's baked macaroon).
 pub const NEEDED_OPS: [&str; 4] = ["info:read", "offchain:read", "offchain:write", "onchain:read"];
 
-/// Permissions that let a holder move funds on chain, sign arbitrary data or mint new macaroons:
-/// refused on mainnet.
+/// Permissions that let a holder move funds on chain, sign arbitrary data or mint new macaroons, named in
+/// `ln_status`. Mainnet refuses every permission outside [`NEEDED_OPS`], not only these (AGP-066).
 pub const DANGEROUS_OPS: [&str; 4] = ["onchain:write", "macaroon:generate", "macaroon:write", "signer:generate"];
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -158,6 +158,18 @@ impl Macaroon {
         self.ops.iter().filter(|o| DANGEROUS_OPS.contains(&o.as_str()) || o.ends_with(":*")).cloned().collect()
     }
 
+    /// AGP-066 (review L2): why this macaroon is more than `rail=ln` needs, if it is. An allowlist: any
+    /// permission outside [`NEEDED_OPS`] (a `uri:` one such as `uri:/lnrpc.Lightning/SendCoins` included),
+    /// or permissions that cannot be read from the identifier.
+    pub fn beyond_needed(&self) -> Option<String> {
+        let need = NEEDED_OPS.join(" ");
+        if self.ops.is_empty() {
+            return Some(format!("the LN macaroon's permissions cannot be read (not an LND identifier): bake one with only {need}"));
+        }
+        let excess = self.excess_ops();
+        (!excess.is_empty()).then(|| format!("the LN macaroon grants {}: bake one with only {need}", excess.join(", ")))
+    }
+
     /// For `ln_status`: the permissions and caveats, with what each means for a REST client.
     pub fn report(&self) -> Value {
         let ip = self.caveat("ipaddr").or_else(|| self.caveat("iprange"));
@@ -169,7 +181,8 @@ impl Macaroon {
             }
             Some(a) => format!("IP caveat {a}: over REST LND sees 127.0.0.1, so REST calls fail unless {a} covers loopback"),
         };
-        json!({"ops": self.ops, "excess_ops": self.excess_ops(), "dangerous_ops": self.dangerous_ops(), "caveats": self.caveats,
+        json!({"ops": self.ops, "excess_ops": self.excess_ops(), "dangerous_ops": self.dangerous_ops(), "only_needed": self.beyond_needed().is_none(),
+               "caveats": self.caveats,
                "ip_caveat": ip, "ip_note": ip_note, "time_before": self.caveat("time-before")})
     }
 }
@@ -222,7 +235,12 @@ mod tests {
         assert_eq!(m.location, "lnd");
         assert_eq!(m.ops, vec!["info:read", "offchain:read", "offchain:write", "onchain:read"]);
         assert_eq!(m.caveat("ipaddr").as_deref(), Some("127.0.0.1"));
-        assert!(m.excess_ops().is_empty() && m.dangerous_ops().is_empty());
+        assert!(m.excess_ops().is_empty() && m.dangerous_ops().is_empty() && m.beyond_needed().is_none());
+        // AGP-066: a URI-scoped permission is no "dangerous" entity, and the allowlist still refuses it
+        let uri = parse(&lnd_macaroon(&[("info", &["read"]), ("uri", &["/lnrpc.Lightning/SendCoins"])], &[])).unwrap();
+        assert!(uri.dangerous_ops().is_empty());
+        assert!(uri.beyond_needed().unwrap().contains("grants uri:/lnrpc.Lightning/SendCoins"));
+        assert!(parse(&lnd_macaroon(&[], &[])).unwrap().beyond_needed().unwrap().contains("cannot be read"));
         assert!(m.report()["ip_note"].as_str().unwrap().contains("passes every REST caller"));
         let admin = parse(&lnd_macaroon(&[("onchain", &["read", "write"]), ("macaroon", &["generate"])], &[])).unwrap();
         assert_eq!(admin.dangerous_ops(), vec!["macaroon:generate", "onchain:write"]);

@@ -26,6 +26,7 @@ use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::{AdaptorLock, LocalSigner, RouteSigner, StateSigner};
 use xbt402::wire::{b64json, request_auth, request_digest_v2};
+use xbt402_interop::crash_copy;
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
@@ -501,7 +502,8 @@ fn provider_write_ahead_then_the_same_answer_again() {
     let lid = first["lockId"].as_str().unwrap();
     assert_eq!((st2.best_cum, &st2.extra["route_locks"][lid]["secret"]), (st2.params.min_amount(), &first["secret"]));
     let name = w.origin().replace("http://", "").replace('.', "_");
-    let reloaded = Ledger::open(&w.dir.0.join(format!("prov-{name}.jsonl"))).unwrap(); // on disk
+    crash_copy(&w.dir.0.join(format!("prov-{name}.jsonl")), &w.dir.0.join("on-disk.jsonl")).unwrap();
+    let reloaded = Ledger::open(&w.dir.0.join("on-disk.jsonl")).unwrap(); // on disk
     assert_eq!(reloaded.channels[&st2.params.channel_id()].extra["route_locks"][lid]["secret"], first["secret"]);
     let paid = w.prov().routes().lock().sessions[&w.sh().session].paid_sat;
     let t = Sc::from_hex64(first["secret"].as_str().unwrap()).unwrap().secret().unwrap();
@@ -761,7 +763,8 @@ fn watcher_t_from_a_ch2_close_completes_ch1_even_after_a_hub_restart() {
     let pend = local.pending_lock(&chan).expect("the client kept its lock");
     let st2 = prov.channel_ids().iter().filter_map(|c| prov.channel_state(c)).next().unwrap();
     assert_eq!(st2.best_cum, st2.params.min_amount()); // the provider did complete it
-    let hub2 = hub_with(&chain, &net, &dir.0.join("hub"), sk(0x4B4B), hub_cfg());
+    crash_copy(&dir.0.join("hub"), &dir.0.join("hub-restarted")).unwrap();
+    let hub2 = hub_with(&chain, &net, &dir.0.join("hub-restarted"), sk(0x4B4B), hub_cfg());
     assert_eq!(hub2.out_channels()[origin].stale.len(), 1);
     prov.close_now(&st2.params.channel_id()).unwrap();
     let acts = hub2.watch_tick();

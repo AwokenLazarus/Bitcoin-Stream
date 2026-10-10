@@ -122,7 +122,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let prepared = meta["preparedAt"].as_f64().unwrap_or(0.0);
     let (mut receipts, mut first_receipt_s): (Vec<Signed>, Option<f64>) = (vec![], None);
     let mut note = |r: &Signed, receipts: &mut Vec<Signed>| {
-        if r.receipt.seq > 0 && receipts.last().map_or(true, |l| l.receipt.seq != r.receipt.seq) {
+        if r.receipt.seq > 0 && receipts.last().is_none_or(|l| l.receipt.seq != r.receipt.seq) {
             eprintln!("  receipt seq {} cum_work {} heights {}..{}", r.receipt.seq, r.receipt.cum_work, r.receipt.first_height, r.receipt.last_height);
             receipts.push(r.clone());
             first_receipt_s.get_or_insert(((now() - prepared) * 10.0).round() / 10.0);

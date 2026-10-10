@@ -53,12 +53,6 @@ pub fn origin_of(url: &str) -> Result<String> {
     Ok(format!("{}://{netloc}", scheme.to_ascii_lowercase()))
 }
 
-/// Path + query as the provider sees it.
-pub fn request_target(url: &str) -> String {
-    let parts: Vec<&str> = url.splitn(4, '/').collect();
-    if parts.len() > 3 { format!("/{}", parts[3]) } else { "/".into() }
-}
-
 fn pick_accept(pr: &Value, network: &str) -> Result<Value> {
     pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
         .find(|a| scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(network))
@@ -130,6 +124,9 @@ pub type SpendBook = Arc<dyn Fn(&str, i64, &str, i64) -> Result<()> + Send + Syn
 /// The policy's verdict on a signed increase larger than the amount it approved (a channel's
 /// dust floor). `(dest, max_sats, delta_sats)`; `Some(deny)` stops the call before anything is signed.
 pub type SpendCheck = Arc<dyn Fn(&str, i64, i64) -> Result<Option<Value>> + Send + Sync>;
+
+/// One stream chunk: `Ok((data, charged, chan))`, or `Err((reason, charged, chan))`.
+type ChunkStep = std::result::Result<(Vec<u8>, i64, String), (String, i64, String)>;
 
 /// One signer-owned client session.
 pub struct Session {
@@ -222,7 +219,9 @@ impl Session {
         }
         let min_exp = or_int(extra.get("minExpiryBlocks"), 1)?;
         let max_exp = or_int(extra.get("maxExpiryBlocks"), 100_000)?;
-        let blocks = expiry_blocks.max(min_exp + 6).min(max_exp - 1);
+        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
+        // default margin is 36, so a channel opened at exactly minExpiry is refused
+        let blocks = expiry_blocks.max(min_exp + 6).max(min_exp + 36).min(max_exp - 1);
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
         let expiry = open_height + blocks;
@@ -238,11 +237,12 @@ impl Session {
             None => 1,
             Some(v) => py_int(Some(v)).map(|x| x.max(0)).unwrap_or(1),
         };
+        let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
+        self.preflight(&open_url, &network, &params, funded, &fee_payer)?;
         let prep = self.hot.prepare_fund(&params.spk(), funded, DEFAULT_FEE)?;
         let params = params.with_funding(&prep.txid, 0, funded as u64)?;
         // P1 write-ahead: the payer key is sealed on disk, with everything the refund needs, before
         // the funding exists anywhere but here
-        let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
         self.book.add_pending(dest, secret, &params, dest, Some(cap), open_height, &open_url, &network, min_conf, &prep.hex)?;
         if let Err(e) = self.hot.broadcast(&prep) {
             self.book.drop_pending(dest, &params.channel_id())?;
@@ -252,6 +252,37 @@ impl Session {
         log_call("funding", json!({"dest": dest, "chan": params.channel_id(), "txid": prep.txid, "capacity": funded, "expiry": expiry,
                                    "min_conf": min_conf}));
         self.complete_open(dest, self.open_wait_s)
+    }
+
+    /// review C2: the provider says it opens a channel on exactly these terms before the funding
+    /// exists (a refusal after funding locks the coins until expiry). A provider from before the
+    /// preflight answers `bad_request` (no outpoint) once the terms it checks first have passed.
+    fn preflight(&self, open_url: &str, network: &str, params: &xbt402::channel::ChannelParams, funded: i64, fee_payer: &str) -> Result<()> {
+        let mut ch = json!({"capacity": funded, "expiry": params.expiry, "payerPub": hex::encode(params.payer_pub),
+                            "payerSpk": hex::encode(&params.payer_spk), "redeemScript": hex::encode(params.script())});
+        if fee_payer != "payer" {
+            ch["closeFeePayer"] = fee_payer.into();
+        }
+        let body = json!({"x402Version": 2, "network": network, "preflight": true, "channel": ch});
+        let resp = self.http("POST", open_url, dumps(&body).as_bytes(), &[("Content-Type".into(), "application/json".into())])
+            .map_err(|_| rt("open preflight failed: provider unreachable; nothing was funded"))?;
+        let reply: Option<Value> = serde_json::from_slice(&resp.body).ok();
+        if resp.status != 200 {
+            let code = reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("");
+            if code == "bad_request" {
+                return Ok(());
+            }
+            let tail = if code.is_empty() { String::new() } else { format!(" {code}") };
+            return Err(rt(format!("open refused before funding: HTTP {}{tail}; nothing was funded", resp.status)));
+        }
+        let r = reply.unwrap_or(Value::Null);
+        if r.get("preflight") != Some(&Value::Bool(true)) {
+            return Err(rt("the provider did not answer the open preflight; nothing was funded"));
+        }
+        if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer {
+            return Err(rt("the provider would open the channel with another closeFeePayer; nothing was funded"));
+        }
+        Ok(())
     }
 
     /// Confirmations of a channel's funding output; `None` when the node does not have it at all.
@@ -580,7 +611,7 @@ impl Session {
         for i in 0..n - 1 {
             let url = format!("{dest}{}", chunk_url.replace("{i}", &i.to_string()));
             let t = Instant::now();
-            let step = || -> std::result::Result<(Vec<u8>, i64, String), (String, i64, String)> {
+            let step = || -> ChunkStep {
                 let rec = self.book.fresh_seq(dest).map_err(|e| (e.msg, 0, String::new()))?;
                 let (r, receipt) = self.paid("GET", &url, b"", acc, json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string()}))
                     .map_err(|e| (e.msg, 0, rec.chan.clone()))?;

@@ -8,6 +8,7 @@
 //! [`Provider::serve`] is transport-independent: give it the method, path, headers and body of a
 //! request and send back what it returns. The `http-server` feature serves it on std::net.
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,13 +19,16 @@ use xbt_primitives::sighash::SIGHASH_ALL_UNIFIED;
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 
 use crate::channel::{canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, settle_due,
-                     sign_p2wpkh, sign_with_type, ChannelParams, FeePayer, Payee, DERIVATION, DUST};
+                     cpfp_child, sign_p2wpkh, sign_with_type, ChannelParams, FeePayer, Payee, DERIVATION, DUST};
 use crate::conditional::{encrypt, ConditionalParams, CSV_DELTA};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{check_funding, ChainBackend, FundingPolicy};
 use crate::json::{dumps, py_int, py_str, py_u64, truthy};
 use crate::ledger::{ChannelState, Ledger};
 use crate::wire::*;
+
+/// vsize of a CPFP child (one P2WPKH input, one P2WPKH output: 109.25 vB, rounded up).
+pub const CPFP_CHILD_VSIZE: u64 = 110;
 
 /// The header the HTTP server sets to the TCP peer's IP address. A client-sent header of this name
 /// never reaches the service.
@@ -101,6 +105,15 @@ pub struct ProviderConfig {
     /// AGP-054: a path makes each routed session's meter (seq, calls, accrued) durable before its
     /// ROUTE-STATE leaves, written ahead while the handler runs (`RouteOffer::precharge`). None: off.
     pub route_wal: Option<std::path::PathBuf>,
+    /// AGP-067 (review C1): most sats a CPFP child of one close may pay. The watcher bumps a close
+    /// still unconfirmed before expiry with a child spending this provider's own close output (never
+    /// more than that output less dust). 0: never bump.
+    pub close_bump_max_fee: u64,
+    /// sat/vB floor of a close's package feerate (below any estimate or mempool floor).
+    pub close_min_feerate: f64,
+    /// A close unconfirmed this many blocks after its last send, with half the close margin or less
+    /// left to expiry, has its package feerate at least doubled whatever the estimate says.
+    pub close_bump_blocks: u32,
 }
 
 impl ProviderConfig {
@@ -123,6 +136,9 @@ impl ProviderConfig {
             rollover_zero_conf_max: None,
             settle_lock_multiple: 4,
             route_wal: None,
+            close_bump_max_fee: 10_000,
+            close_min_feerate: 1.0,
+            close_bump_blocks: 3,
         }
     }
 
@@ -180,7 +196,7 @@ pub struct Provider {
 fn locks_open(st: &ChannelState) -> bool {
     truthy(st.extra.get("route_lock"))
         || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
-            s.iter().any(|x| py_u64(x.get("cum")).map_or(true, |c| c > st.best_cum))
+            s.iter().any(|x| py_u64(x.get("cum")).is_none_or(|c| c > st.best_cum))
         })
 }
 
@@ -236,6 +252,56 @@ fn path_key(path: &str) -> &str {
 /// target it routes on. A `url` without an origin binds the target alone.
 pub(crate) fn binding_url(url: &str, path: &str) -> String {
     format!("{}{path}", url_origin(url))
+}
+
+/// The provider's payTo secret kept in `path` (review C4): read it, or create it (64 hex chars,
+/// mode 0600 on Unix, never overwritten). Every channel key derives from it, so a provider that
+/// starts with a new one can no longer close a single channel it holds states for. On Unix a file
+/// readable by group or others is refused.
+pub fn load_or_create_secret(path: &Path) -> Result<SecretKey> {
+    let bad = |m: String| ChannelError::new("key_file", format!("{}: {m}", path.display()));
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d).map_err(|e| bad(e.to_string()))?;
+    }
+    if !path.exists() {
+        // written whole under a private name, then linked into place: never a torn key, never an
+        // overwrite of a key another starter linked first
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".new.{}", std::process::id()));
+        let tmp = std::path::PathBuf::from(name);
+        let sk = SecretKey::from_slice(&random32()).map_err(|e| bad(e.to_string()))?;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let written = o.open(&tmp).and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(f, "{}", hex::encode(sk.secret_bytes()))?;
+            f.sync_all()
+        });
+        let linked = written.and_then(|_| std::fs::hard_link(&tmp, path));
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| bad(e.to_string()))?;
+                return Ok(sk);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(bad(e.to_string())),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).map_err(|e| bad(e.to_string()))?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(bad(format!("mode {:o} lets others read the payTo key: chmod 600", mode & 0o777)));
+        }
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
+    let raw = hex::decode(text.trim()).map_err(|_| bad("not a hex secret".into()))?;
+    SecretKey::from_slice(&raw).map_err(|_| bad("not a secp256k1 secret".into()))
 }
 
 fn random32() -> [u8; 32] {
@@ -511,8 +577,41 @@ impl Provider {
 
     // --- control endpoints -----------------------------------------------------------------
 
-    /// POST /x402/xbt-channel/open.
+    /// POST /x402/xbt-channel/open. With `"preflight": true` and no outpoint (review C2) it answers
+    /// whether it would open a channel on exactly these terms, before the payer funds it: every
+    /// check that does not need the funding output, nothing recorded.
     pub fn open(&self, req: &Value) -> Result<Value> {
+        let (p, hub_req) = self.open_terms(req)?;
+        let c = field(req, "channel")?;
+        if truthy(req.get("preflight")) {
+            return self.open_preflight(p, c);
+        }
+        self.open_funded(p, hub_req, c)
+    }
+
+    /// The preflight's checks past [`open_terms`](Self::open_terms): the capacity and the blocks to
+    /// expiry against the funding policy, as `check_funding` will apply them.
+    fn open_preflight(&self, mut p: ChannelParams, c: &Value) -> Result<Value> {
+        let pol = &self.cfg.policy;
+        p.capacity = py_u64(c.get("capacity")).ok_or_else(|| ChannelError::new("bad_request", "capacity"))?;
+        if !(pol.min_capacity..=pol.max_capacity).contains(&p.capacity) {
+            return fail("bad_capacity", format!("capacity outside [{}, {}]", pol.min_capacity, pol.max_capacity));
+        }
+        let left = p.expiry as i64 - self.height()? as i64;
+        if left < pol.min_expiry_blocks as i64 || left > pol.max_expiry_blocks as i64 {
+            return fail("bad_expiry", format!("{left} blocks to expiry, need [{}, {}]", pol.min_expiry_blocks, pol.max_expiry_blocks));
+        }
+        let mut out = json!({"preflight": true, "expiry": p.expiry, "maxCum": p.max_amount().to_string(), "minConf": pol.conf_for(p.capacity)});
+        if p.close_fee_payer != FeePayer::Payer {
+            out["closeFeePayer"] = p.close_fee_payer.as_str().into();
+            out["minCum"] = p.min_amount().to_string().into();
+        }
+        Ok(out)
+    }
+
+    /// The channel terms of an open request (no outpoint yet), checked: the network, the keys, the
+    /// close-fee payer and the redeem script this provider would derive.
+    fn open_terms<'a>(&self, req: &'a Value) -> Result<(ChannelParams, Option<&'a Value>)> {
         if req.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str()) {
             return fail("wrong_network", format!("this provider is on {}", self.cfg.network));
         }
@@ -536,11 +635,15 @@ impl Provider {
         let expiry = py_u64(c.get("expiry")).and_then(|e| u32::try_from(e).ok())
             .ok_or_else(|| ChannelError::new("bad_request", "expiry"))?;
         let pay_to = hex::decode(&self.pay_to).unwrap_or_default();
-        let mut p = ChannelParams::derive(&pay_to, &payer_pub, expiry, self.cfg.close_fee, payer_spk, &self.cfg.network, fee_payer)?;
+        let p = ChannelParams::derive(&pay_to, &payer_pub, expiry, self.cfg.close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let redeem = field(c, "redeemScript")?.as_str().ok_or_else(|| ChannelError::new("bad_request", "redeemScript"))?;
         if redeem.to_ascii_lowercase() != hex::encode(p.script()) {
             return fail("bad_funding", "redeemScript does not match payTo/payerPub/expiry");
         }
+        Ok((p, hub_req))
+    }
+
+    fn open_funded(&self, mut p: ChannelParams, hub_req: Option<&Value>, c: &Value) -> Result<Value> {
         let vout = py_u64(c.get("vout")).ok_or_else(|| ChannelError::new("bad_request", "vout"))?;
         let txid = field(c, "txid")?.as_str().ok_or_else(|| ChannelError::new("unknown_channel", "chan must be txid:vout"))?;
         let chan = canonical_chan(&format!("{txid}:{vout}"))?;
@@ -875,13 +978,142 @@ impl Provider {
             st.extra.insert("close_intent".into(), json!({"hex": tx.to_hex(), "txid": txid, "cond": conditional}));
             self.save_state(l, st)?;
             if let Err(e) = self.chain.send_raw_transaction(&tx.to_hex()) {
-                if !self.tx_known(&txid, &tx) {
-                    return fail("close_failed", e.to_string());
+                // AGP-067 (C1): refused alone (below the mempool's floor), it goes in with a child
+                let bump = if self.cfg.close_bump_max_fee > 0 { Some(self.height().and_then(|h| self.bump_close(st, h, &txid, &tx, true))) } else { None };
+                if !matches!(bump, Some(Ok(()))) && !self.tx_known(&txid, &tx) {
+                    let why = match bump {
+                        Some(Err(b)) => format!("{e}; bump: {b}"),
+                        _ => e.to_string(),
+                    };
+                    return fail("close_failed", why);
                 }
             }
             self.closed(l, st, &tx.to_hex(), &txid, conditional)?;
         }
         Ok(st.closed_txid.clone())
+    }
+
+    /// The package feerate (sat/vB) a close needs at `tip`: the estimate for confirming within a
+    /// quarter of the blocks left to expiry, the mempool's floor and `close_min_feerate`, whichever
+    /// is highest; doubled from the last send once `close_bump_blocks` passed without a
+    /// confirmation in the second half of the close margin (an estimate that lags the market).
+    fn close_rate_wanted(&self, p: &ChannelParams, tip: u32, last: Option<&Value>) -> f64 {
+        let left = p.expiry.saturating_sub(tip);
+        let mut want = self.cfg.close_min_feerate;
+        if let Ok(Some(r)) = self.chain.estimate_fee_rate((left / 4).clamp(1, 1008)) {
+            want = want.max(r);
+        }
+        if let Ok(Some(r)) = self.chain.mempool_min_fee() {
+            want = want.max(r);
+        }
+        if let Some(b) = last {
+            let at = py_u64(b.get("at")).unwrap_or(0);
+            if tip as u64 >= at + self.cfg.close_bump_blocks as u64 && left <= self.cfg.close_margin / 2 {
+                want = want.max(b.get("rate").and_then(Value::as_f64).unwrap_or(0.0) * 2.0);
+            }
+        }
+        want
+    }
+
+    /// review C1: get the close `txid` confirmed before the payer's refund is valid. Each block (each
+    /// call while it is not in the mempool) the close goes out alone if its own fee meets
+    /// [`close_rate_wanted`](Self::close_rate_wanted), else with a CPFP child that spends this
+    /// provider's close output back to the same key and pays the difference, replacing the last
+    /// child (BIP125: the new one pays at least the old fee plus its own vsize). The child's fee is
+    /// capped at `close_bump_max_fee` and at the output less dust. Recorded in `extra.close_bump`
+    /// (`at` the last send, `rate`, `fee`, the child's `txid`/`hex`, `capped`, `replaced`).
+    /// `refused_alone`: the node just refused the close alone, so it is not sent alone again.
+    fn bump_close(&self, st: &mut ChannelState, tip: u32, txid: &str, close: &Tx, refused_alone: bool) -> Result<()> {
+        let p = st.params.clone();
+        if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?.is_none() {
+            return Ok(());      // spent in a block: the close confirmed, or the channel is gone
+        }
+        let last = st.extra.get("close_bump").cloned().filter(Value::is_object);
+        let field_u64 = |k: &str| last.as_ref().and_then(|b| py_u64(b.get(k))).unwrap_or(0);
+        let child_txid = last.as_ref().and_then(|b| b.get("txid")).and_then(Value::as_str).unwrap_or("").to_string();
+        // a node may still answer for an evicted close's txid: in the pool only while the funding is spent there
+        let in_pool = self.tx_known(txid, close)
+            && matches!(self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true), Ok(None));
+        let child_in_pool = !child_txid.is_empty() && self.chain.has_transaction(&child_txid).unwrap_or(false);
+        if in_pool && (child_txid.is_empty() || child_in_pool) && field_u64("seen") == tip as u64 && last.is_some() {
+            return Ok(());      // looked at this block already
+        }
+        let close_hex = close.to_hex();
+        let close_fee = (p.capacity as i64 - close.outputs.iter().map(|o| o.value).sum::<i64>()).max(0) as u64;
+        let cv = close.vsize() as u64;
+        let want = self.close_rate_wanted(&p, tip, last.as_ref());
+        let (have_fee, have_vs) = if child_in_pool { (close_fee + field_u64("fee"), cv + CPFP_CHILD_VSIZE) } else { (close_fee, cv) };
+        let mut rec = last.clone().unwrap_or_else(|| json!({"at": tip, "rate": close_fee as f64 / cv as f64, "fee": 0}));
+        rec["seen"] = tip.into();
+        if in_pool && have_fee as f64 >= want * have_vs as f64 {
+            st.extra.insert("close_bump".into(), rec);
+            return Ok(());
+        }
+        let send_alone = |rec: &mut Value| -> Result<()> {
+            if refused_alone {
+                return fail("close_failed", "the node refused the close alone");
+            }
+            if let Err(e) = self.chain.send_raw_transaction(&close_hex) {
+                if !self.tx_known(txid, close) {
+                    return fail("close_failed", e.to_string());
+                }
+            }
+            rec["at"] = tip.into();
+            Ok(())
+        };
+        let payee_out = close.outputs.iter().position(|o| o.script_pubkey == p.payee_spk);
+        let swept = st.extra.contains_key("payee_sweep") || st.extra.contains_key("payee_sweep_intent");
+        let (Some(vout), false) = (payee_out, swept) else {
+            // nothing of ours to spend (or a sweep spends it already): the close alone, as before
+            let r = send_alone(&mut rec);
+            st.extra.insert("close_bump".into(), rec);
+            return r;
+        };
+        if close_fee as f64 >= want * cv as f64 {
+            let r = send_alone(&mut rec);
+            st.extra.insert("close_bump".into(), rec);
+            return r;
+        }
+        let value = close.outputs[vout].value as u64;
+        let mut fee = ((want * (cv + CPFP_CHILD_VSIZE) as f64).ceil() as u64).saturating_sub(close_fee);
+        let last_fee = field_u64("fee");
+        if last_fee > 0 {
+            fee = fee.max(last_fee + CPFP_CHILD_VSIZE);
+        }
+        let cap = self.cfg.close_bump_max_fee.min(value.saturating_sub(DUST));
+        let capped = fee > cap;
+        fee = fee.min(cap);
+        let (child_hex, child_id) = if last_fee > 0 && fee <= last_fee {
+            // at the cap: nothing higher to sign; the last child again
+            (rec.get("hex").and_then(Value::as_str).unwrap_or("").to_string(), child_txid.clone())
+        } else {
+            let child = cpfp_child(txid, vout as u32, value, &p.payee_spk, &self.chan_secret(&p)?, fee)?;
+            (child.to_hex(), child.txid())
+        };
+        if child_hex.is_empty() || fee == 0 {
+            let r = send_alone(&mut rec);
+            st.extra.insert("close_bump".into(), rec);
+            return r;
+        }
+        let sent = self.chain.submit_package(&[close_hex.clone(), child_hex.clone()]);
+        if let Err(e) = sent {
+            st.extra.insert("close_bump".into(), rec);
+            return fail("close_bump_failed", e.to_string());
+        }
+        if child_id != child_txid && !child_txid.is_empty() {
+            let mut replaced = rec.get("replaced").and_then(Value::as_array).cloned().unwrap_or_default();
+            replaced.push(json!([child_txid, last_fee]));
+            rec["replaced"] = replaced.into();
+        }
+        let fee = if child_id == child_txid { last_fee } else { fee };
+        rec["at"] = tip.into();
+        rec["rate"] = ((close_fee + fee) as f64 / (cv + CPFP_CHILD_VSIZE) as f64).into();
+        rec["fee"] = fee.into();
+        rec["txid"] = child_id.into();
+        rec["hex"] = child_hex.into();
+        rec["capped"] = capped.into();
+        st.extra.insert("close_bump".into(), rec);
+        Ok(())
     }
 
     pub(crate) fn save_state(&self, l: &mut Ledger, st: &ChannelState) -> Result<()> {
@@ -946,13 +1178,16 @@ impl Provider {
     fn watch_one(&self, l: &mut Ledger, st: &mut ChannelState, h: u32, out: &mut Vec<String>) -> Result<()> {
         let p = st.params.clone();
         if !st.closed_txid.is_empty() {
-            // funding still unspent even counting the mempool: the close was evicted, send it again
-            if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_some() {
-                let hx = match st.extra.get("close_hex").and_then(Value::as_str) {
-                    Some(h) => h.to_string(),
-                    None => self.close_tx(st)?.0.to_hex(),
-                };
-                self.chain.send_raw_transaction(&hx)?;
+            let close = match st.extra.get("close_hex").and_then(Value::as_str) {
+                Some(h) => Tx::parse_hex(h)?,
+                None => self.close_tx(st)?.0,
+            };
+            if self.cfg.close_bump_max_fee > 0 {
+                let txid = st.closed_txid.clone();
+                self.bump_close(st, h, &txid, &close, false)?;
+            } else if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_some() {
+                // funding still unspent even counting the mempool: the close was evicted, send it again
+                self.chain.send_raw_transaction(&close.to_hex())?;
             }
             if truthy(st.extra.get("cond_close")) {
                 self.claim(st)?;
@@ -1033,18 +1268,32 @@ impl Provider {
         let close = Tx::parse_hex(&close_hex)?;
         let vout = close.outputs.iter().position(|o| o.script_pubkey == st.params.payee_spk)
             .ok_or_else(|| ChannelError::new("no_payee_output", "the close pays nothing to the payee key"))?;
-        let value = close.outputs[vout].value as u64;
+        // AGP-067: a CPFP child (the latest, or one it replaced) moved the output to the same key
+        let base = close.outputs[vout].value as u64;
+        let mut found = (st.closed_txid.clone(), vout as u32, base);
+        if let Some(b) = st.extra.get("close_bump").filter(|b| py_u64(b.get("fee")).unwrap_or(0) > 0) {
+            let mut kids = vec![(py_str(b.get("txid")), py_u64(b.get("fee")).unwrap_or(0))];
+            for r in b.get("replaced").and_then(Value::as_array).into_iter().flatten() {
+                kids.push((py_str(r.get(0)), py_u64(r.get(1)).unwrap_or(0)));
+            }
+            for (txid, kfee) in kids.into_iter().rev().filter(|(t, _)| !t.is_empty()) {
+                if self.chain.get_tx_out(&txid, 0, true)?.is_some() {
+                    found = (txid, 0, base.saturating_sub(kfee));
+                }
+            }
+        }
+        let (from_txid, vout, value) = found;
         if value < fee + DUST {
             return fail("bad_amount", format!("fee {fee} leaves dust from {value}"));
         }
-        if self.chain.get_tx_out(&st.closed_txid, vout as u32, true)?.is_none() {
+        if self.chain.get_tx_out(&from_txid, vout, true)?.is_none() {
             return fail("payee_spent", "the payee output is spent or its close is not on this node");
         }
-        let op = OutPoint::from_display(&st.closed_txid, vout as u32)?;
+        let op = OutPoint::from_display(&from_txid, vout)?;
         let mut tx = Tx::new(2, vec![TxIn::new(op, 0xFFFF_FFFD)], vec![TxOut::new((value - fee) as i64, dest_spk.to_vec())], 0);
         sign_p2wpkh(&self.chan_secret(&st.params)?, &mut tx, &[TxOut::new(value as i64, st.params.payee_spk.clone())], 0)?;
         let txid = tx.txid();
-        let rec = json!({"txid": txid, "outpoint": format!("{}:{vout}", st.closed_txid), "value": value, "fee": fee,
+        let rec = json!({"txid": txid, "outpoint": format!("{from_txid}:{vout}"), "value": value, "fee": fee,
                          "swept": value - fee, "dest_spk": hex::encode(dest_spk)});
         let mut intent = rec.clone();
         intent["hex"] = tx.to_hex().into();
@@ -1332,7 +1581,7 @@ impl Provider {
             }
             st.seq = py_u64(pl.get("seq")).unwrap_or(st.seq);        // spent, whatever happens next
             // every refusal from here on is durable: the seq it spent, and a higher state that
-            // still does not cover this call (Guida T4: a seq kept only in memory came back after a
+            // still does not cover this call (review T4: a seq kept only in memory came back after a
             // restart, and the refused header with it)
             let refuse = |l: &mut Ledger, st: &ChannelState, error: &str, price: u64| {
                 if let Err(e) = self.save_state(l, st) {
@@ -1457,7 +1706,7 @@ impl Provider {
             } else {
                 l.channels.insert(cid.clone(), st.clone());
             }
-            // the numbers of this call's own reservation (Guida T4): calls running beside it move the
+            // the numbers of this call's own reservation (review T4): calls running beside it move the
             // channel, not this receipt. Calls reserved before it count at what they reserved.
             let (cum, spent) = (numbers.0, numbers.1.saturating_sub(refund));
             let r = json!({"scheme": SCHEME, "chan": cid, "seq": call.seq, "cum": cum.to_string(), "charged": charged.to_string(),

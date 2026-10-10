@@ -26,6 +26,8 @@ xbt-svc.workspace = true
 # AGP-048: invoice signatures (recovery) and the LND REST client's pinned TLS certificate
 secp256k1 = { workspace = true, features = ["recovery"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# AGP-066: the LN REST URL's host, parsed as ureq parses it (already in the tree through ureq)
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3"

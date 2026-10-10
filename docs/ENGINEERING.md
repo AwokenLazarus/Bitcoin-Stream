@@ -28,6 +28,8 @@ The pinned vectors in `vectors/` are what the Rust is checked against. `lazarus-
 
 ```bash
 cargo test -j2 --workspace
+cargo deny check                   # AGP-075: licences (deny.toml), advisories, crates.io only
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # AGP-075: clean on main
 cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
 ./scripts/regtest_interop.sh       # Rust <-> Python on a private Knots 29.4.2 regtest node
@@ -865,7 +867,7 @@ therefore waits for a process's "ready" line before it polls its port, and start
 before that line again.
 
 ## Hub routing safety (AGP-064)
-From Chris Guida's external review of the hub: two High findings, H1 and H2, where the hub could pay a
+From an external review of the hub: two High findings, H1 and H2, where the hub could pay a
 provider on ch2 without being able to collect from the client on ch1. There was also a test-only
 nonce API in the library. Both were still present on `main` (`c8d607b`), and the tests below
 reproduce each one there. The same changes are in B1 `agp-064-w4`, with the same test names. The
@@ -887,6 +889,7 @@ that gap closed ch1 below the lock, and the provider was still paid on ch2.
 * A ch1 lock that no route is forwarding and that sits on no ch2 can never complete: the hub
   stopped between its two write-aheads, or the `withhold "all"` test hook was used. The hub drops
   it when the client asks to close (`orphan_lock_dropped`), so it does not keep ch1 from closing.
+  (AGP-073: the watcher sweeps these too, and holds one its ch2 wrote off.)
   This is checked under the provider's busy flag, which `route()` holds from before it writes the
   lock until its forward ends, so a lock in flight is never dropped.
 
@@ -972,15 +975,15 @@ changed with H2, because a provider's refusal now blocks that ch2:
   the held base, and once by rerouting the same service. The provider's own meter credit is out of
   the hub's reach.
 * A provider that refuses after taking the pre-signature stops its ch2 for that ch2's lifetime
-  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up would be
-  to close and refill such a ch2 early.
+  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up was to
+  close and refill such a ch2 early: AGP-073 does.
 
 ## Agent-wallet budget integrity and privileged methods (AGP-063)
 
-Fixes for Chris Guida's agent-wallet findings W1-W4, X1 and K1, plus the library payer's watermark.
+Fixes for the external review's agent-wallet findings W1-W4, X1 and K1, plus the library payer's watermark.
 Each test fails on `main` and passes here (the run is in the task's `result.md`). Most are in
-`crates/xbt-signer/tests/guida_w.rs`; B2's port (branch `agp-063`) has the same names in
-`tests/test_guida_w.py`.
+`crates/xbt-signer/tests/review_w.rs`; B2's port (branch `agp-063`) has the same names in
+`tests/test_review_w.py`.
 
 **W1: the wallet books what it signs.** `xbt402_pay` books the **signed delta**: the cumulative amount
 signed after the call, minus what the policy ledger already holds for that channel
@@ -1114,7 +1117,7 @@ amount below the highest one signed (`stale_amount`) and advance it, as `sign_st
 
 ## Request binding and the HTTP server (AGP-068)
 
-Guida T1–T4. A few slow connections must not stall a provider, and a receipt binds one request and
+review T1–T4. A few slow connections must not stall a provider, and a receipt binds one request and
 the answer that was actually returned. B1 `x402_channel.py` on `agp-068` (`a495430`) does the same, and
 `tests/test_agp068.py` there uses the same test names.
 
@@ -1137,8 +1140,8 @@ terms it was given, so a server-side check of one would never fire.
 - `seq` is the call's own, and cum and spentMsat come from the call's reservation (less its own
   refund), not from whatever another call wrote meanwhile. A seq spent on a refusal is saved before
   the 402 goes out (a 500 if that save fails), so a replay after a restart is still `bad_auth`.
-- The old `sha256(method|path|body)` remains as `request_digest_v1` for xbt-work's published
-  XBT-053 vectors; xbt-work still speaks v1.
+- xbt-work moved to request binding v2 with the XBT-053 vectors (AGP-074): see "Embedders on
+  xbt402 v1.3 (AGP-074)".
 
 **HTTP server (`http-server` feature).** It is now `std::net`:
 
@@ -1205,26 +1208,403 @@ and up.
   digest no longer authenticates.
 - B5 and xbt-063 vendor pinned B1/B2 and are unaffected until they re-pin. On re-pin, B5
   `fwd/server.py` must add status and bodyHash to its receipts and use the v2 digest.
-- The B2 wallet (`agp-068`, `8299cee`) binds the v2 digest, but as before it does not check receipts.
-- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still serve with `tiny_http`, so they keep T1's
-  slowloris exposure until they move to the same server. That is a follow-up, and so is moving
-  xbt-work to v2.
-- `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
+- The B2 wallet (`agp-068`, `8299cee`) binds the v2 digest. Since the AGP-063 merge it also checks the seller's receipt (request binding v2, status and bodyHash), as xbt-signer does.
+- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still served with `tiny_http`, so they kept T1's
+  slowloris exposure until AGP-072 moved them to the same server ("One bounded HTTP server for every service (AGP-072)"). Moving xbt-work
+  to v2 is a follow-up.
+- The interop scripts' B1 default went back to `~/xbt-rnd/b1` when this merged.
 
 Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_server`,
 `slow_heads_do_not_stall_the_server_and_are_cut_off`, `an_endless_header_line_is_refused`,
 `an_oversized_response_is_an_error_not_a_truncated_body`, `a_body_cut_short_is_an_error`) and the
 AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_origin`,
 `concurrent_calls_get_the_numbers_of_their_own_reservation`,
-`a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
+  `a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
 `an_altered_conditional_answer_keeps_the_hash_lock`).
+
+## Channel findings C1–C5 (AGP-067, external review)
+
+The provider's close must confirm before the payer's refund is valid, the payer must not fund a
+channel the seller then refuses, a rollover is the tx the payer signed, the payTo key and ledger
+survive a restart, and one ledger file has one writer. B1 `x402_channel.py`/`ledger.py` on branch
+`agp-067` does the same for C1, C2 and C5, and `tests/security/test_agp067_review_c.py` and
+`test_agp067_review_c1.py` there use the test names of `review_c.rs` and `review_c1.rs`. C3 does not
+apply to B1's client (it has no wire rollover; B1's hub already refuses `bad_rollover_reply`). C4 is
+xbt-rs only (B1's launcher already seals its payTo key, P7). The conformance vectors are unchanged.
+
+**Wire.**
+
+- `/open` takes `"preflight": true` with a `channel` that has no `txid`/`vout`. The provider runs
+  every check of a funded open that does not need the funding output (network, payTo, closeFeePayer,
+  redeemScript, capacity and expiry against its policy). It records nothing and answers
+  `{"preflight": true, "expiry", "maxCum", "minConf"}`, plus `closeFeePayer` and `minCum` under
+  payee-pays, or the refusal the funded open would get. The Rust client, the B1 client and the
+  xbt-signer session preflight before they fund. A provider from before AGP-067 answers
+  `bad_request` (no `vout`), and only after its own terms checks have passed, so on `bad_request`
+  the client funds and opens as before.
+- The funded `/open` carries the same fields. In the Rust client `txid` and `vout` are now the last
+  keys of `channel`, not the first (serde_json keeps insertion order); B1 keeps them first. JSON
+  key order carries no meaning.
+- A rollover reply is accepted only if `txid`, `nextChan` (`txid:1`) and `nextCapacity` match the
+  rollover tx the payer computed and signed (`bad_rollover` otherwise). The next channel's refund
+  is kept (`on_refund`) and its key bound before that check, so a provider that broadcast the real
+  tx and lied about its id cannot strand the payer's refund.
+
+**C1: the close bump.** The close pays the `closeFee` fixed at open (600 sat, about 3.5 sat/vB on a
+171 vB close). Until now a fee spike through the close margin meant the close never confirmed and
+the payer's refund took the whole channel back at expiry. Now the watcher (`close_due`, and
+`close_locked` when the node refuses the close outright) works out the package feerate the close
+needs for each block it is unconfirmed:
+
+- the highest of `close_min_feerate`, the node's estimate for confirmation within a quarter of the
+  blocks left (`estimatesmartfee`, clamped to 1–1008) and the mempool's floor
+  (`max(mempoolminfee, minrelaytxfee)`);
+- in the second half of the close margin, at least double the last send's rate once
+  `close_bump_blocks` have passed without confirming (an estimate that lags the market).
+
+If the close alone pays that, it is sent alone. Otherwise it goes out with a CPFP child that spends
+the provider's own close output back to the same key (`submitpackage`), replacing the previous
+child under BIP125 (the new child pays at least the old fee plus its own vsize). The child's fee is
+capped at `close_bump_max_fee` and at the output less dust; at the cap the last child is rebroadcast.
+`sweep_payee` spends the child's output when there is one. A node that answers `getrawtransaction`
+for an evicted close does not fool the watcher: the close counts as in the mempool only while the
+funding outpoint is spent there.
+
+- `ProviderConfig`: `close_bump_max_fee` (default 10,000 sat; 0 is main's behaviour, the close
+  rebroadcast and nothing else), `close_min_feerate` (1.0 sat/vB), `close_bump_blocks` (3).
+- `ChainBackend` gains three methods with defaults, so existing backends compile unchanged:
+  `estimate_fee_rate(target) -> Result<Option<f64>>` and `mempool_min_fee() -> Result<Option<f64>>`
+  (both default to `None`, meaning no estimate) and `submit_package(&[hex])` (default: send each in
+  order, only the last one's refusal counts). `Rpc` implements all three. An RPC error on the
+  estimate or the floor counts as no estimate; `close_min_feerate` and the doubling still apply.
+- The record is `extra.close_bump`: `{at, seen, rate, fee, txid, hex, capped, replaced:[[txid, fee]…]}`
+  (`at` is the last send, `seen` the last block looked at). `close_failed` now names the bump's error
+  after the close's own (`…; bump: close_bump_failed: …`).
+- Limits. The child can only spend what the provider's output holds, so a small channel can only be
+  bumped a little: a 2-call channel at 1,000 sat a call has 1,546 sat to give. Package relay (Knots
+  and Core 28 and later) lets a close below the dynamic `mempoolminfee` in on its child's fee, but
+  not one below the node's static `minrelaytxfee`: a node configured above 3.5 sat/vB refuses the
+  close in any package. Payer-pays closes are bumped from the provider's output too.
+
+Options weighed (best-performing-stack rule):
+
+| option | wire change | needs | cost |
+|---|---|---|---|
+| raise the fixed `closeFee` | no | nothing | paid on every close in every market; still loses to a big enough spike |
+| the 0xA3 fee-input close (SIGHASH_SINGLE\|ACP) | no | a provider wallet with spare UTXOs and their key on the watcher | a wallet hook per embedder, and UTXOs locked for every channel near its margin |
+| anchors / TRUC (v3) closes | yes: a new state tx format both sides sign | v3 relay | a protocol version and new vectors |
+| **CPFP from the provider's own close output (chosen)** | **no** | package relay (Knots 29 has it) | bounded by that output; one child sign per bump |
+
+**Cost.** Per channel in its close margin, each block: up to three extra RPCs (estimate, mempool
+info, `gettxout`) and at most one child signature. One ECDSA sign is 16.2 µs on the Ryzen 9 9950X3D
+(`binding_bench`, AGP-068) and well under a millisecond on 32-bit libsecp256k1. Nothing is added
+to a paid call.
+
+**C2: preflight.** Options weighed: hand the provider a signed, unbroadcast funding tx to check (it
+could broadcast and refuse, and every wallet would need a sign-without-broadcast hook), a separate
+`/terms` endpoint (a second code path to drift from `/open`'s checks), or **the same `/open` with
+`preflight` (chosen)**, which runs the exact checks of the funded open minus the outpoint. Cost: one
+HTTP round trip per channel open (not per call), and no signature on either side.
+
+**C3.** The client computes the rollover txid from the tx it signed (segwit: the witness is not in
+the txid) and checks the reply against it. There is no wire change and no extra cost.
+
+**C4: a provider that survives a restart.** `xbt-work-provider` and `xbt402-rust-provider` keep
+their payTo key and their ledger under `--data-dir` (`XBT_WORK_DATA_DIR`; defaults
+`./xbt-work-provider-data` and `./xbt402-rust-provider-data`). `xbt402-rust-provider --ledger FILE`
+still overrides the ledger path. The key is `DIR/payto.key`, created once with mode 0600: it is
+written to a temp file, hard-linked into place (a crash leaves no half-written key) and the
+directory is fsynced. A key file with any group or other permission bit (`mode & 0o077`), or that
+is not a key, is refused (error code `key_file`). `xbt-work-provider` runs a watcher (`close_due`) every `--watch-secs`
+(`XBT_WORK_WATCH_SECS`, default 5), which closes channels before their payers' refunds and bumps
+stuck closes. `load_or_create_secret(path)` is public for embedders. `xbt402-route-provider`
+takes the same `--data-dir` (AGP-075; default `./xbt402-route-provider-data`); `--ledger FILE`
+and `--secret HEX` still override the ledger and the key.
+
+**C5: one opener per ledger.** `Ledger::open` and `FileClientLedger::open` take an exclusive
+`flock(2)` on a sidecar `<path>.lock`, which holds the opener's pid. A second opener, in this
+process or another, gets `ledger_locked` with the holder's pid. The lock goes with the ledger, and
+with the process when it dies, so a crash never leaves a stale lock. B1's `Ledger` takes the same
+lock with `fcntl.flock` (the same system call), and its `Ledger.close()` releases it. Options weighed:
+the `fs2` or `fd-lock` crates (a new dependency for what std has done since 1.89), a lock on the
+ledger file itself (the ledger is replaced by rename, which would drop the lock), a pid file without
+a lock (stale after a crash, racy), or **std `File::try_lock` on a sidecar (chosen)**: no `unsafe`, no
+new dependency, and it works on Linux, macOS and Windows. Cost: one syscall per ledger open. The
+workspace MSRV is now **1.89**.
+
+**Embedders.**
+
+- A payer client from before AGP-067 talks to a new provider unchanged (it never preflights). A
+  new client talks to an old provider through the `bad_request` fallback.
+- Anything that opens one ledger file twice in one process (tests that "restart" a provider while
+  the old instance is alive) now gets `ledger_locked`. Drop the old instance first, or copy the
+  files the way a crash leaves them: `xbt402_interop::crash_copy(from, to)` copies a ledger file or
+  directory and skips `.lock`. B1's tests use `sechelp.crashed(...)`, which releases the old
+  instance's lock.
+- A provider binary started without `--data-dir` now writes `./xbt*-provider-data` in its working
+  directory instead of keeping everything in memory.
+- Custom `ChainBackend`s get the defaults above. Override `submit_package` (and the estimate and
+  floor) to get the bump through a package-relay node; with the defaults the close and child are
+  sent one at a time, which works whenever the close alone clears the floor.
+
+**Regtest.** `scripts/close_bump_regtest.sh` (ports 24860–24869) runs `xbt402-close-bump` against a
+private Knots 29.4.2 node with `maxmempool=5`. A direct channel and a hub ch2 are each opened with
+the bump on and off. Before the close margin the mempool is filled at 9.5 sat/vB until
+`mempoolminfee` is 10.5 sat/vB, and from then on blocks take only packages paying 10 sat/vB or more.
+Result (`run/close_bump.json`):
+
+- with the bump, the direct and the ch2 close go in with a 2,351 sat child (package 10.50 sat/vB)
+  and confirm in the first block after the margin, 19 blocks before expiry, paying the provider its
+  best state;
+- without it, both closes are refused (`mempool min fee not met`) until expiry. Then the payer's
+  refund at 12 sat/vB and the hub's ch2 refund take both channels back.
+
+Tests: `crates/xbt402/tests/review_c.rs` (`c2_a_refused_open_funds_nothing`,
+`c2_the_preflight_records_nothing`, `c2_a_provider_without_preflight_still_opens`,
+`c3_a_rollover_reply_naming_another_txid_is_refused`,
+`c4_the_payto_key_persists_0600_and_a_loose_file_is_refused`,
+`c4_a_restarted_provider_keeps_its_key_and_channels_and_closes_them`,
+`c5_a_second_provider_on_one_ledger_is_refused`, `c5_a_second_client_on_one_client_ledger_is_refused`,
+`c5_another_process_holding_the_lock_is_refused`) and `review_c1.rs`
+(`c1_a_close_below_the_mempool_floor_goes_in_with_a_child`,
+`c1_without_the_bump_the_close_never_confirms`,
+`c1_the_bump_follows_the_estimate_and_escalates_near_expiry`,
+`c1_the_child_never_pays_more_than_the_cap_or_the_output`,
+`c1_the_payee_sweep_spends_the_child_after_a_bump`, `c1_a_close_that_pays_enough_is_left_alone`),
+which run against a mempool model with a floor, full RBF, `submitpackage`, an estimate and
+fee-market blocks.
+
+## One bounded HTTP server for every service (AGP-072)
+
+review T1 for the other servers. AGP-068 fixed xbt402's server only; xbt-wallet-ui, xbt-wallet-mcp
+(streamable HTTP) and xbt-work-relay (both listeners) still served with `tiny_http` 0.12, with no
+header-line cap and no read deadline, and the MCP started one thread per request with no limit.
+All three, and xbt402, now listen with **`xbt_svc::http`**: the AGP-068 server, moved into xbt-svc
+(which all four already depend on) behind a small `Handler` trait. `tiny_http` is gone from the
+workspace (`Cargo.lock` loses it; `cargo tree -i tiny_http` finds nothing).
+
+**Limits** (`xbt_svc::http::Limits::default()`, the same as AGP-068): 8 KiB header line and 32 KiB
+head (431), the head within 10 s (408) and the body within 30 s, both absolute; at most 64
+connections (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
+body byte is read; Transfer-Encoding is 501); `Expect: 100-continue`; `Connection: close`.
+
+**What changed in the server while moving it:**
+
+- Connection threads are reused (an idle one waits 60 s for the next connection) instead of one
+  spawned per connection. The accept thread only queues a connection, so it is no longer the cap.
+- A complete request runs on its connection thread once one of `threads` handler slots is free,
+  instead of being handed to a worker and back. The bound on concurrent handlers is the same;
+  two thread switches per request are gone. A panicking handler still costs a 500 and its slot
+  is given back.
+- `HEAD` gets the headers and the length but no body; 1xx, 204 and 304 carry neither.
+  `Content-Length`, `Connection` and `Transfer-Encoding` are the server's: a handler's copies are
+  dropped, as before any header holding CR, LF or NUL.
+- The server's own refusals (400, 408, 413, 431, 501, 503) are `text/plain` with `Cache-Control:
+  no-store` and `nosniff`.
+- An accept error (out of descriptors) backs off 10 ms instead of spinning; a failed thread
+  spawn closes that connection.
+
+**Per server.**
+
+| server | handler slots | body limit | kept |
+|---|---|---|---|
+| xbt402 provider / hub | the caller's `threads` | the service's, per path | public API (`serve_http`, `serve_service`, `serve_listener`, `HttpService`), `X-Xbt402-Peer` from the socket only, `X-Forwarded-Proto` + `Host` URL, duplicate `PAYMENT-SIGNATURE` is 400 |
+| xbt-wallet-ui | `XBT_UI_THREADS` (4) | 256 KiB | security headers on every app response, Host and Origin checks (AGP-063 W4), `Running` stops on drop |
+| xbt-wallet-mcp | `HTTP_WORKERS` = 16 (was unbounded) | 1 MiB | bearer token and token file, Origin allowlist (AGP-063 X1), loopback guard; new `serve_listener` for a caller-bound listener |
+| xbt-work-relay public | `--threads` (8) | 1052 B (a blob, so a misdirected push still gets 405) | rate limit per client, no-store, no listing |
+| xbt-work-relay push | `--threads`, at most 4 | 1052 B | push token, exact blob length |
+
+**Behaviour changes for operators and embedders.** Every answer closes the connection (browsers
+and the MCP SDKs reconnect; `tiny_http` kept connections alive). A chunked request body is 501
+(the MCP SDKs send Content-Length). Over-limit bodies get the server's plain-text 413 instead of
+the app's (the MCP's was a JSON-RPC error). The MCP runs at most 16 requests at once; a paid tool
+call waiting on a funding confirmation holds one, and further requests wait in their connection.
+No wire change.
+
+Options weighed (best-performing-stack rule):
+
+| option | outcome |
+|---|---|
+| each crate depends on xbt402's `http-server` | links the provider and secp256k1 into the UI and the relay, which are meant to stay small and keyless |
+| a new `xbt-http` crate | works, but xbt-svc already is the shared std-only service plumbing all four use |
+| `hyper` / `axum` | an async runtime, ruled out for Pi-class boxes (AGP-068) |
+| keep `tiny_http` behind a reverse proxy | the bare-metal default stays exposed |
+| **move the AGP-068 server into xbt-svc (chosen)** | no new dependency, one implementation and one set of tests |
+
+**Cost.** Pass line declared before measuring: (a) median latency of `GET /healthz` on loopback,
+a fresh connection per request, served by xbt-work-relay, is at most `tiny_http`'s + 50 µs; (b) on
+armv7 the extra per request is at most 0.5 ms. Measured with
+`cargo run --release -p xbt-svc --example http_bench -- 127.0.0.1:29080 /healthz 5000 8` against
+`xbt-work-relay --bind 127.0.0.1:29080 --push-bind off --memory` built from `main` (9ec4090) and
+from this branch, on a Ryzen 9 9950X3D, two runs each:
+
+| build | median | p99 | 8 clients |
+|---|---|---|---|
+| `tiny_http` (main) | 114 / 121 µs | 163 / 212 µs | 49.7k / 38.5k req/s |
+| first cut: a thread spawned per connection, worker hand-off | 147 µs | 197 µs | 28.6k req/s |
+| **reused connection threads, handler slots (shipped)** | **89 / 85 µs** | **143 / 125 µs** | **57.4k / 69.0k req/s** |
+
+(a) passes: the shipped server is faster than `tiny_http`. The first cut passed (a) on latency but
+halved throughput, because the accept thread spawned a thread per connection; that is why
+connection threads are reused. (b) was not measured (no armv7 box or emulator, as in AGP-068).
+With threads reused, a request costs the same kind of work as under `tiny_http` (a few syscalls,
+one buffer), and no thread spawn, so (b) holds by construction. The three binaries cross-build for
+`armv7-unknown-linux-musleabihf`, and the x86_64 relay binary shrinks from 1.12 MB to 0.77 MB.
+
+Tests: the AGP-068 slowloris checks as shared functions in `crates/xbt-svc/tests/common/slowloris.rs`
+(`slow_bodies_do_not_stall_and_are_cut_off`, `slow_heads_do_not_stall_and_are_cut_off`,
+`an_endless_header_line_is_refused`), run by `tests/http_limits.rs` in xbt-wallet-ui (3 tests),
+xbt-wallet-mcp (3) and xbt-work-relay (5, both listeners). All 11 fail on `main`: no 431 after
+4 MiB of one header line, slow heads held for 20 s, slow bodies stall the UI and the relay, and
+the MCP holds a body that never comes for over 60 s. The server's edges are in
+`crates/xbt-svc/tests/http_server.rs` (HEAD and 204, header injection, a panicking handler, the
+Content-Length rules and 100-continue, the socket peer, stop). xbt402's `http_limits.rs` passes
+unchanged. Each slow-body test waits for the 30 s body deadline.
+
+## Hub follow-ups: sealed ch2 keys, written-off ch2s, orphan locks, preflight (AGP-073)
+Four follow-ups from AGP-063 (K1) and from the trade-offs of AGP-064 and AGP-067. The same changes
+are in B1 `agp-073`, with the same test names. All the tests below fail on `main` (`4bbcefc`) and pass
+here.
+
+**K1: the ch2 payer keys are sealed at rest.** The hub's state file (`<datadir>/ch2.json`) held every
+ch2 payer key in plaintext: the live and next ch2s, the archive, and a rollover's next ch2 written
+ahead inside a record. Each key is now stored as `secret_sealed` in the B2 keystore's blob format:
+`{"v":1,"alg":"aes-256-gcm","kdf":"keyfile","salt":"","nonce","ct","aad":"xbt402/hub-ch2"}`. The rest
+of each record stays readable, for the operator and the reconcile tools.
+* **The wrap key** is 32 random bytes, kept in a file of mode 0600 (32 raw bytes or 64 hex). It is
+  made with `O_EXCL`, and a file that is not regular or is open to group or others is refused
+  (`keystore`). `xbt402-hub` takes it from the config's `wrap_key_file`. Failing that, in a container
+  or with `XBT_SECRETS_DIR`, it uses the secret `hub-wrap-key`, made on first start. Otherwise it uses
+  `<datadir>/hub-wrap-key` and logs a warning: beside the file it seals, it only protects copies of
+  `ch2.json` made without it.
+* **On load**, every blob is opened with the wrap key. The hub refuses to start (`keystore`) if a blob
+  does not open (another wrap key, a changed file), or if a key is not its record's `payer_pub` (a blob
+  moved to another record; checked for every record not yet final).
+* **A legacy file** with plaintext keys is read once and rewritten sealed at startup. The event is
+  `ch2_keys_sealed {count}`, with a line on stderr. The old file's blocks and any backups still hold
+  the keys.
+* A save seals only keys it has not sealed before (each blob is cached in memory), so a write does no
+  AES work once a ch2 is funded. The temp file is created 0600 before the rename.
+
+Design comparison (the best-performing-stack rule):
+
+| option | per-write cost | file readable | unattended restart |
+|---|---|---|---|
+| **per-key AES-256-GCM, cached blobs (chosen)** | a cache lookup per key (31 µs armv7, 10 records) | yes, except the keys | yes |
+| whole-file AES-256-GCM | encrypt the whole file on every write, growing with the archive | no | yes |
+| passphrase KDF (scrypt or Argon2) for the wrap key | as chosen | as chosen | no: an operator at every start |
+
+Per key keeps the write path flat on small boards and the file inspectable. `kdf: "keyfile"` leaves
+room for a passphrase later. The Rust side uses RustCrypto's `aes-gcm` and `zeroize`: pure Rust, no C,
+builds for every target in the matrix, and already in the lock through `xbt-signer` (whose keystore
+cannot be reused: `xbt-signer` depends on `xbt402`). No new duplicates in `cargo tree -d`. B1 uses
+`cryptography` (now in `requirements.txt`; only `xbt402.hub_keys` imports it).
+
+**A ch2 blocked by a written-off lock is closed early.** AGP-064 blocks routing and rollover over a ch2
+with a written-off lock until the ch2 closes or is refunded, which could be its whole life. The
+watcher now asks the provider to close that ch2 at once, once a block until it does, with the best
+state (`ch2_close`, `why: "written_off"`). A close that shows t pays the held lock on ch1; one that
+confirms without t releases the hold (AGP-064).
+* After a **refusal** (the provider answered 400 after taking the pre-signature), the hub refills: its
+  next ch2, if one was funded ahead and is open, takes over at once (`ch2_switch`, `why:
+  "written_off"`) and the old one is closed as retired (AGP-057); otherwise a new ch2 is funded after
+  the close.
+* After a **timeout** (no reveal in time), the hub stopped routing to that provider (AGP-064), so it
+  closes the ch2 and does not fund a new one.
+* A ch2 with nothing signed but a written-off lock is closed too (before, a ch2 with nothing signed
+  was "idle" and left to its refund). A failed close request is reported
+  (`ch2_written_off_close_failed`) and asked again next block.
+
+**Orphan ch1 locks are swept by the watcher.** A ch1 lock that no route is forwarding and that sits on
+no ch2 (the hub stopped between its two write-aheads) was dropped only when the client asked to
+close. The watcher now checks every open ch1 with a lock, each tick, before the margin close. The
+check runs under the provider's busy flag, which `route()` holds from before it writes the lock until
+its forward ends, so a lock in flight is never touched. AGP-064's drop had a gap: if the crash came
+between a void's two writes, ch2 had the lock written off (its pre-signature may be out) while ch1
+still had it as its lock, and the drop let ch1 close below it. Such a lock is now held in the base
+like any written-off lock (`orphan_lock_held`), and the client's close is refused `lock_pending`
+until it resolves. Other orphans are dropped as before (`orphan_lock_dropped`).
+
+With the sweep, the hub now settles a lock's ch1 side before its ch2 side (the provider's answer,
+and t read off a close). A stop between the two leaves the ch2 lock pending, which the provider's
+answer or its close completes again; the other order left a ch1 lock with no ch2 lock, which the
+sweep would drop unpaid. Completing a lock a second time returns the first result.
+
+**C2: the routed funders ask before they broadcast.** AGP-067 made the payer client preflight
+`/open`. `RoutePayer::open` (ch1, to the hub) and the hub's ch2 funding (`connect`, refills,
+`fund_ch2`) funded first and asked afterwards. Both now send the same preflight (`"preflight": true`,
+the terms, no funding outpoint) and fund only after a yes. A refusal is passed on with its code
+(`ch2_preflight_refused` on the hub), and nothing is funded or written. A provider from before AGP-067
+answers `bad_request`, and the funder goes on as before. B1's route payer already preflighted (its
+open is `XbtChannelClient._open`); its hub did not.
+
+**Cost.** Pass lines declared before measuring, armv7 musl release under `qemu-arm-static` as the
+Pi-class figure, x86_64 native beside it (`hub::tests::seal_cost`, ignored by default: `cargo test -p
+xbt402 --release --lib seal_cost -- --ignored --nocapture`):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| sealing step added to a state write (10 records, keys cached) | ≤ 100 µs | 29–31 µs | 7.2 µs |
+| seal one new key (once per funded ch2) | ≤ 1 ms | 12 µs | 1.0 µs |
+| open a 100-record file at startup (opens + `payer_pub` checks) | ≤ 500 ms | 16 ms | 1.3 ms |
+
+For scale, serializing the same 10-record file costs 131 µs on armv7, before its fsync. The sweep is
+one busy-flag try per open ch1 with a lock, per tick. The preflight is one HTTP round trip per funded
+channel, not per call.
+
+**For embedders (cmp).**
+* `RouteHub::new` with a data dir makes `<datadir>/hub-wrap-key` if there is none. Use
+  `RouteHub::new_with_wrap_key(.., Some(WrapKey::load_or_create(path)?))` to keep the wrap key off the
+  data dir. In B1, pass `RouteHub(..., wrap_key=WrapKey.load_or_create(path))`. `OutBook::open` takes
+  the wrap key and refuses a file without one.
+* **Downgrade:** an older hub cannot read a sealed `ch2.json`. Old B1 fails at start (`TypeError` on
+  `secret_sealed`); old Rust loads it with empty keys and cannot sign. Keep a copy from before the
+  upgrade, plaintext keys and all, if a rollback is possible.
+* The ch2 record's `secret` field is gone from the file (it is still in memory). Tools that read keys
+  from `ch2.json` must open `secret_sealed` with the wrap key.
+* A written-off ch2 is closed early, so the provider sees a cooperative close request soon after a
+  refused or timed-out lock. A payee-pays ch2 pays its close fee then.
+* The hub and the route payer send one more `/open` (the preflight) per channel.
+* New events: `ch2_keys_sealed`, `ch2_written_off_close_failed`, `orphan_lock_held`,
+  `ch2_preflight_refused`; `ch2_close` and `ch2_switch` can carry `why: "written_off"`.
+
+Tests: `crates/xbt402-interop/tests/hub_followups.rs` (10; B1
+`tests/security/test_agp073_hub_followups.py`, the same 10):
+* K1: `k1_the_state_file_holds_no_plaintext_ch2_key`,
+  `k1_a_legacy_plaintext_state_file_is_read_once_and_rewritten_sealed`,
+  `k1_a_wrong_wrap_key_or_a_swapped_blob_is_refused`;
+* written off: `written_off_a_refused_lock_ch2_is_closed_and_refilled`,
+  `written_off_with_a_next_ch2_the_hub_switches_and_has_the_old_one_closed`,
+  `written_off_on_a_timeout_the_ch2_is_closed_and_not_refilled`;
+* orphans: `orphan_a_lock_a_crash_left_is_swept_by_the_watcher`,
+  `orphan_a_lock_its_ch2_wrote_off_before_the_crash_is_held_not_dropped`;
+* C2: `c2_the_route_payer_asks_the_hub_before_it_funds_ch1`,
+  `c2_the_hub_asks_the_provider_before_it_funds_ch2`;
+* `hub_keys` unit tests: the seal round trip and its refusals, the key file's forms, and its mode.
+
+On `main`, 9 of the 10 fail; the tenth (the wrong-key test) needs the new API. In B1 master, 9 of 10
+fail: the route payer test passes there, since B1's client already preflighted. Existing tests changed
+with the new behaviour: `hub_money_safety::wa_the_key_is_on_disk_before_fund_runs` (the key is sealed),
+`hub_reconcile::close_fields_round_trip`, and
+`hub_routing_safety::h2_a_refused_lock_stays_in_the_base_and_blocks_routing_and_rollover` (the
+watcher asks for the close itself). In B1: `test_agp037` (key on disk, rollover next key, the
+unknown-spender reconcile), `test_agp053` `HubOff` (one more `/open`) and the same `test_agp064` H2
+test.
+
+**Trade-offs.**
+* A refused first lock on a ch2 with nothing signed asks for a close every block until the provider
+  closes or the refund comes, unless a next ch2 is open.
+* The default wrap key beside the state file only protects copies of `ch2.json`. A secrets mount or
+  `wrap_key_file` elsewhere is the real protection.
+* The write does not fsync the directory after the rename, as before: no extra IO per call. A
+  follow-up could add it.
 
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
 `getrandom`, std threads (no async runtime). The payer HTTP client uses `ureq` with rustls/ring
-(no OpenSSL). The xbt402 server is std (`http-server`, AGP-068). wallet-ui, the work relay and MCP
-still use `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
+(no OpenSSL). Every HTTP server (xbt402 `http-server`, wallet-ui, the work relay, the MCP) is
+`xbt_svc::http`, std only (AGP-068, AGP-072). `cargo check -p xbt402` (library, and all features + the hub binary)
 passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
 x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).
 Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of
@@ -1282,6 +1662,172 @@ the miner, and the oracle every answer is compared with.
 Deliberately different from B2's Python: `gettxspendingprevout` reports mempool spends only, as
 Knots does (the Python also reported confirmed spends; the typed `spending_tx` still does), and the
 fee estimate is the median over servers (the Python took the first answer).
+
+## Light client and consensus edges (AGP-069, review E1–E3, S1, M1)
+
+The light backend now checks headers as Knots does from the first header above the checkpoint. It
+withholds answers while its chain is not believable, and a lying server can neither stall callers
+nor get a cheap fork believed. The hot wallet waits for the coinbase maturity the node reports. B2
+`agentwallet/headers.py`, `electrum.py`, `maturity.py` and `hot.py` on `agp-069` (`24a0cd5`) and B1
+`xbt402/tx.py` on `agp-069` (`fe96c67`) do the same, with the same test names (`test_` prefixed in
+Python). Knots line numbers below are v29.4.2.
+
+**Header rules (E3).** `HeaderChain` refuses:
+
+- a header whose top two flag bits are set (`bad-flags-highbits`, validation.cpp:4431);
+- a version below 4 once bit 31 is masked off (`bad-version`, 4757–4762);
+- a time not above the median of the 11 before it, from the first header above the checkpoint on
+  (4737);
+- on regtest, nBits other than the min-difficulty walk-back gives (pow.cpp:42–56,
+  `ChainRules::next_bits_with`);
+- any block other than the pinned one at a pinned height (`ChainRules::pins`; on mainnet 964264,
+  Knots' assumevalid block, chainparams.cpp:150).
+
+The median and the walk-back need the 10 headers below the checkpoint, so
+`set_checkpoint(raw, prior)` now takes `PRIOR_HEADERS` (10) 80-byte v1 headers. Each must hash-link
+to the one above it, and the last to the checkpoint. The backend fetches them from the servers, and
+they are never answered as ours. Testnet3, testnet4 (BIP94) and signet have no rules here, so
+`ChainRules::for_chain` refuses them and no chain starts.
+
+**Believable chain (E2).** On mainnet every chain answer fails with `Kind::Implausible` (B2:
+`ImplausibleChain`, status `"implausible"`) until the verified chain:
+
+- reaches every pinned block;
+- carries Knots' nMinimumChainWork (chainparams.cpp:149, the chainwork of 964264) less the
+  chainwork of 961640, which is 0x10c4284b5592c3c377 by Knots' `getblockheader`;
+- trails one block per 600 s since the newest pinned block by at most 2016 blocks.
+
+`Config.plausibility` overrides this (default `Plausibility::mainnet` on mainnet, none elsewhere)
+and `Config.clock` sets the clock in tests. A checkpoint of unknown chainwork gets no minimum work,
+but it still has to reach the pins.
+
+**TLS (E2).** On mainnet every server must be `ssl://`. `tcp://` is allowed only to a loopback host
+(`is_loopback_host`); anything else is `Kind::BadRequest` from `ElectrumBackend::new`.
+
+**Lying servers (E1).**
+
+- On mainnet a claimed tip is believed up to ours + (time since our tip / 150 s) + 2016
+  (`TIP_CAP_SPACING_S`). Nothing above that is fetched, and the server is flagged.
+  `Config.tip_cap_spacing_s` sets it; it is off by default elsewhere, because regtest mines blocks
+  as fast as it is asked to (the interop run's electrs were flagged until it was).
+- Each chunk is checked as it arrives (`HeaderChain::branch`, `Branch::extend`), so the first bad
+  header stops that server's sync. The branch is adopted only if it has more work and our chain
+  under it has not moved (`HeaderChain::adopt`).
+- No lock is held across a network read. Servers sync in parallel. Once a chain is held, a caller
+  that finds a sync running answers from the verified chain instead of waiting (a try-lock gate);
+  only before the first chain do callers wait.
+- Before a chain is held, a tip outside our powLimit means another chain: `Kind::CheckpointMismatch`,
+  as for a missing checkpoint.
+
+**Sighash (S1).** `unified_sighash_ext(…, SpendExt { annex, codesep_pos })` commits an annex as
+`0x01 ‖ sha256(compact_size ‖ annex)` (interpreter.cpp:1730–1732, 2152) and the position of the
+last executed OP_CODESEPARATOR after the leaf hash (1749). It refuses values the script type does not
+commit to: an annex outside taproot, an annex without the 0x50 tag, and a position outside
+tapscript. `unified_sighash` is `SpendExt::default()` and unchanged, so the 166 pinned vectors still
+match. B1's `unified_sighash` takes keyword-only `annex=` and `codesep_pos=`. Knots' REDUCED_DATA
+refuses any annex on mainnet until 2027-09-01 (2149–2150). For script type 0, `script_code` must
+already have this signature's pushes removed: Knots still runs FindAndDelete there (345–349), and
+the docs of both functions now say so. The 60 new vectors in `vectors/unified_sighash_ext.json`
+were computed with Knots' own Python test framework (`scripts/gen_unified_sighash_ext.py`); main
+matches 8 of them (the cases with neither an annex nor a codeseparator).
+
+**Coinbase maturity (M1).** The hot wallet learns which coins are coinbase outputs from
+`scantxoutset`, `gettxout`, and a funding transaction's `vin[0].coinbase`. Such a coin is spendable
+once tip + 1 ≥ h + max(depth, 100), with the depth from the node's `getdeploymentinfo`
+`long_coinbase_maturity` (Knots' mempool holds every coinbase spend to that depth,
+validation.cpp:1021–1022). A node that cannot say holds them: the light backend has no
+`getdeploymentinfo`, so a light hot wallet does not spend coinbase coins. `fund`, `rotate`, the
+sweeps and `status` (`hot_coinbase_sats`) all use it. `Maturity` moved from xbt-work to
+`xbt402::maturity` (xbt-work re-exports it), so the signer does not depend on xbt-work.
+
+**CAIP-2.** `network.rs` now says why XBT's id is keyed to block 961640 and not genesis: a
+genesis-keyed id would be Bitcoin's own.
+
+**Embedders.**
+
+| change | who must act |
+|---|---|
+| The header store records the priors; a store from an older release is ignored and the chain resyncs from the checkpoint once | nobody (one resync) |
+| `set_checkpoint(raw, prior)`; `HeaderChain::new` takes `impl Fn() -> u64` (was `Box<dyn Fn>`); `Header` gains `version` and `flags` | anyone driving `HeaderChain` directly |
+| Mainnet light backend: `ssl://` only, except loopback | configs listing `tcp://` mainnet servers |
+| New `Kind::Implausible`: retry later, as for `NotFound` | exhaustive matches on `Kind` |
+| Servers must serve the 10 v1 headers below the checkpoint (`blockchain.block.headers`; electrs does) | operators of other Electrum servers |
+| Coin records gain `"coinbase": true, "height": h` (only on coinbase coins); spending them needs `getdeploymentinfo` | hot-wallet users with mined coins |
+| `xbt_work::chain::Maturity` is `xbt402::maturity::Maturity` | nobody (re-exported) |
+
+cmp, xbt-compute, B5 and xbt-063 pin their own copies and are unaffected until they re-pin.
+Nothing on the xbt402 wire changes, and `scripts/conformance.sh` is unchanged (253/253).
+
+Choices (best-performing-stack rule; the code ships in the existing Rust crates, with the Python
+references kept in step, and adds no dependencies):
+
+| question | options | chosen, and why |
+|---|---|---|
+| not stalling on a slow or lying server | one lock across reads (main); a background sync thread with a channel; a try-lock gate | **the gate**: no new thread or state, and callers keep answering from the verified chain |
+| when headers are checked | after a whole batch (main); per chunk as it arrives; one request per header | **per chunk**: the first bad header ends the fetch, and the round trips stay batched |
+| how high a claimed tip to believe | anything; a fixed cap; a cap from elapsed time | **elapsed time** (4× the target block rate, plus 2016): a real tip always fits |
+| the headers under the checkpoint | skip the median for the first 10 (main); ship them in the binary; fetch and hash-link them | **fetch**: an operator checkpoint works too, and the hash link adds no trust in the server |
+| coinbase depth | hard-code the #419 schedule; ask the node | **the node**: it is what the mempool enforces; unknown means hold |
+| annex and codeseparator | more arguments on `unified_sighash`; a new function | **`unified_sighash_ext`**: no caller or pinned vector changes |
+
+**Cost.** Pass line declared before measuring:
+
+- (a) per 2016-header chunk, validation costs at most 10% more than on main;
+- (b) on armv7 (Cortex-A7 class), the catch-up from 961640 to a tip about 10,000 headers above it
+  takes at most 10 s of CPU, and the priors at most 10 ms;
+- (c) the plausibility check on every answer costs at most 1 µs on x86.
+
+`cargo run --release -p xbt-primitives --example header_cost` on a Ryzen 9 9950X3D, three runs
+interleaved with the same example built on main:
+
+| per header (8064 synthetic headers) | agp-069 | main |
+|---|---|---|
+| parse (BLAKE2b) and PoW alone | 810 ns | 820 ns |
+| connect, mainnet's path (no min-difficulty walk) | 940–950 ns | 950–1004 ns |
+| connect, regtest rules | 2176–2250 ns | 961–1011 ns |
+| the 61 real mainnet headers from 961640, checkpoint included | 974–990 ns | 945–973 ns |
+
+- Mainnet passes (a): no difference on its path, and +3% on the real headers.
+- **Regtest fails (a) at +125%.** All of it is Knots' min-difficulty walk-back, which on regtest
+  walks to the last 2016 boundary for every header. Mainnet never runs it. It is kept because it is
+  the Knots rule; 8064 regtest headers still take 18 ms.
+- The checkpoint with its priors costs 2.3 µs (main 0.9 µs). `branch()` at the tip copies the last
+  2016 headers once per sync round, 31 µs. `implausible()` costs 8.4 ns per answer, which passes (c).
+- There was no armv7 box or emulator, so (b) is an estimate. The armv7 build of the example
+  compiles. BLAKE2b is 64-bit arithmetic, roughly 50–100× slower per header on a 900 MHz Cortex-A7,
+  so 10,000 headers take about 0.5–1 s and the priors well under 1 ms. That passes.
+
+**What this does not fix.**
+
+- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^53 hashes per
+  block. The floor only raises the bar for a fork that also hides the real tip. Releases should bump
+  the pins, and operators can set a later checkpoint.
+- A call that fans out to every server waits for the slowest one, up to the timeout (no lock held).
+- One batch can fetch up to 4×2016 junk headers before the first is checked (B2 fetches chunk by
+  chunk).
+- If blocks really did come much slower than one per 600 s for weeks, the floor would withhold
+  answers until the pins are bumped.
+- A light hot wallet cannot spend coinbase coins (fail closed).
+
+Tests, each failing on main first:
+
+- `crates/xbt-primitives/tests/header_chain.rs`: `e3_flags_highbits_and_version`,
+  `e3_median_time_from_the_first_header`, `e3_min_difficulty_walk_back`,
+  `pinned_heights_refuse_any_other_block`, `unsupported_test_networks_fail_closed`,
+  `a_branch_validates_as_it_grows` and `mainnet_checkpoint_with_its_real_priors` (the 71 real
+  headers 961630–961700 from xbt-snapshot, `vectors/mainnet_headers_961630.json`). Unit test: `mainnet_minimum_work`.
+- `crates/xbt-electrum/tests/backend.rs`:
+  - `mainnet_needs_tls`;
+  - `hostile_lying_server_cannot_stall`: main gives no answer within 10 s, and a slow server holds a
+    caller 1.2 s;
+  - `hostile_cheap_fork_is_not_believed`: main shows 20 confirmations on the fork;
+  - `tip_cap_is_mainnet_only`.
+- `crates/xbt-primitives/tests/sighash_ext.rs`: `s1_annex_and_codesep_vectors_match_knots` and
+  `s1_refuses_values_the_script_type_does_not_commit_to`.
+- `crates/xbt-signer/tests/review_e.rs`: `m1_coinbase_waits_for_the_node_maturity`,
+  `m1_coinbase_waits_when_the_node_cannot_say` and
+  `m1_coinbase_flag_from_gettxout_and_the_transaction`. On main the wallet spends a block-200
+  coinbase at block 299. Unit test: `maturity_from_the_node`.
 
 ## Pay-with-work: xbt-work (AGP-032)
 
@@ -1358,12 +1904,12 @@ through `xbt-primitives` (NTA BIP340).
   paid with the carry, released. D: a pool block outside the invoice covers the rest. Then the payer's 19 checks.
   42/42 on 2026-09-29 (`docs/work-nta-agp043-20260929-032035/`).
 
-## The coinbase audit without trusting the Prime (AGP-065, Guida P1–P6)
+## The coinbase audit without trusting the Prime (AGP-065, review P1–P6)
 
-Chris Guida reviewed the public snapshot (xbt-rs `ecdbb50`). His point: the §10.3 audit took every
+An external reviewer read the public snapshot (xbt-rs `ecdbb50`). The point: the §10.3 audit took every
 number from the Prime's own window statement, so a Prime colluding with a payer could receipt work
 nobody mined and then sign a statement that excused the unpaid coinbase. Every finding was still
-present on `main` (`c8d607b`). Each now has a test in `crates/xbt-work/tests/guida_p.rs`; P1–P4 were
+present on `main` (`c8d607b`). Each now has a test in `crates/xbt-work/tests/review_p.rs`; P1–P4 were
 first run against `main` and failed there.
 
 * **P1: the provider pins the Prime's terms.** `WorkConfig::terms` (`audit::PrimeTerms { window,
@@ -1496,6 +2042,206 @@ beside it; pass lines declared before measuring):
 The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verifications (AGP-032), of
 which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
 makes one pass over the spans; before, it recomputed the caps' room for each open span.
+
+## Lightning rail hardening (AGP-066, review L1–L5)
+
+An external review of the public snapshot (xbt-rs `ecdbb50`) found five weaknesses in the payer-only
+`rail=ln` (AGP-048/049, `crates/xbt-signer/src/ln.rs`). All five were still present on `main`
+(`9ec4090`); since `ecdbb50`, the LN code had changed only in `7c90e17` (AGP-055, how the tests read
+the ledger), which none of the findings depends on. Each
+has a test in `crates/xbt-signer/tests/ln_rail.rs` that failed on `main`; commit `25f5ea8` holds the
+tests alone. Neither Python reference has a Lightning rail (B1 `xbt402/` and B2 `agentwallet/` have
+none), so there is no parity change and no vector changed.
+
+Two design notes stand as before, and nothing below changes them:
+
+* **The wallet's policy is advisory as far as LND is concerned.** The signer's checks bind what goes
+  through the signer. Anyone holding a macaroon with more access (the node's `admin.macaroon`, `lncli`
+  on its host) bypasses all of them. That is why mainnet requires `ln.exposure_cap_sats`: the LN node
+  is trusted with everything it holds.
+* **Everything rests on the Lightning Fork's behaviour.** Its unified signatures (`option_unified_sigs`,
+  sighash 0x21) and its feature bit 512 (`option_blake2b`) are what keep a channel's transactions and
+  invoices off SHA-256 Bitcoin. The signer checks that they are in use (L5 below tightens the funding
+  proof) but cannot make the fork implement them correctly.
+
+* **L1: plain http only to a loopback address.** `LndRest::new` cut the URL's host at the first `:`,
+  so in `http://[::ffff:10.0.0.5]:8080` the leftover `[` passed as loopback, and the spending macaroon
+  crossed the LAN in cleartext. The URL is now parsed with the `url` crate (the parser `ureq` itself
+  uses, so the host checked is the host dialled). Plain http is allowed only to an IPv4 address in
+  127.0.0.0/8, to `::1`, or to an IPv4-mapped address inside 127.0.0.0/8. A hostname, `localhost`
+  included, needs https. Test: `l1_plain_http_only_to_a_loopback_address`: a table of URLs, then a
+  property over 400 random IPv4 addresses (half in 127/8), their IPv4-mapped forms and 400 random
+  IPv6 addresses (accepted exactly when in 127/8; random IPv6 never). On
+  regtest, S18 starts a signer with that URL and checks it is refused.
+* **L2: the mainnet macaroon check is an allowlist.** The check refused only `onchain:write`,
+  `macaroon:*` and `signer:generate`. A macaroon granting `uri:/lnrpc.Lightning/SendCoins` (or
+  `invoices:write`, `peers:write`, …) passed. Now, on mainnet, `ln_macaroon` refuses any permission
+  beyond the rail's four (`info:read offchain:read offchain:write onchain:read`). It also refuses a
+  macaroon whose permissions cannot be read (not an LND identifier), since one that cannot be read
+  cannot be shown to be least privilege. Off mainnet the macaroon is reported, not refused: `ln_status`
+  `macaroon.only_needed` and `excess_ops`. `dangerous_ops` stays in the report. (The field is not
+  called `least_privilege`: the response sanitizer drops every key containing `priv`, and the regtest
+  caught it.) Test:
+  `l2_the_mainnet_macaroon_holds_only_the_rails_permissions`, plus the `macaroon.rs` unit test.
+  Regtest: S17. An allowlist scoped by URI (accepting the rail's own URIs and nothing else) would also
+  work; the entity allowlist is simpler and is what `lncli bakemacaroon` produces.
+* **L3: a payment is looked up by its hash.** `lookup` scanned `GET /v1/payments` (the newest 1,000),
+  so on a busy node an older settled payment looked like no payment, and reconcile released its
+  booking. It now calls `GET /v2/router/track/{payment_hash}` (TrackPaymentV2, base64url hash), reads
+  the first line of the stream, and checks that the record's hash is the one asked for. Only LND's
+  "payment isn't initiated" answer means "no payment": grpc-gateway answers an unknown route with a 404
+  too, so the status code alone proves nothing, and any other error stays an error (nothing is
+  released). LND has no hash filter on `ListPayments`, and scanning all of its pages costs O(payments)
+  on every reconcile; TrackPaymentV2 costs one call. It needs the node built with `routerrpc` (Lightning
+  Fork releases are) and `offchain:read`, which the rail's macaroon already has. Tests:
+  `l3_a_payment_is_looked_up_by_its_hash_not_among_the_newest_1000` and
+  `l3_reconcile_does_not_release_a_settled_payment_on_a_busy_node`, against a fake REST LND on
+  loopback that holds 1,001 payments. On regtest, S16 checks both answers on lf1, and S15's reconcile
+  goes through the new lookup.
+* **L4: a late rebook that breaks the policy halts the rail.** A booking released because the node had
+  no record of it is watched; if the node records the payment late, it is booked again (`ln_rebook`).
+  That booking discarded the policy's verdict, so a release, a new payment in the freed room, and the
+  late settle could overspend the daily budget without anyone noticing. Now the rebook still books what
+  was spent (the ledger is the truth), but asks `evaluate_booking` first. If the booking breaks the
+  policy (or cannot be committed), the signer:
+  * writes a halt to `.run/ln_halt.json` (atomic write, `0600`) and audits `ln_halted`;
+  * refuses every `ln_pay` with `ln_halted` (nothing reaches the router), and `ln_status` shows
+    `halted`, `ready: false` and a warning;
+  * puts an approval of kind `ln_resume` (dest `ln:resume`, the amount rebooked) in the human's queue.
+    It is renewed while the halt stands, one live request per halt. Only the human's ed25519 signature
+    on it resumes the rail (`ln_resumed`). A wrong signature, or a token for an earlier halt, is refused.
+
+  A halt file that cannot be read counts as a halt. The watch lasted until the invoice's expiry plus
+  10 minutes, far shorter than an HTLC can stay out. It now lasts `ln.max_cltv_blocks` + 144 blocks
+  (`REBOOK_WATCH_MARGIN_BLOCKS`), counted both in blocks from the tip at release
+  (`watch_until_height`) and in time at 600 s a block. Tests:
+  `l4_a_late_rebook_that_breaks_the_policy_halts_the_rail_until_the_human_resumes_it` and
+  `l4_the_rebook_watch_lasts_as_long_as_the_htlc_can`. The AGP-048 test
+  `a_payment_released_as_never_sent_and_settled_late_is_booked_again` now checks the longer window.
+  The alert is the approval queue the human already watches: the wallet UI's card says the rail is
+  halted and that approving pays nothing. No new message type or key was needed.
+* **L5: the funding proof.**
+  * **The cache is keyed on the block.** A `Proven` verdict was cached per channel point forever, so
+    after a reorg removed the funding block the channel still carried payments. The signer now asks
+    its node for the hash at the short channel id's height on every use, and a cached verdict counts
+    only while that hash is the one it was reached on (`Funding::block_hash`, in the evidence as
+    `block_hash`). After a reorg the channel is proven again from the new block. Test:
+    `l5_a_proven_funding_is_proven_again_after_a_reorg` (refused while the block is gone, proven again
+    when it returns).
+  * **Which signatures count.** The proof read the sighash byte of every DER-shaped push, so a 0x21
+    push that the script never checks (`OP_DROP OP_TRUE`, a taproot script path) "proved" the input.
+    `ln_funding::checked_sighashes` now reads only spends whose sole condition is signatures: P2WPKH,
+    P2SH-P2WPKH, P2PKH, P2WSH or P2SH-P2WSH whose witness script is `<key> CHECKSIG` or
+    `m <keys> n CHECKMULTISIG` (with exactly its `m` signatures), and a taproot key path. Any other
+    input leaves the channel unproven, and the refusal names the input and why. Tests:
+    `l5_a_0x21_push_the_script_never_checks_proves_nothing` (an anyone-can-spend P2WSH and a taproot
+    script path are refused; LND's 2-of-2 P2WSH and np2wkh spends are proven), the unit test
+    `reads_sighash_bytes_by_input_kind`, and the property test `only_signature_only_scripts_are_read`
+    (2,000 random P2WSH witnesses: one is read only if its script is a key-check template, and then
+    yields exactly the `m` signatures that script checks).
+
+**The replay-safety reasoning, corrected** (`ln_funding.rs` module documentation):
+
+* A channel's transactions can replay on SHA-256 Bitcoin only if its funding transaction is valid
+  there too. One input with a signature that its script checks, and that SHA-256 Bitcoin cannot verify,
+  makes the transaction invalid there. The proof asks for that of every signature of every input.
+* The earlier comment said SHA-256 Bitcoin rejects a 0x21 signature. It does not: its consensus accepts
+  hash type 0x21 on legacy and segwit v0 inputs (the byte is only non-standard there; taproot does
+  reject it). The protection is the digest. An XBT signer signs 0x21 over the unified message
+  (`unified_sighash`: BIP341-shaped, committing to every input's amount and scriptPubKey). SHA-256
+  Bitcoin checks the same signature against its own legacy or BIP143 message for hash type 0x21. One
+  ECDSA signature valid under one key for both messages would need the two digests to be equal modulo
+  the group order.
+* **Why reading the bytes suffices, without verifying the signatures in the signer.** The funding
+  transaction is read from a block on the signer's own node's best chain, at the position its short
+  channel id names. That node's consensus has already verified every signature each input's script
+  checks, against XBT's message for its hash type (below an `assumevalid` block, the network that built
+  on it has). Verifying again in the signer would repeat that work and add a second ECDSA path to keep
+  in step with Knots. What the bytes alone cannot tell is which pushes the script checks, so the fix is
+  the template restriction above.
+* **The height proves nothing on its own.** A coin confirmed at or above the split is not thereby
+  XBT-only. A transaction valid on both chains (a 0x01 spend of pre-split coins, broadcast on both) has
+  the same txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here.
+  The signatures are the proof. The rule that every input's coin is confirmed at or above the split
+  stays, as an extra, conservative rule: a channel opened after the split never needs older coins.
+
+**For embedders (cmp and anyone linking `xbt-signer`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `B2_LN_REST` plain http | allowed to any host starting `127.`, `localhost`, or with a `[` (the bug) | only 127.0.0.0/8, `::1`, `::ffff:127.0.0.0/104`; `localhost` needs https |
+| mainnet macaroon | refused if it grants `onchain:write`, `macaroon:*`, `signer:generate` | refused if it grants anything beyond the rail's 4 permissions, or cannot be read |
+| `ln_status.macaroon` | | adds `only_needed` (bool) |
+| payment lookup | `GET /v1/payments` (newest 1,000) | `GET /v2/router/track/{hash}`: needs `routerrpc` on the node |
+| `ln_pay` | | new rule `ln_halted` (with `halted`, the halt record) |
+| `ln_status` | | adds `halted` (`null` or `{halt_id, reason, payment_hash, dest, booked_sats, ts}`) |
+| approvals | kinds `xbt402`, `ln`, payment | adds kind `ln_resume`, dest `ln:resume`; `approve` with the human's signature resumes the rail |
+| audit log | | `ln_halted`, `ln_resumed`; `ln_rebooked` gains `breach` |
+| `.run/` | | `ln_halt.json` while halted; `ln_payments.json` records gain `watch_until_height` |
+| funding evidence | | adds `block_hash` |
+| `LnBook::watched` | `watched(now)` | `watched(now, tip)` |
+| `ln_funding` | `input_sighashes` | `checked_sighashes(&TxIn, prev_spk) -> Result<Vec<u8>, String>` |
+
+New dependency: `url` 2.5, already in the tree through `ureq` 2.12 (`cargo tree -d` shows no new
+duplicate).
+
+Results on 2026-10-08: `cargo test --workspace` (517 passed) and `scripts/conformance.sh`;
+`scripts/ln_rail_regtest.sh` 61/61 against Lightning Fork `dd659b3` (`docs/agp066_ln_rail_regtest.json`).
+S16 shows the node's answer for an unknown hash: 404 `{"error": {"code": 5, "message": "payment isn't
+initiated"}}`. Its first run also caught `least_privilege`, which the sanitizer had removed from every
+response.
+
+CPU (`crates/xbt-signer/examples/ln_funding_cost.rs`; armv7 musl under `qemu-arm-static` as the
+Pi-class figure, x86_64 native beside it; pass line declared before measuring):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| `checked_sighashes`, one funding transaction of 10 inputs (P2WPKH, 2-of-3 P2WSH, P2SH-P2WPKH, P2TR key path) | ≤ 50 µs | 1.97 µs | 0.16 µs |
+
+The L5 cache check adds one `getblockhash` RPC to the signer's own node per usable channel on each
+`ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
+listing with one record. The L1 parse runs once, at configuration.
+
+## Embedders on xbt402 v1.3 (AGP-074)
+
+AGP-068 changed the wire (derivation v3, request binding v2, receipt v2) and left the embedders on
+their pins. This moves them.
+
+**xbt-work speaks request binding v2.** `xbt_work::auth::request_digest` is now
+`xbt402::wire::request_digest_v2`: the digest is the tagged hash of the length-prefixed method,
+scheme, host, port, target and body, taken over the URL the payer sent the request to. A bare
+target binds no origin, which is what the published vectors use. v1 (`request_digest_v1`) no longer
+authenticates. The vectors are XBT-053's `vectors.json` with the `auth` section regenerated
+(XBT-053 branch `agp-074`; `scripts/work_conformance.sh` still demands byte identity). The HMAC
+over the digest is unchanged.
+
+Options weighed for the binding (best-performing-stack rule): a digest of xbt-work's own (a second
+definition to keep equal with xbt402's, forever), keeping v1 behind a version flag (two live
+bindings, and a captured v1 header still spends), or **xbt402's v2 directly (chosen)**. One
+function, the same one B1 and the channel scheme already verify, and the published vectors move
+with it.
+
+**Cost.** Declared before measuring: moving xbt-work's digest from v1 to v2 may add at most 50 µs
+per paid call on the Ryzen 9 9950X3D, and at most 1 ms on the Pi 3's Cortex-A53. Measured with
+`cargo run --release -p xbt402 --example binding_bench` (20,000 iterations, the bench's own empty
+body): v1 98 ns, v2 273 ns, so +175 ns per call. The difference is the length prefix per field and
+the origin split; both hash the same body bytes, and the bench's own line puts a 4 KiB body at
+1,657 ns. On the Pi 3 the same SHA-256 is the cost, and 175 ns scaled by that core's gap to the
+Ryzen stays far under 1 ms. Nothing is added per byte beyond what v1 already hashed.
+
+**xbt-063.** `rehearsal/PINS` and `vendor/` move to the merged B1 and B2 masters. The flagship
+refund probe's policy carries `allowlist` and `counterparties[probe].pay_to`, because AGP-063 (W3)
+refuses an `open_channel` whose destination is not the policy's. `scripts/mcp/regtest_conformance.sh`
+and `verify_agp030.sh` default to this xbt-063 tree.
+
+**B5.** `vendor/` moves to the same masters, and `fwd/server.py` signs receipt v2: `status` and
+`bodyHash` over the answer body, with `req` bound by `request_digest_v2`.
+
+**B2.** `open_from_offer` posts the review C2 preflight `/open` (no outpoint) before it funds, as
+`Payer::open` and the B1 client do. A refusal funds nothing; a provider from before the preflight
+answers `bad_request` and the wallet funds as before.
+
+`xbt-signer`'s `request_target` is gone: nothing called it once the binding moved to the full URL.
 
 ## Linking xbt-rs from cmp (AGP-035)
 

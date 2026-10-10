@@ -15,15 +15,22 @@
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
 //!                   [--max-unfunded-per-client N] [--trust-forwarded]
+//!                   [--data-dir DIR] [--watch-secs N]
+//!
+//! AGP-067 (review C4): the channel side keeps its payTo key (`DIR/payto.key`, created 0600 on first
+//! start) and its channel ledger (`DIR/channels.jsonl`, locked to one process) in `--data-dir`
+//! (`XBT_WORK_DATA_DIR`, default `./xbt-work-provider-data`), and a watcher runs `close_due` every
+//! `--watch-secs` (default 5): it closes each channel before its expiry and bumps a stuck close. A
+//! restart keeps every channel; before, a new random key and an empty ledger let each buyer refund.
 //!
 //! §13.1 caps (AGP-043): unaudited credit per invoice and in total, in work units, in sats converted
 //! at each epoch's price (without the haircut), or in calls at the `--price` (sats); `off` removes
 //! a cap. Owed carry above `--max-carry-sats`, or growing over `--carry-growth-blocks` audited
-//! blocks, stops new credit. AGP-065 (Guida P5): with no cap flag the provider caps unaudited
+//! blocks, stops new credit. AGP-065 (review P5): with no cap flag the provider caps unaudited
 //! credit at 100 calls per invoice and 1000 calls in total, and forgives at most 100 calls of
 //! skipped credit (credit the Prime's window moved past before any audit counted it).
 //!
-//! AGP-065 (Guida P1): the Prime's pool terms are pinned here, never taken from a statement:
+//! AGP-065 (review P1): the Prime's pool terms are pinned here, never taken from a statement:
 //! `--prime-window` (primed `window`, default 8), `--prime-window-min-work` (primed
 //! `window-min-work`, default 0; regtest runs need the Prime's floor), `--window-tolerance-bps`
 //! (default 500), `--prime-fee-bps` (default 0, the fee the provider prices with) and
@@ -33,7 +40,7 @@
 //! `XBT_WORK_PRIME_WINDOW`, `XBT_WORK_PRIME_WINDOW_MIN_WORK`, `XBT_WORK_WINDOW_TOLERANCE_BPS`,
 //! `XBT_WORK_PRIME_FEE_BPS`, `XBT_WORK_PRIME_MIN_PAYOUT`, `XBT_WORK_MAX_UNFUNDED_PER_CLIENT`.
 //!
-//! The audit loop audits every block (Guida P4): a block with no statement that paid the identity
+//! The audit loop audits every block (review P4): a block with no statement that paid the identity
 //! fails; a Prime or node it cannot reach stops the pass, which resumes at that block. Before each
 //! pass it compares the audited blocks with the node and undoes the audit of any reorged one.
 //!
@@ -53,9 +60,8 @@ use serde_json::{json, Value};
 use xbt402::funding::ChainBackend;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
 use xbt402::ledger::Ledger;
-use xbt402::provider::{HttpResponse, Provider, ProviderConfig, PEER_HEADER};
+use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig, PEER_HEADER};
 use xbt402::rpc::Rpc;
-use xbt_primitives::secp256k1::SecretKey;
 use xbt_work::audit::{audit_block, check_fraud_proof};
 use xbt_work::book::CreditCaps;
 use xbt_work::chain::ChainBlock;
@@ -120,7 +126,7 @@ struct Caps {
 }
 
 impl Caps {
-    /// Guida P5: what the provider runs with when the operator sets no cap.
+    /// review P5: what the provider runs with when the operator sets no cap.
     const DEFAULT: Caps = Caps { invoice: Cap::Calls(100), total: Cap::Calls(1000), skipped: Cap::Calls(100) };
 
     fn at(&self, bits: u32, v: u64, price: u64) -> CreditCaps {
@@ -217,7 +223,7 @@ impl Service {
         Ok(low)
     }
 
-    /// Audit every block in [from, to] (the auto-audit loop, Guida P4): the verdicts, and the next
+    /// Audit every block in [from, to] (the auto-audit loop, review P4): the verdicts, and the next
     /// height to audit. A node or Prime it cannot reach stops the pass there (retried next time);
     /// a statement it refuses (another block, a window start that went backwards) leaves the
     /// block's credit held and moves on.
@@ -322,7 +328,7 @@ fn main() {
     wcfg.nta = flag("--nta") || std::env::var("XBT_WORK_NTA").is_ok_and(|v| v == "1");
     let subsidy = node.call("getblockstats", json!([block_count(&node).expect("height"), ["subsidy"]])).ok()
         .and_then(|s| s["subsidy"].as_u64()).unwrap_or(5_000_000_000);
-    // Guida P5: safe caps unless the operator sets them (in calls, so they hold on any chain)
+    // review P5: safe caps unless the operator sets them (in calls, so they hold on any chain)
     let d = Caps::DEFAULT;
     let caps = Caps { invoice: Cap::from_args("invoice", d.invoice), total: Cap::from_args("total", d.total), skipped: Cap::from_args("skipped", d.skipped) };
     wcfg.caps = caps.at(tip_bits(&node).expect("bits"), subsidy, price);
@@ -348,13 +354,28 @@ fn main() {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     }));
-    let mut sk = [0u8; 32];
-    getrandom::getrandom(&mut sk).expect("randomness");
+    let data = std::path::PathBuf::from(opt("--data-dir", "XBT_WORK_DATA_DIR").unwrap_or_else(|| "xbt-work-provider-data".into()));
+    let die = |e: xbt402::ChannelError| -> ! {
+        eprintln!("xbt-work-provider: {e}");
+        std::process::exit(2);
+    };
+    // the ledger first: its lock keeps a second process off this data dir, key file included
+    let ledger = Ledger::open(&data.join("channels.jsonl")).unwrap_or_else(|e| die(e));
+    let sk = load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| die(e));
     let chain: Arc<dyn ChainBackend> = Arc::new(node.clone());
-    let prov = Arc::new(Provider::new(chain, SecretKey::from_slice(&sk).expect("key"), ProviderConfig::new(&net), Ledger::in_memory(),
+    let prov = Arc::new(Provider::new(chain, sk, ProviderConfig::new(&net), ledger,
                                       Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
-                                      Box::new(|_, p, _| answer(p))).expect("provider")
+                                      Box::new(|_, p, _| answer(p))).unwrap_or_else(|e| die(e))
         .with_scheme(Arc::new(WorkScheme(work.clone()))));
+    let (w, every) = (prov.clone(), num::<u64>("--watch-secs", "XBT_WORK_WATCH_SECS").unwrap_or(5).max(1));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(every));
+        match w.close_due() {
+            Ok(closed) if !closed.is_empty() => eprintln!("watcher: closed {closed:?}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("watcher: {e}"),
+        }
+    });
     // pull receipts through the relay, and follow the epoch (§6.3: re-price new 402s)
     let (w2, n2) = (work.clone(), node.clone());
     let pull_secs: u64 = arg("--pull-secs").map(|p| p.parse().expect("pull secs")).unwrap_or(3);
@@ -428,7 +449,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// Guida P5: with no cap flag the binary caps unaudited credit, on mainnet and on regtest.
+    /// review P5: with no cap flag the binary caps unaudited credit, on mainnet and on regtest.
     #[test]
     fn p5_the_binary_ships_non_zero_caps() {
         for (bits, v) in [(0x1702_3a6e_u32, 312_500_000u64), (0x207f_ffff, 5_000_000_000)] {

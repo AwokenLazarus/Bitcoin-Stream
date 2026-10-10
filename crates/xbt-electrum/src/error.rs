@@ -14,6 +14,9 @@ pub enum Kind {
     CheckpointMismatch,
     /// Nothing verifiable: no server served the checkpoint yet, a height beyond our chain, ...
     NotFound,
+    /// The verified chain is not believable yet (below a pinned block, the minimum work, or the
+    /// height its age implies): every chain answer is withheld until it is.
+    Implausible,
     /// The call needs a full node (a node wallet, blocks, or mining).
     LightBackend,
     /// A malformed argument or configuration.

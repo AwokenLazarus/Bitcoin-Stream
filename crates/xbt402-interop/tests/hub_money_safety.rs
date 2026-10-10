@@ -280,7 +280,10 @@ fn wa_the_key_is_on_disk_before_fund_runs() {
     let oc = h.connect(&s.origin, None, None).unwrap();
     let rec = seen.lock().unwrap()[&s.origin].clone();
     assert_eq!(rec["state"], "funding");
-    assert_eq!(rec["secret"], oc.secret.as_str());
+    // sealed (AGP-073 K1): it opens under the data dir's wrap key
+    let wrap = xbt402::hub_keys::WrapKey::load_or_create(&s.dir.0.join("hub").join("hub-wrap-key")).unwrap();
+    assert!(rec.get("secret").is_none());
+    assert_eq!(wrap.open(&rec["secret_sealed"]).unwrap(), oc.secret);
     assert_eq!(rec["params"]["payer_pub"], hex::encode(oc.params.payer_pub));
     assert_eq!(oc.state, "funded");
 }

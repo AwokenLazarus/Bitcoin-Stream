@@ -20,8 +20,8 @@ fn mainnet_next_bits_match_python() {
             compact += 1;
             continue;
         }
-        let parent = Header { raw: vec![], hash: [0; 32], prev: [0; 32], merkle_root: [0; 32], time: c["time"].as_u64().unwrap() as u32,
-                              bits: c["bits"].as_u64().unwrap() as u32, height: c["height"].as_u64().unwrap() as u32, txcount: 1 };
+        let parent = Header { time: c["time"].as_u64().unwrap() as u32, bits: c["bits"].as_u64().unwrap() as u32,
+                              height: c["height"].as_u64().unwrap() as u32, txcount: 1, ..Header::default() };
         let first = c["firstTime"].as_i64().map(|t| t.max(0) as u32);
         // Python allows a negative first time only in synthetic cases; skip those
         if c["firstTime"].as_i64().is_some_and(|t| t < 0) {

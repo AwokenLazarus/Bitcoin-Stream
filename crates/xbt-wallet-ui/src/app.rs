@@ -102,7 +102,7 @@ fn state_of(c: &Value) -> &'static str {
 /// The signer did it: no deny, no `ok: false`, no error.
 fn ok_of(r: &Value) -> bool {
     r.is_object() && !matches!(r.get("verdict").and_then(Value::as_str), Some("deny") | Some("needs_human"))
-        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").map_or(true, Value::is_null)
+        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").is_none_or(Value::is_null)
 }
 
 fn reason_of(r: &Value) -> String {
@@ -337,6 +337,8 @@ impl App {
                 if v["granted"] == true {
                     format!("Approved. The agent's call to {} will be paid (at most {} sats) when it arrives; approvals expire at {}.",
                             txt(v.get("url")), int(v.get("amount_sats")), utc(int(v.get("expires"))))
+                } else if v["resumed"] == true {
+                    "Resumed: the agent may pay over Lightning again, within the policy.".into()
                 } else {
                     format!("Approved and paid: {} sats to {} ({}{}).", int(v.get("amount_sats")), txt(v.get("dest")), txt(v.get("rail")),
                             v.get("txid").or(v.get("chan")).map(|t| format!(" {}", txt(Some(t)))).unwrap_or_default())
@@ -486,6 +488,10 @@ impl App {
             let mut rows = vec![("To", format!("<code>{}</code>", esc(&dest)))];
             if kind == "xbt402" {
                 rows.push(("Paid call", format!("{} <code>{}</code> (at most this amount)", escv(a.get("method")), escv(a.get("url")))));
+            } else if kind == "ln_resume" {
+                rows.push(("Kind", "resume Lightning payments: they are halted because a payment the node recorded late (this amount) \
+                                    broke the policy when it was booked. Nothing is paid when you approve; the agent may pay over \
+                                    Lightning again, within the policy.".into()));
             } else {
                 rows.push(("Kind", "payment (paid as soon as you approve)".into()));
             }

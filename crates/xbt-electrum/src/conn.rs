@@ -445,8 +445,8 @@ mod tests {
     fn server_urls() {
         assert_eq!(parse_server("tcp://127.0.0.1:50001").unwrap(), ServerAddr { host: "127.0.0.1".into(), port: 50001, tls: false });
         assert_eq!(parse_server("ssl://electrum.example:50002").unwrap(), ServerAddr { host: "electrum.example".into(), port: 50002, tls: true });
-        assert_eq!(parse_server("host:1:s").unwrap().tls, true);
-        assert_eq!(parse_server("host:1:t").unwrap().tls, false);
+        assert!(parse_server("host:1:s").unwrap().tls);
+        assert!(!parse_server("host:1:t").unwrap().tls);
         assert_eq!(parse_server("tcp://[::1]:5").unwrap().host, "::1");
         for bad in ["http://h:1", "tcp://h", "tcp://:1", "h:1", "h:x:t", "tcp://h:0", "tcp://h:99999"] {
             assert!(parse_server(bad).is_err(), "{bad}");

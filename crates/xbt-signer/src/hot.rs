@@ -22,6 +22,8 @@ use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::{unified_sighash, ScriptType, SIGHASH_ALL_UNIFIED};
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 
+use xbt402::maturity::Maturity;
+
 use crate::keystore::{write_private, KeyStore};
 use crate::node::{self, sats, Node};
 use crate::pyjson::{dumps, dumps_indent, now_f64, py_int};
@@ -62,14 +64,18 @@ impl HotKey {
     }
 }
 
-/// One hot coin (`{"txid", "vout", "value", "spk", "why"?}`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One hot coin (`{"txid", "vout", "value", "spk", "why"?, "coinbase"?, "height"?}`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Coin {
     pub txid: String,
     pub vout: u32,
     pub value: i64,
     pub spk: String,
     pub why: String,
+    /// A coinbase output: spendable only once the node's coinbase maturity allows ([`HotWallet::spendable`]).
+    pub coinbase: bool,
+    /// The block a coinbase coin is in; None when the node did not say (the coin then waits).
+    pub height: Option<u32>,
 }
 
 impl Coin {
@@ -80,6 +86,8 @@ impl Coin {
             value: py_int(u.get("value")).ok_or_else(|| err("hot", "coin value"))?,
             spk: u.get("spk").and_then(Value::as_str).unwrap_or("").into(),
             why: u.get("why").and_then(Value::as_str).unwrap_or("").into(),
+            coinbase: crate::pyjson::truthy(u.get("coinbase")),
+            height: py_int(u.get("height")).and_then(|h| u32::try_from(h).ok()),
         })
     }
 
@@ -91,6 +99,12 @@ impl Coin {
         m.insert("spk".into(), self.spk.clone().into());
         if !self.why.is_empty() {
             m.insert("why".into(), self.why.clone().into());
+        }
+        if self.coinbase {
+            m.insert("coinbase".into(), true.into());
+            if let Some(h) = self.height {
+                m.insert("height".into(), h.into());
+            }
         }
         Value::Object(m)
     }
@@ -141,6 +155,13 @@ fn gettxout(node: &dyn Node, txid: &str, n: u32) -> Result<Option<Value>> {
 
 fn spk_of(v: &Value) -> String {
     v.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// The coinbase flag and block of one `scantxoutset` unspent.
+fn scanned(c: &Value) -> Coin {
+    let coinbase = crate::pyjson::truthy(c.get("coinbase"));
+    let height = if coinbase { py_int(c.get("height")).and_then(|h| u32::try_from(h).ok()) } else { None };
+    Coin { coinbase, height, ..Coin::default() }
 }
 
 impl HotWallet {
@@ -377,7 +398,9 @@ impl HotWallet {
                 bump(&mut out, "dropped"); // the node disagrees with the file: the node wins
                 continue;
             }
-            keep.push(Coin { why: String::new(), spk: check_spk.clone(), ..u });
+            let coinbase = crate::pyjson::truthy(r.get("coinbase"));
+            let height = if coinbase { u.height.or_else(|| self.txout_height(&r)) } else { None };
+            keep.push(Coin { why: String::new(), spk: check_spk.clone(), coinbase, height, ..u });
             bump(&mut out, if was_stale { "restored" } else { "kept" });
         }
         if scan {
@@ -391,7 +414,7 @@ impl HotWallet {
                         if have.contains(&op) || Self::key_for_spk(&g, spk).is_none() {
                             continue;
                         }
-                        keep.push(Coin { txid: op.0.clone(), vout: op.1, value: sats(c.get("amount")), spk: spk.into(), why: String::new() });
+                        keep.push(Coin { txid: op.0.clone(), vout: op.1, value: sats(c.get("amount")), spk: spk.into(), ..scanned(c) });
                         stale.retain(|x| x.op() != op);
                         have.push(op);
                         bump(&mut out, "found");
@@ -416,13 +439,38 @@ impl HotWallet {
 
     // --- coins -----------------------------------------------------------------------------------
     fn notice_locked(&self, g: &mut Inner, txid: &str, vout: u32, value: i64, spk: &str) -> Result<()> {
-        let spk = if spk.is_empty() { g.current.spk_hex() } else { spk.to_string() };
-        if !g.utxos.iter().any(|u| u.txid == txid && u.vout == vout) {
-            g.utxos.push(Coin { txid: txid.into(), vout, value, spk, why: String::new() });
-            g.stale.retain(|u| !(u.txid == txid && u.vout == vout));
+        self.notice_coin_locked(g, Coin { txid: txid.into(), vout, value, spk: spk.into(), ..Coin::default() })
+    }
+
+    fn notice_coin_locked(&self, g: &mut Inner, mut c: Coin) -> Result<()> {
+        if c.spk.is_empty() {
+            c.spk = g.current.spk_hex();
+        }
+        if !g.utxos.iter().any(|u| u.op() == c.op()) {
+            g.stale.retain(|u| u.op() != c.op());
+            g.utxos.push(c);
             self.persist_utxos(g)?;
         }
         Ok(())
+    }
+
+    /// A coinbase output's block from a `gettxout` answer: its confirmations counted back from the
+    /// `bestblock` they were counted at.
+    fn txout_height(&self, r: &Value) -> Option<u32> {
+        let conf = py_int(r.get("confirmations")).filter(|c| *c > 0)?;
+        let best = r.get("bestblock").and_then(Value::as_str)?;
+        let tip = py_int(self.node.call("getblockheader", json!([best, true])).ok()?.get("height"))?;
+        u32::try_from(tip - conf + 1).ok()
+    }
+
+    /// The block of a confirmed transaction from its verbose form (`height`, else its `blockhash`,
+    /// else the block it was looked up in).
+    fn tx_height(&self, raw: &Value, looked_in: &str) -> Option<u32> {
+        if let Some(h) = py_int(raw.get("height")) {
+            return u32::try_from(h).ok();
+        }
+        let bh = raw.get("blockhash").and_then(Value::as_str).or((!looked_in.is_empty()).then_some(looked_in))?;
+        py_int(self.node.call("getblockheader", json!([bh, true])).ok()?.get("height")).and_then(|h| u32::try_from(h).ok())
     }
 
     pub fn notice_utxo(&self, txid: &str, vout: u32, value: i64, spk: &str) -> Result<()> {
@@ -437,6 +485,8 @@ impl HotWallet {
         let Some(raw) = node::get_tx(&*self.node, txid, blockhash) else {
             return self.scan_utxoset_for(txid);
         };
+        let coinbase = raw.get("vin").and_then(|v| v.get(0)).map(|i| i.get("coinbase").is_some()).unwrap_or(false);
+        let height = if coinbase { self.tx_height(&raw, blockhash) } else { None };
         let mut g = self.lock();
         let mut added = 0;
         for o in raw.get("vout").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -445,7 +495,8 @@ impl HotWallet {
             if unspent_only && gettxout(&*self.node, txid, n)?.is_none() {
                 continue;
             }
-            self.notice_locked(&mut g, txid, n, sats(o.get("value")), &k)?;
+            let c = Coin { txid: txid.into(), vout: n, value: sats(o.get("value")), spk: k, coinbase, height, ..Coin::default() };
+            self.notice_coin_locked(&mut g, c)?;
             added += 1;
         }
         Ok(added)
@@ -459,7 +510,9 @@ impl HotWallet {
         for c in res.get("unspents").and_then(Value::as_array).cloned().unwrap_or_default() {
             let spk = c.get("scriptPubKey").and_then(Value::as_str).unwrap_or("").to_string();
             if c.get("txid").and_then(Value::as_str) == Some(txid) && Self::key_for_spk(&g, &spk).is_some() {
-                self.notice_locked(&mut g, txid, py_int(c.get("vout")).unwrap_or(0) as u32, sats(c.get("amount")), &spk)?;
+                let coin = Coin { txid: txid.into(), vout: py_int(c.get("vout")).unwrap_or(0) as u32, value: sats(c.get("amount")), spk,
+                                  ..scanned(&c) };
+                self.notice_coin_locked(&mut g, coin)?;
                 added += 1;
             }
         }
@@ -587,12 +640,33 @@ impl HotWallet {
         let cur = g.current.spk_hex();
         let bal: i64 = g.utxos.iter().map(|u| u.value).sum();
         let retired: i64 = g.utxos.iter().filter(|u| !u.spk.is_empty() && u.spk != cur).map(|u| u.value).sum();
-        json!({"hot_address": g.current.address, "hot_spk": cur, "hot_sats": bal, "hot_utxos": g.utxos.len(),
+        let coinbase: i64 = g.utxos.iter().filter(|u| u.coinbase).map(|u| u.value).sum();
+        json!({"hot_address": g.current.address, "hot_spk": cur, "hot_sats": bal, "hot_utxos": g.utxos.len(), "hot_coinbase_sats": coinbase,
                "hot_stale_utxos": g.stale.len(), "hot_encrypted": self.encrypted(), "hot_retired_keys": g.retired.len(),
                "hot_retired_sats": retired, "hot_cap_sats": self.cap_sats(), "hot_over_cap": self.cap_sats() > 0 && bal > self.cap_sats()})
     }
 
     // --- spending --------------------------------------------------------------------------------
+    /// `coins` less every coinbase coin the node would not relay a spend of yet, and the sats held
+    /// back. The depth is the node's (`getdeploymentinfo`, [`Maturity::relay_at`]); when the node
+    /// cannot say (no deployment info, no tip, no block for the coin), the coin waits.
+    pub fn spendable(&self, coins: &[Coin]) -> (Vec<Coin>, i64) {
+        if !coins.iter().any(|c| c.coinbase) {
+            return (coins.to_vec(), 0);
+        }
+        let rule = self.node.call("getdeploymentinfo", json!([])).ok().and_then(|d| Maturity::from_deployments(&d).ok());
+        let tip = self.node.call("getblockcount", json!([])).ok().and_then(|v| py_int(Some(&v))).and_then(|h| u32::try_from(h).ok());
+        let mut held = 0;
+        let ok = coins.iter().filter(|c| {
+            let mature = !c.coinbase || matches!((rule, tip, c.height), (Some(m), Some(t), Some(h)) if t.saturating_add(1) >= m.relay_at(h));
+            if !mature {
+                held += c.value;
+            }
+            mature
+        }).cloned().collect();
+        (ok, held)
+    }
+
     fn prepare_locked(&self, g: &Inner, utxos: &[Coin], outs: Vec<TxOut>, kind: &str, extra: Value) -> Result<Prep> {
         let cur = g.current.spk_hex();
         let keys: Vec<HotKey> = utxos.iter().map(|u| Self::key_for_spk(g, if u.spk.is_empty() { &cur } else { &u.spk }).cloned())
@@ -677,8 +751,10 @@ impl HotWallet {
         let g = self.lock();
         let cur = g.current.spk_hex();
         let bal: i64 = g.utxos.iter().map(|u| u.value).sum();
-        let utxo = g.utxos.iter().find(|u| (u.spk.is_empty() || u.spk == cur) && u.value >= need).cloned()
-            .ok_or_else(|| err("hot", format!("hot wallet has no UTXO \u{2265} {need} sats (have {bal})")))?;
+        let (ok, held) = self.spendable(&g.utxos);
+        let immature = if held > 0 { format!(", {held} of it immature coinbase") } else { String::new() };
+        let utxo = ok.into_iter().find(|u| (u.spk.is_empty() || u.spk == cur) && u.value >= need)
+            .ok_or_else(|| err("hot", format!("hot wallet has no UTXO \u{2265} {need} sats (have {bal}{immature})")))?;
         let change = utxo.value - need;
         let mut outs = vec![TxOut::new(sats, dest_spk.to_vec())];
         if change >= DUST {
@@ -714,6 +790,7 @@ impl HotWallet {
             self.persist_keys(&g)?; // the new key is on disk before any coin moves to it
             (old.address.clone(), old.spk_hex(), new.address, new.spk, Self::retired_utxos(&g))
         };
+        let coins = self.spendable(&coins).0;
         let mut out = json!({"old_address": old_addr, "new_address": new_addr, "sweep": null});
         if !coins.is_empty() {
             out["sweep"] = self.sweep(&coins, &new_spk, "rotation_sweep", json!({"old_key": old_spk}))?;
@@ -724,6 +801,7 @@ impl HotWallet {
     /// Sweep coins that reached a retired key (a channel close or refund to an old address).
     pub fn sweep_retired(&self) -> Result<Option<Value>> {
         let (coins, spk) = { let g = self.lock(); (Self::retired_utxos(&g), g.current.spk.clone()) };
+        let coins = self.spendable(&coins).0;
         let total: i64 = coins.iter().map(|u| u.value).sum();
         if coins.is_empty() || total - SWEEP_FEE_BASE - SWEEP_FEE_PER_INPUT * (coins.len() as i64) < DUST {
             return Ok(None);
@@ -734,10 +812,12 @@ impl HotWallet {
     /// Human-approved sweep of `amount_sats` out of the hot key (the signer checks the signature).
     pub fn sweep_to(&self, dest_spk: &[u8], amount_sats: i64, fee: i64) -> Result<Value> {
         let (coins, cur_spk) = { let g = self.lock(); (g.utxos.clone(), g.current.spk.clone()) };
+        let (coins, held) = self.spendable(&coins);
         let total: i64 = coins.iter().map(|u| u.value).sum();
         let mut fee = fee.max(SWEEP_FEE_BASE + SWEEP_FEE_PER_INPUT * coins.len() as i64);
         if amount_sats < DUST || amount_sats + fee > total {
-            return Err(err("hot", format!("cannot sweep {amount_sats} sats from {total}")));
+            let immature = if held > 0 { format!(" (and {held} immature coinbase)") } else { String::new() };
+            return Err(err("hot", format!("cannot sweep {amount_sats} sats from {total}{immature}")));
         }
         let change = total - amount_sats - fee;
         let mut outs = vec![TxOut::new(amount_sats, dest_spk.to_vec())];

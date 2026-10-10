@@ -1,0 +1,32 @@
+# cargo deny check (AGP-075). The workspace is MIT OR Apache-2.0; every dependency must be usable
+# under it. Only the licences Cargo.lock needs are listed: a crate offering MIT/Apache-2.0 as one
+# alternative (adler2 0BSD, memchr Unlicense, miniz_oxide Zlib, fiat-crypto BSD-1-Clause, wasi
+# Apache-2.0 WITH LLVM-exception) is satisfied by MIT or Apache-2.0.
+
+[graph]
+all-features = true
+
+[advisories]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",        # curve25519-dalek, ed25519-dalek, subtle
+    "ISC",                 # ring (Apache-2.0 AND ISC), rustls-webpki, untrusted
+    "Unicode-3.0",         # icu_*, unicode-ident: the Unicode data licence, OSI-approved
+    # Not OSI-approved, but permissive and compatible with MIT OR Apache-2.0:
+    "CC0-1.0",             # secp256k1, secp256k1-sys: a public-domain dedication
+    "CDLA-Permissive-2.0", # webpki-roots: Mozilla's CA root list; a data licence whose only condition is passing the licence text on
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

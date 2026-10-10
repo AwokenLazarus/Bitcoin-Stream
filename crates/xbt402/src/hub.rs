@@ -115,6 +115,7 @@ use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_with_typ
 use crate::client::{Transport, Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, FundingPolicy};
+use crate::hub_keys::{WrapKey, WRAP_KEY_FILE};
 use crate::json::{dumps, py_int, py_str, py_u64, truthy};
 use crate::ledger::{ChannelState, Ledger};
 use crate::provider::{HttpResponse, Provider, ProviderConfig};
@@ -378,7 +379,7 @@ pub struct OutChannel {
     /// The provider operator's payTo (one key may serve many devices).
     pub pay_to: String,
     pub params: ChannelParams,
-    /// Payer key (regtest: stored here; production: a B2-style signer).
+    /// Payer key (hex). Sealed on disk under the hub's wrap key (AGP-073 K1).
     pub secret: String,
     /// funding -> funded -> open -> closing -> closed | rolled | refunded; funding -> dropped.
     pub state: String,
@@ -514,7 +515,7 @@ impl OutChannel {
 /// Why a rollover child is blocked while its rollover is in no block and not in the mempool (AGP-053).
 pub const ROLLOVER_GONE: &str = "the rollover that funds this ch2 is in no block and not in the mempool";
 
-/// The hub's ch2s, an fsynced JSON file (keys included: regtest only).
+/// The hub's ch2s, an fsynced JSON file, 0600 (each payer key sealed: AGP-073 K1).
 ///
 /// One ch2 per origin (AGP-056, replacing AGP-044's one live ch2 per payTo): `chans` is keyed by the
 /// canonical origin ([`canon_origin`]), one provider PROCESS, because that process's ledger is the
@@ -524,6 +525,10 @@ pub const ROLLOVER_GONE: &str = "the rollover that funds this ch2 is in no block
 /// ahead of the live one running out, which takes its place in `chans` at the switch. `origins` maps
 /// every origin the hub connected to the payTo its /terms named (a record, and the per-payTo count:
 /// `ch2_max_per_pay_to`).
+///
+/// On disk (AGP-073 K1) every record's payer key is `secret_sealed` ([`crate::hub_keys`]), never
+/// `secret`; in memory the records hold the key as before. A file from before (plaintext keys) is
+/// read once and rewritten sealed.
 #[derive(Debug, Default)]
 pub struct OutBook {
     path: Option<PathBuf>,
@@ -531,13 +536,64 @@ pub struct OutBook {
     pub next_chans: IndexMap<String, OutChannel>,
     pub archived: Vec<Value>,
     pub origins: IndexMap<String, String>,
+    wrap: Option<WrapKey>,
+    sealed: std::cell::RefCell<SealCache>,
+    legacy: usize,
+}
+
+/// Each key's blob, sealed once: a save seals only keys it has not seen. Never printed.
+#[derive(Default)]
+struct SealCache(HashMap<String, Value>);
+
+impl std::fmt::Debug for SealCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SealCache({} keys)", self.0.len())
+    }
+}
+
+/// Every ch2 record in a state file's JSON: the live and next ones, the archive, and the rollover's
+/// next ch2 written ahead inside a record.
+fn each_record(doc: &mut Value, f: &mut dyn FnMut(&mut Value) -> Result<()>) -> Result<()> {
+    let mut one = |r: &mut Value| -> Result<()> {
+        f(r)?;
+        match r.get_mut("next") {
+            Some(n) if n.get("params").is_some() => f(n),
+            _ => Ok(()),
+        }
+    };
+    for k in ["chans", "next_chans"] {
+        if let Some(m) = doc.get_mut(k).and_then(Value::as_object_mut) {
+            for r in m.values_mut() {
+                one(r)?;
+            }
+        }
+    }
+    if let Some(a) = doc.get_mut("archived").and_then(Value::as_array_mut) {
+        for r in a {
+            one(r)?;
+        }
+    }
+    Ok(())
 }
 
 impl OutBook {
-    pub fn open(path: Option<&Path>) -> Result<Self> {
-        let mut b = Self { path: path.map(Path::to_path_buf), ..Default::default() };
-        if let Some(raw) = path.and_then(|p| std::fs::read(p).ok()) {
-            let v: Value = crate::json::parse_slice(&raw).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
+    /// The book in `path` (none yet: empty), its keys opened with `wrap`. A file needs a wrap key.
+    /// Refused (`keystore`): a blob that does not open (another wrap key, a changed file), or a key
+    /// that is not its record's `payer_pub` (a blob moved to another record).
+    pub fn open(path: Option<&Path>, wrap: Option<WrapKey>) -> Result<Self> {
+        if path.is_some() && wrap.is_none() {
+            return fail("keystore", "a hub state file needs a wrap key (its ch2 keys are sealed)");
+        }
+        let mut b = Self { path: path.map(Path::to_path_buf), wrap, ..Default::default() };
+        let raw = match path.map(std::fs::read) {
+            Some(Ok(r)) => Some(r),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Some(Err(e)) => return fail("ledger_error", format!("{}: {e}", path.map(Path::display).map(|d| d.to_string()).unwrap_or_default())),
+            None => None,
+        };
+        if let Some(raw) = raw {
+            let mut v: Value = crate::json::parse_slice(&raw).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
+            b.unseal_all(&mut v)?;
             for (k, c) in v.get("chans").and_then(Value::as_object).into_iter().flatten() {
                 b.chans.insert(k.clone(), OutChannel::from_json(c)?);
             }
@@ -548,8 +604,64 @@ impl OutBook {
             for (o, pt) in v.get("origins").and_then(Value::as_object).into_iter().flatten() {
                 b.origins.insert(o.clone(), py_str(Some(pt)));
             }
+            if b.legacy > 0 {
+                b.save()?;
+            }
         }
         Ok(b)
+    }
+
+    /// How many plaintext keys the file had when it was opened (now sealed).
+    pub fn legacy_sealed(&self) -> usize {
+        self.legacy
+    }
+
+    fn unseal_all(&mut self, doc: &mut Value) -> Result<()> {
+        let (wrap, cache, legacy) = (self.wrap.as_ref(), self.sealed.get_mut(), &mut self.legacy);
+        each_record(doc, &mut |r| {
+            let Some(o) = r.as_object_mut() else { return Ok(()) };
+            if let Some(blob) = o.remove("secret_sealed") {
+                let k = wrap.ok_or_else(|| ChannelError::new("keystore", "no wrap key"))?.open(&blob)?;
+                cache.0.insert(k.clone(), blob);
+                o.insert("secret".into(), k.into());
+            } else if o.get("secret").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                *legacy += 1;
+            }
+            // a key only ever signs for a record still watched: check that one is its own
+            let key = o.get("secret").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let payer = o.get("params").and_then(|p| p.get("payer_pub")).and_then(Value::as_str);
+            if let (Some(k), Some(pp), false) = (key, payer, truthy(o.get("final"))) {
+                let sk = Sc::from_hex64(k).and_then(|s| s.secret()).ok_or_else(|| ChannelError::new("keystore", "a ch2 key is not a secret key"))?;
+                if !hex::encode(ecdsa::pubkey(&sk)).eq_ignore_ascii_case(pp) {
+                    return fail("keystore", format!("the ch2 key of {} is not its payer_pub: a sealed key moved to another record", py_str(o.get("origin"))));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The file's JSON with every key sealed (a key seen before reuses its blob).
+    fn sealed_doc(&self, mut doc: Value) -> Result<Value> {
+        let wrap = self.wrap.as_ref().ok_or_else(|| ChannelError::new("keystore", "a hub state file needs a wrap key"))?;
+        let mut cache = self.sealed.borrow_mut();
+        each_record(&mut doc, &mut |r| {
+            let Some(o) = r.as_object_mut() else { return Ok(()) };
+            let Some(Value::String(k)) = o.remove("secret") else { return Ok(()) };
+            if k.is_empty() {
+                return Ok(());
+            }
+            let blob = match cache.0.get(&k) {
+                Some(b) => b.clone(),
+                None => {
+                    let b = wrap.seal(&k)?;
+                    cache.0.insert(k, b.clone());
+                    b
+                }
+            };
+            o.insert("secret_sealed".into(), blob);
+            Ok(())
+        })?;
+        Ok(doc)
     }
 
     /// The origins with a live ch2 (funding, funded or open) to `pay_to`: their own, or the next one
@@ -581,13 +693,13 @@ impl OutBook {
         let chans: Map<String, Value> = self.chans.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
         let nexts: Map<String, Value> = self.next_chans.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
         let origins: Map<String, Value> = self.origins.iter().map(|(k, v)| (k.clone(), Value::from(v.as_str()))).collect();
+        let doc = self.sealed_doc(json!({"chans": chans, "archived": self.archived, "origins": origins, "next_chans": nexts}))?;
         let io = |e: std::io::Error| ChannelError::new("ledger_error", e.to_string());
         let tmp = path.with_extension("tmp");
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).map_err(io)?;
-            f.write_all(dumps(&json!({"chans": chans, "archived": self.archived, "origins": origins, "next_chans": nexts})).as_bytes())
-                .map_err(io)?;
+            let mut f = crate::hub_keys::create_private(&tmp).map_err(io)?;
+            f.write_all(dumps(&doc).as_bytes()).map_err(io)?;
             f.sync_all().map_err(io)?;
         }
         std::fs::rename(&tmp, path).map_err(io)
@@ -675,6 +787,8 @@ pub struct RouteHub {
     ahead_tried: Mutex<HashSet<(String, u32)>>,
     /// (chan, tip): a retired ch2's close, asked once a block.
     retire_tried: Mutex<HashSet<(String, u32)>>,
+    /// (chan, tip): the early close of a ch2 a written-off lock blocks (AGP-073), asked once a block.
+    stale_tried: Mutex<HashSet<(String, u32)>>,
 }
 
 /// How long a watcher tick waits for one busy provider's flag, and for all of them (AGP-053).
@@ -716,13 +830,29 @@ fn ok_json(v: &Value) -> HttpResponse {
 impl RouteHub {
     /// `chain`: the merchant's node (a pruned one works: no txindex anywhere); `scan`: the same node
     /// for [`SpendScan`]; `wallet` funds ch2s; `http` talks to providers; `datadir` holds
-    /// `ch1.jsonl` (ch1 ledger) and `ch2.json` (the out book).
+    /// `ch1.jsonl` (ch1 ledger) and `ch2.json` (the out book), whose ch2 keys are sealed under
+    /// `<datadir>/hub-wrap-key` (made 0600 on first run). [`RouteHub::new_with_wrap_key`] takes the
+    /// wrap key from elsewhere (a secrets mount, kept apart from the state).
     #[allow(clippy::too_many_arguments)]
     pub fn new(chain: Arc<dyn ChainBackend>, scan: Arc<dyn SpendScan>, wallet: Box<dyn Wallet>, http: Box<dyn Transport>,
                pay_to_secret: SecretKey, network: &str, datadir: Option<&Path>, cfg: HubConfig) -> Result<Self> {
+        Self::new_with_wrap_key(chain, scan, wallet, http, pay_to_secret, network, datadir, cfg, None)
+    }
+
+    /// [`RouteHub::new`] with the key that seals the ch2 keys in `ch2.json` (AGP-073 K1). None: the
+    /// data dir's `hub-wrap-key`. A state file sealed under another key is refused (`keystore`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_wrap_key(chain: Arc<dyn ChainBackend>, scan: Arc<dyn SpendScan>, wallet: Box<dyn Wallet>, http: Box<dyn Transport>,
+                             pay_to_secret: SecretKey, network: &str, datadir: Option<&Path>, cfg: HubConfig, wrap: Option<WrapKey>)
+                             -> Result<Self> {
         if let Some(d) = datadir {
             std::fs::create_dir_all(d).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
         }
+        let wrap = match (wrap, datadir) {
+            (Some(w), _) => Some(w),
+            (None, Some(d)) => Some(WrapKey::load_or_create(&d.join(WRAP_KEY_FILE))?),
+            (None, None) => None,
+        };
         let mut pc = ProviderConfig::new(network);
         pc.close_fee = cfg.close_fee;
         pc.close_margin = cfg.close_margin;
@@ -734,13 +864,20 @@ impl RouteHub {
         };
         let inbound = Provider::new(chain.clone(), pay_to_secret, pc, ledger, Box::new(|_, _| 0),
                                     Box::new(|_, _, _| HttpResponse::new(404, vec![], b"not found".to_vec())))?;
-        let out = OutBook::open(datadir.map(|d| d.join("ch2.json")).as_deref())?;
+        let out = OutBook::open(datadir.map(|d| d.join("ch2.json")).as_deref(), wrap)?;
+        let mut events = vec![];
+        if out.legacy_sealed() > 0 {
+            eprintln!("hub: sealed {} plaintext ch2 keys in ch2.json (AGP-073); older copies of that file (backups) still hold them",
+                      out.legacy_sealed());
+            events.push(json!({"event": "ch2_keys_sealed", "count": out.legacy_sealed()}));
+        }
         Ok(Self { pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)), cfg, chain, scan, wallet, http, secret: pay_to_secret,
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
                   quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None,
-                  refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(vec![]),
+                  refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(events),
                   stats: Mutex::new(HubStats::default()), zc_tried: Mutex::new(HashSet::new()), refill_ahead: Mutex::new(None),
-                  ahead_tried: Mutex::new(HashSet::new()), retire_tried: Mutex::new(HashSet::new()) })
+                  ahead_tried: Mutex::new(HashSet::new()), retire_tried: Mutex::new(HashSet::new()),
+                  stale_tried: Mutex::new(HashSet::new()) })
     }
 
     /// Seconds a lock may wait for the provider's reveal (starts at `cfg.reveal_timeout`).
@@ -932,36 +1069,53 @@ impl RouteHub {
         }
         if method == "POST" && path.split('?').next() == Some(CLOSE_PATH) {
             if let Some(ch1) = crate::json::parse_slice(body).ok().and_then(|v| v.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok())) {
-                self.drop_orphan_lock(&ch1);
+                self.sweep_orphan_lock(&ch1);
             }
         }
         self.inbound.serve(method, path, headers, body, url, max_body)
     }
 
-    /// AGP-064: a ch1 lock that no route is forwarding and no ch2 holds (the hub stopped between its
-    /// write-ahead and the ch2 one, or the withholding test hook) can never complete: it is dropped,
-    /// so it does not keep ch1 from closing. Checked under the provider's busy flag, which route()
-    /// holds from before it writes the lock until its forward ends.
-    fn drop_orphan_lock(&self, ch1: &str) {
-        let Some(rl) = self.ch1_state(ch1).and_then(|s| s.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned()) else { return };
+    /// A ch1 lock that no route is forwarding and no ch2 has pending: the hub stopped between its
+    /// write-ahead and the ch2 one, or between a void's ch2 write and its ch1 write (or the
+    /// withholding test hook). Checked under the provider's busy flag, which route() holds from
+    /// before it writes the lock until its forward ends. AGP-073: if a ch2 of that provider has the
+    /// lock written off, its pre-signature may be out, so it is held in ch1's base as the void would
+    /// have held it; otherwise nothing can complete it and it is dropped (AGP-064), so it does not
+    /// keep ch1 from closing. Run by the watcher for every ch1 with a lock, and before a ch1 close.
+    fn sweep_orphan_lock(&self, ch1: &str) -> Option<Value> {
+        let rl = self.ch1_state(ch1).and_then(|s| s.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned())?;
         let origin = py_str(rl.get("provider"));
-        let Some(_busy) = self.acquire(&origin, Duration::ZERO) else { return };
-        {
+        let _busy = self.acquire(&origin, Duration::ZERO)?;
+        let lid = rl.get("lockId").cloned().unwrap_or(Value::Null);
+        let written_off = {
             let b = lk(&self.out);
-            if b.chans.get(&origin).into_iter().chain(b.next_chans.get(&origin)).any(|c| c.pending.get("lockId") == rl.get("lockId")) {
-                return;
+            let live = || b.chans.get(&origin).into_iter().chain(b.next_chans.get(&origin));
+            if live().any(|c| c.pending.get("lockId") == Some(&lid)) {
+                return None;
             }
-        }
+            let has = |stale: &[Value]| stale.iter().any(|s| s.get("lockId") == Some(&lid));
+            live().any(|c| !c.final_ && has(&c.stale))
+                || b.archived.iter().any(|r| {
+                    py_str(r.get("origin")) == origin && !truthy(r.get("final")) && r.get("stale").and_then(Value::as_array).is_some_and(|s| has(s))
+                })
+        };
         let mut l = self.inbound.ledger_lock();
-        let Some(mut st1) = l.channels.get(ch1).cloned() else { return };
-        if st1.extra.get("route_lock").and_then(|x| x.get("lockId")) != rl.get("lockId") {
-            return;
-        }
+        let mut st1 = l.channels.get(ch1).cloned()?;
+        let mut rl = st1.extra.get("route_lock").filter(|x| x.get("lockId") == Some(&lid)).cloned()?;
         st1.extra.insert("route_lock".into(), Value::Null);
-        if self.inbound.save_state(&mut l, &st1).is_ok() {
-            drop(l);
-            self.event(json!({"event": "orphan_lock_dropped", "chan": ch1, "lockId": rl.get("lockId"), "provider": origin}));
+        if written_off {
+            rl["voided"] = round3(now_f());
+            hold_in_base(&mut st1.extra, &mut rl);
+            let mut stale = st1.extra.get("stale_locks").and_then(Value::as_array).cloned().unwrap_or_default();
+            stale.push(rl);
+            st1.extra.insert("stale_locks".into(), Value::Array(stale));
         }
+        self.inbound.save_state(&mut l, &st1).ok()?;
+        drop(l);
+        let ev = json!({"event": if written_off { "orphan_lock_held" } else { "orphan_lock_dropped" }, "chan": ch1, "lockId": lid,
+                        "provider": origin});
+        self.event(ev.clone());
+        Some(ev)
     }
 
     fn acquire(&self, origin: &str, timeout: Duration) -> Option<Busy<'_>> {
@@ -1399,12 +1553,12 @@ impl RouteHub {
         if Some(adaptor::point_of(&t)) != adaptor::dec_hex(&py_str(pend.get("T"))).ok() {
             return None; // bad_secret: keep the lock pending
         }
-        {
-            let mut b = lk(&self.out);
-            let c = b.chans.get_mut(origin)?;
-            if c.pending.get("lockId") != pend.get("lockId") {
-                return None;
-            }
+        // ch1 first (AGP-073): a stop between the two leaves the ch2 lock pending, which the
+        // provider's answer or its close completes again; the other order left a ch1 lock with no
+        // ch2 lock, which the watcher's sweep would drop unpaid
+        let done = self.complete_ch1(ch1, &py_str(pend.get("lockId")), &t, "provider");
+        let mut b = lk(&self.out);
+        if let Some(c) = b.chans.get_mut(origin).filter(|c| c.pending.get("lockId") == pend.get("lockId")) {
             c.signed = c.signed.max(py_u64(pend.get("cum")).unwrap_or(0));
             c.routed += py_u64(pend.get("d")).unwrap_or(0);
             c.max_lock = c.max_lock.max(py_u64(pend.get("d")).unwrap_or(0));
@@ -1412,17 +1566,25 @@ impl RouteHub {
             c.pending = Map::new();
             b.save().ok()?;
         }
-        self.complete_ch1(ch1, &py_str(pend.get("lockId")), &t, "provider")
+        done
     }
 
+    /// Complete ch1's lock `lock_id` (its current one or a written-off one) with t + r. A lock it
+    /// completed already gets the same answer again (a stop between this and the ch2 write).
     fn complete_ch1(&self, ch1: &str, lock_id: &str, t: &SecretKey, via: &str) -> Option<Value> {
         let mut l = self.inbound.ledger_lock();
         let mut st1 = l.channels.get(ch1)?.clone();
         let mut ex = st1.extra.clone();
         let current = ex.get("route_lock").filter(|x| x.get("lockId").and_then(Value::as_str) == Some(lock_id)).cloned();
-        let (lock1, stale) = match current {
-            Some(x) => (x, false),
-            None => (ex.get("stale_locks").and_then(Value::as_array)?.iter().find(|s| s.get("lockId").and_then(Value::as_str) == Some(lock_id))?.clone(), true),
+        let stale_one = || ex.get("stale_locks").and_then(Value::as_array)?.iter().find(|s| s.get("lockId").and_then(Value::as_str) == Some(lock_id)).cloned();
+        let (lock1, stale) = match (current, stale_one()) {
+            (Some(x), _) => (x, false),
+            (None, Some(x)) => (x, true),
+            (None, None) => {
+                let done = ex.get("route_done").and_then(|d| d.get(lock_id)).cloned();
+                let rec = || ex.get("recovered").and_then(Value::as_array)?.iter().find(|r| r.get("lockId").and_then(Value::as_str) == Some(lock_id)).cloned();
+                return done.or_else(rec);
+            }
         };
         let r = Sc::from_hex_mod_n(&py_str(lock1.get("r")))?;
         let s1 = Sc::from_secret(t).add(&r);
@@ -1749,6 +1911,7 @@ impl RouteHub {
                                           expiry, close_fee, None, &self.network, self.cfg.ch2_close_fee_payer)?;
         p.capacity = cap;
         let address = segwit_address(&self.cfg.hrp, &p.spk())?;
+        self.preflight_ch2(origin, terms, &p)?;
         let tip = self.chain.block_count()?;
         let oc = OutChannel::fresh(origin, &pay_to, p, &secret, "funding", py_u64(ex.get("settleMultiple")).unwrap_or(20), terms, tip);
         {
@@ -1807,6 +1970,37 @@ impl RouteHub {
         };
         self.funded(loc, &oc, &txid, vout, cap)?;
         Ok(self.get(loc).unwrap_or(oc))
+    }
+
+    /// Ask the provider whether it opens `p` (not funded yet) for this hub before anything is written
+    /// or funded (review C2, AGP-073): a refusal after the funding locks the capacity until the refund.
+    /// A provider from before the preflight answers `bad_request` (no outpoint), having passed the
+    /// terms it checks before the outpoint: that alone lets the funding go ahead.
+    fn preflight_ch2(&self, origin: &str, terms: &Value, p: &ChannelParams) -> Result<()> {
+        let mut c = json!({"capacity": p.capacity, "expiry": p.expiry, "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk),
+                           "redeemScript": hex::encode(p.script())});
+        if p.close_fee_payer != FeePayer::Payer {
+            c["closeFeePayer"] = p.close_fee_payer.as_str().into();
+        }
+        let body = json!({"x402Version": 2, "network": self.network, "preflight": true, "channel": c, "hub": {"payTo": self.pay_to}});
+        let open_url = terms.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH);
+        let (st, doc) = self.post_json(&format!("{origin}{open_url}"), &body)?;
+        if st != 200 {
+            let code = doc.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
+            if code == "bad_request" {
+                return Ok(());
+            }
+            let det: String = doc.get("detail").and_then(Value::as_str).unwrap_or("").chars().take(160).filter(|c| (' '..='~').contains(c)).collect();
+            self.event(json!({"event": "ch2_preflight_refused", "provider": origin, "error": code, "detail": det}));
+            return fail(code, format!("{origin} would not open this ch2: {det}"));
+        }
+        if doc.get("preflight") != Some(&Value::Bool(true)) {
+            return fail("bad_open", format!("{origin} did not answer the open preflight"));
+        }
+        if doc.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() {
+            return fail("bad_fee_payer", format!("{origin} would open this ch2 with another closeFeePayer"));
+        }
+        Ok(())
     }
 
     /// Apply `f` to the record at `loc` that is `oc`'s ch2 (same payer key), and save. None: gone.
@@ -2163,7 +2357,7 @@ impl RouteHub {
 
     fn close_ch2_at(&self, loc: Loc<'_>, oc: &OutChannel, refill: bool) -> Result<Value> {
         let p = &oc.params;
-        if oc.signed == 0 {
+        if oc.signed == 0 && oc.stale.is_empty() {
             // nothing signed on this ch2 (e.g. a fresh rollover): nothing to close; the hub's refund
             // (at expiry, by the watcher) returns the coins, or the next routed lock uses it
             let ev = json!({"event": "ch2_idle", "provider": oc.origin, "chan": p.channel_id(), "capacity": p.capacity});
@@ -2436,6 +2630,12 @@ impl RouteHub {
                 acts.extend(self.close_retired(i, &oc, tip));
             }
         }
+        // AGP-073: the ch1 locks a stop left (before a margin close, so one held is in that close)
+        let locked: Vec<String> = self.inbound.ledger_lock().channels.iter()
+            .filter(|(_, s)| s.closed_txid.is_empty() && truthy(s.extra.get("route_lock"))).map(|(c, _)| c.clone()).collect();
+        for ch1 in locked {
+            acts.extend(self.sweep_orphan_lock(&ch1));
+        }
         match self.inbound.close_due() {
             Ok(txs) => acts.extend(txs.into_iter().map(|t| json!({"event": "ch1_close", "txid": t}))),
             Err(e) => eprintln!("hub watcher ch1: {e}"),
@@ -2566,7 +2766,7 @@ impl RouteHub {
     /// then reconciled like any (`closing`, `closed` once confirmed). With nothing signed there is
     /// nothing to close: the hub's refund returns it at its expiry, as for any unused ch2.
     fn close_retired(&self, i: usize, oc: &OutChannel, tip: u32) -> Vec<Value> {
-        if oc.state != "open" || !oc.pending.is_empty() || oc.signed == 0 {
+        if oc.state != "open" || !oc.pending.is_empty() || (oc.signed == 0 && oc.stale.is_empty()) {
             return vec![];
         }
         let chan = oc.params.channel_id();
@@ -2584,6 +2784,43 @@ impl RouteHub {
                 self.event(ev.clone());
                 vec![ev]
             }
+        }
+    }
+
+    /// AGP-073: the live ch2 holds a written-off lock (its pre-signature may be out), so it takes no
+    /// lock and is not rolled over until that resolves, which left alone is its refund at expiry. Ask
+    /// the provider to close it now, once a block until it does: a close that shows t pays the hub on
+    /// ch1, one that confirms without t releases the hold. A provider that refused the lock gets a new
+    /// ch2 (its next one, funded ahead, takes over at once and the old one is closed as retired); one
+    /// the hub stopped routing to (no reveal in time) does not.
+    fn close_written_off(&self, origin: &str, oc: &OutChannel, tip: u32) -> Vec<Value> {
+        let chan = oc.params.channel_id();
+        {
+            let mut tried = lk(&self.stale_tried);
+            if !tried.insert((chan.clone(), tip)) {
+                return vec![];
+            }
+            tried.retain(|(_, t)| *t + 1 >= tip);
+        }
+        let refill = oc.blocked.is_empty();
+        let failed = |e: &ChannelError| {
+            let ev = json!({"event": "ch2_written_off_close_failed", "provider": origin, "chan": chan, "error": e.to_string().chars().take(200).collect::<String>()});
+            self.event(ev.clone());
+            vec![ev]
+        };
+        if refill && lk(&self.out).next_chans.get(origin).is_some_and(|n| n.state == "open") {
+            return match self.promote(origin, "written_off") {
+                Ok(Some(nxt)) => vec![json!({"event": "ch2_switch", "provider": origin, "from": chan, "to": nxt.params.channel_id(), "why": "written_off"})],
+                Ok(None) => vec![],
+                Err(e) => failed(&e),
+            };
+        }
+        match self.close_ch2(oc, refill) {
+            Ok(mut ev) => {
+                ev["why"] = "written_off".into();
+                vec![ev]
+            }
+            Err(e) => failed(&e),
         }
     }
 
@@ -2644,7 +2881,9 @@ impl RouteHub {
             return Ok(out);
         }
         if !oc.stale.is_empty() {
-            // AGP-064: no rollover until the written-off locks resolve (the provider's close, or the refund)
+            // AGP-064: no rollover until the written-off locks resolve (the provider's close, or the
+            // refund); AGP-073: the hub asks for that close now
+            out.extend(self.close_written_off(origin, &oc, tip));
             return Ok(out);
         }
         // settlement: the provider's net payout >= its settleMultiple × closeFee, or near ch2's close
@@ -2963,6 +3202,8 @@ impl RouteHub {
             let Ok(tp) = adaptor::dec_hex(&py_str(lk1.get("T"))) else { continue };
             let Some(t) = adaptor::secret_from_witness(&pre, &wit, &tp) else { continue };
             let lid = py_str(lk1.get("lockId"));
+            // ch1 first, as in `settled` (AGP-073)
+            let res = self.complete_ch1(&py_str(lk1.get("ch1")), &lid, &t, &format!("ch2 close {}", tx.txid()));
             let _ = self.upd(loc, oc, |c| {
                 c.signed = c.signed.max(py_u64(lk1.get("cum")).unwrap_or(0));
                 if c.pending.get("lockId").and_then(Value::as_str) == Some(lid.as_str()) {
@@ -2972,7 +3213,6 @@ impl RouteHub {
                 }
                 c.stale.retain(|s| s.get("lockId").and_then(Value::as_str) != Some(lid.as_str()));
             });
-            let res = self.complete_ch1(&py_str(lk1.get("ch1")), &lid, &t, &format!("ch2 close {}", tx.txid()));
             out.push(json!({"event": "secret_from_close", "provider": oc.origin, "lockId": lid, "close": tx.txid(), "ch1_completed": res.is_some()}));
         }
         out
@@ -3003,6 +3243,83 @@ impl RouteHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state file's JSON with `n` ch2 records like the hub writes (2 in 5 carry a rollover's next
+    /// ch2 inside), plaintext keys.
+    fn cost_doc(n: usize) -> Value {
+        let rec = |i: usize| {
+            let k = format!("{:064x}", i + 1);
+            let pub_ = hex::encode(ecdsa::pubkey(&Sc::from_hex64(&k).and_then(|s| s.secret()).unwrap()));
+            let extra: Map<String, Value> = (0..16).map(|j| (format!("field{j}"), Value::from(format!("value{j}")))).collect();
+            json!({"origin": format!("http://p{i}.test"), "pay_to": "02".repeat(33), "state": "open", "signed": 3000,
+                   "params": {"payer_pub": pub_, "payee_pub": "03".repeat(33), "expiry": 2000, "capacity": 100_000,
+                              "funding_txid": "ab".repeat(32), "funding_vout": 0, "close_fee": 600},
+                   "secret": k, "terms": {"scheme": "batch-settlement", "extra": extra},
+                   "refund_hex": "00".repeat(200), "final": false, "pending": {}, "stale": []})
+        };
+        let (mut chans, mut archived, mut i) = (Map::new(), vec![], 0);
+        while i < n {
+            let mut r = rec(i);
+            i += 1;
+            if i % 5 < 2 && i < n {
+                r["next"] = rec(i);
+                i += 1;
+            }
+            if chans.len() < n / 3 {
+                chans.insert(format!("http://p{i}.test"), r);
+            } else {
+                archived.push(r);
+            }
+        }
+        json!({"chans": chans, "archived": archived, "origins": {}, "next_chans": {}})
+    }
+
+    #[test]
+    #[ignore = "a cost figure: cargo test -p xbt402 --release --lib seal_cost -- --ignored --nocapture"]
+    fn seal_cost() {
+        use std::time::Instant;
+        let book = OutBook::open(None, Some(WrapKey::from_bytes([7; 32]))).unwrap();
+        let doc = cost_doc(10);
+        book.sealed_doc(doc.clone()).unwrap(); // every key sealed once, as after the first write
+        let n = 2_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(doc.clone());
+        }
+        let clone = t.elapsed().as_secs_f64() / n as f64;
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(book.sealed_doc(doc.clone()).unwrap());
+        }
+        let per_write = t.elapsed().as_secs_f64() / n as f64 - clone;
+        let t = Instant::now();
+        for _ in 0..n / 10 {
+            std::hint::black_box(dumps(&doc));
+        }
+        let dumps_one = t.elapsed().as_secs_f64() / (n / 10) as f64;
+        let wrap = WrapKey::from_bytes([7; 32]);
+        let t = Instant::now();
+        for i in 0..200 {
+            std::hint::black_box(wrap.seal(&format!("{:064x}", i + 1)).unwrap());
+        }
+        let seal_one = t.elapsed().as_secs_f64() / 200.0;
+        let big = book.sealed_doc(cost_doc(100)).unwrap();
+        let mut open100 = f64::MAX;
+        for _ in 0..3 {
+            let mut b = OutBook::open(None, Some(WrapKey::from_bytes([7; 32]))).unwrap();
+            let mut d = big.clone();
+            let t = Instant::now();
+            b.unseal_all(&mut d).unwrap();
+            open100 = open100.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "seal_cost: per write (10 records, cached) {:.1} us; the write's own dumps {:.1} us; seal one new key {:.1} us; open 100 records {:.1} ms",
+            per_write * 1e6,
+            dumps_one * 1e6,
+            seal_one * 1e6,
+            open100 * 1e3
+        );
+    }
 
     #[test]
     fn config_rejects_unknown_keys_and_bad_payers() {

@@ -139,9 +139,13 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    the split (961,632 on mainnet; `ln.split_height` elsewhere) go in `outgoing_chan_ids`, and only once
    their **funding transaction is proven on the signer's own node** (AGP-049, `src/ln_funding.rs`): the
    transaction at the short channel id's block position is the channel point's, its output is the
-   channel's P2WSH of its capacity, every input's signatures carry sighash **0x21** and every input's
-   coin was confirmed at or above the split. LND's `unified_sigs` flag is not trusted for this. The
-   signer's node needs `txindex=1` to look up the inputs; an unprovable channel carries nothing;
+   channel's P2WSH of its capacity, every signature each input's script checks carries sighash
+   **0x21**, and every input's coin was confirmed at or above the split. Only spends whose sole
+   condition is signatures are read (P2WPKH, P2SH-P2WPKH, P2PKH, `<key> CHECKSIG` or
+   `m <keys> n CHECKMULTISIG` P2WSH, a taproot key path; AGP-066). LND's `unified_sigs` flag is not
+   trusted for this. A verdict holds while the funding block is on the node's best chain: after a reorg
+   the channel is proven again. The signer's node needs `txindex=1` to look up the inputs; an unprovable
+   channel carries nothing;
 5. the node's exposure: while it holds more than `ln.exposure_cap_sats` (channel local balances, HTLCs
    in flight and its on-chain coins), `ln_pay` refuses (`ln_exposure_cap`); mainnet requires a cap;
 6. the send rate: at most `ln.max_sends_per_hour` payments reach the router per hour, failed ones
@@ -152,8 +156,9 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    off mainnet: a loud warning in `ln_status` and `ln_pay`) or `refuse` (mainnet's default:
    `ln_tower_chain`);
 8. the macaroon, read from the file (`src/macaroon.rs`): `ln_status` shows its permissions and
-   caveats; on mainnet one granting `onchain:write`, `macaroon:*` or `signer:generate` is refused
-   (`ln_macaroon`);
+   caveats (`only_needed`, `excess_ops`); on mainnet one granting anything beyond `info:read
+   offchain:read offchain:write onchain:read` (a `uri:` permission included), or whose permissions
+   cannot be read, is refused (`ln_macaroon`; AGP-066);
 9. HTLCs under CLTV: outgoing HTLCs the node started that the wallet did not book (sent outside it)
    hold funds until their expiry and count against what is left of the daily and weekly budgets
    (`ln_htlc_lock`) until they resolve. The wallet's own in-flight payments stay booked, with the CLTV
@@ -161,11 +166,15 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
 
 The worst case is booked to the ledger and to `.run/ln_payments.json` before the send; a settled
 payment's booking becomes what it cost, a failed one's goes (the audit log keeps `ln_amend`). A payment
-left in flight is reconciled from the node's payment list (by `ln_status`, the next `ln_pay`, the
-watcher) and blocks new LN payments until then. A booking released because the node had no record of it
-(a crash before the send, or a send that errored) is watched until its invoice has expired (+10 min):
-if the node records it late, it is booked again and settled or kept in flight (AGP-048 risk 7); one
-whose HTLC is on a channel is not released at all. Each settled payment is a `ln_payment` line in the
+left in flight is reconciled from the node's record of it, looked up by payment hash (TrackPaymentV2;
+by `ln_status`, the next `ln_pay`, the watcher), and blocks new LN payments until then. A booking
+released because the node had no record of it (a crash before the send, or a send that errored) is
+watched for as long as its HTLC could be out: `ln.max_cltv_blocks` + 144 blocks, in blocks and in time.
+If the node records it late, it is booked again and settled or kept in flight (AGP-048 risk 7); one
+whose HTLC is on a channel is not released at all. If that late booking breaks the policy, the rail
+**halts** (AGP-066): every `ln_pay` is refused `ln_halted`, `ln_status` shows `halted`, and an approval
+of kind `ln_resume` waits in the human's queue; only the human's signed `approve` of it resumes the
+rail. Each settled payment is a `ln_payment` line in the
 signature log whose `sig_sha256` is the payment hash (the log holds the SHA-256 of the preimage).
 The wallet never opens channels; `ln_status` lists the node's coins below the split, which must never
 fund one.
@@ -175,7 +184,7 @@ policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_pp
 `split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none, not
 allowed on mainnet), `max_sends_per_hour` (60; 0: none), `tower_policy` (`warn` / `refuse`; default
 `refuse` on mainnet), `trusted_towers` (tower public keys, hex). Environment: `B2_LN_REST`
-(`https://host:port`; plain http only on loopback), `B2_LN_MACAROON`, `B2_LN_TLS_CERT` (LND's
+(`https://host:port`; plain http only to 127.0.0.0/8 or `::1`, not to a name), `B2_LN_MACAROON`, `B2_LN_TLS_CERT` (LND's
 `tls.cert`: the connection is pinned to exactly that certificate). A bad LN configuration shuts the
 rail (`ln_config`), not the signer. Regtest proof: `scripts/ln_rail_regtest.sh`.
 

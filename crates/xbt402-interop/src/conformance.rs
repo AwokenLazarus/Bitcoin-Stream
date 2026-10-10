@@ -549,10 +549,14 @@ pub fn regtest_chain_group(path: &Path) -> Group {
     let v = match read_json(path) { Ok(v) => v, Err(e) => { g.failures.push(e); return g; } };
     let hdrs: Vec<Value> = v["headers"].as_array().cloned().unwrap_or_default();
     let mut v2_raw: Vec<Vec<u8>> = vec![];
+    let mut v1_raw: Vec<Vec<u8>> = vec![];
     let mut first_v2: Option<(u32, String)> = None;
     for hv in &hdrs {
         g.total += 1;
         let raw = h(&hv["header"]);
+        if first_v2.is_none() && raw.len() == header::V1_SIZE {
+            v1_raw.push(raw.clone());
+        }
         let height = u(&hv["height"]) as u32;
         let want = hv["hash"].as_str().unwrap_or("");
         let r = match header::header_size(&raw) {
@@ -588,12 +592,15 @@ pub fn regtest_chain_group(path: &Path) -> Group {
             Err(e) => g.failures.push(format!("block {height}: {e}")),
         }
     }
-    // the chain: checkpoint at the first v2 header, then connect the rest under regtest rules
+    // the chain: checkpoint at the first v2 header above the v1 headers the median needs, then
+    // connect the rest under regtest rules
     g.total += 1;
     let chain_ok = (|| -> Result<(), String> {
         let (cp_h, cp_hash) = first_v2.clone().ok_or("no v2 header")?;
-        let mut c = HeaderChain::new("regtest", (cp_h, &cp_hash), None, Box::new(|| u64::MAX / 2)).map_err(|e| e.to_string())?;
-        c.set_checkpoint(&v2_raw[0]).map_err(|e| e.to_string())?;
+        let mut c = HeaderChain::new("regtest", (cp_h, &cp_hash), None, || u64::MAX / 2).map_err(|e| e.to_string())?;
+        let n = c.prior_needed() as usize;
+        let prior = v1_raw.get(v1_raw.len().saturating_sub(n)..).filter(|p| p.len() == n).ok_or("too few v1 headers below the first v2")?;
+        c.set_checkpoint(&v2_raw[0], prior).map_err(|e| e.to_string())?;
         let r = c.connect(cp_h, &v2_raw[1..]).map_err(|e| e.to_string())?;
         if !r.adopted || r.tip != cp_h + v2_raw.len() as u32 - 1 {
             return Err(format!("chain tip {} not adopted", r.tip));

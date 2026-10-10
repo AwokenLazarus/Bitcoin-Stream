@@ -24,6 +24,30 @@ pub trait ChainBackend: Send + Sync {
     fn send_raw_transaction(&self, hex: &str) -> Result<String>;
     /// Does the node know this transaction (mempool, or txindex)?
     fn has_transaction(&self, txid: &str) -> Result<bool>;
+
+    /// `estimatesmartfee target` in sat/vB; None without an estimate (AGP-067: the close bump).
+    fn estimate_fee_rate(&self, _target: u32) -> Result<Option<f64>> {
+        Ok(None)
+    }
+
+    /// The least feerate this node's mempool takes now, in sat/vB (`getmempoolinfo`: the larger
+    /// of `mempoolminfee` and `minrelaytxfee`); None when unknown.
+    fn mempool_min_fee(&self) -> Result<Option<f64>> {
+        Ok(None)
+    }
+
+    /// Submit a parent and the child that pays for it as one package (`submitpackage`), so a
+    /// parent below the mempool's floor gets in on the child's fee. Default: each in order, a
+    /// refusal of the parent left to show as the child's missing input.
+    fn submit_package(&self, hexes: &[String]) -> Result<()> {
+        for (i, h) in hexes.iter().enumerate() {
+            match self.send_raw_transaction(h) {
+                Err(e) if i + 1 == hexes.len() => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a payee accepts as funding.

@@ -10,7 +10,7 @@
 //! pass  ⇔  expected_H < min_payout  ∨  paid_H + deferred_H + 1 ≥ expected_H
 //! ```
 //!
-//! AGP-065 (Guida P1, P3): `window_work`, `fee_bps` and `min_payout` are the Prime's numbers, so the
+//! AGP-065 (review P1, P3): `window_work`, `fee_bps` and `min_payout` are the Prime's numbers, so the
 //! provider holds each to a bound it sets itself ([`AuditBounds`], from the Prime's published
 //! [`PrimeTerms`] and the chain's difficulty) before the rule runs, and the statement must name the
 //! block the provider's node has at that height ([`ChainBlock`]). A third party checks a fraud proof
@@ -228,7 +228,7 @@ pub fn receipts_bound<'a>(receipts: impl IntoIterator<Item = &'a WorkReceipt>, w
     best.values().fold(0u64, |a, b| a.saturating_add(*b))
 }
 
-/// The Prime's published pool terms, pinned in the provider's configuration (AGP-065, Guida P1). They
+/// The Prime's published pool terms, pinned in the provider's configuration (AGP-065, review P1). They
 /// bound what any window statement may claim; a statement never moves them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrimeTerms {

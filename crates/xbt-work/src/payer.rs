@@ -224,7 +224,7 @@ impl WorkPayer {
         }
         let mut m = self.lock();
         let sess = m.get_mut(origin).expect("session");
-        if sess.best.as_ref().map_or(true, |b| signed.receipt.seq > b.receipt.seq) {
+        if sess.best.as_ref().is_none_or(|b| signed.receipt.seq > b.receipt.seq) {
             sess.best = Some(signed);
         }
         let best = sess.best.clone();

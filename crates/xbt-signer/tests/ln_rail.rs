@@ -59,11 +59,53 @@ struct LnNode {
     /// height -> txids in block order
     blocks: Mutex<HashMap<u64, Vec<String>>>,
     txindex: std::sync::atomic::AtomicBool,
+    /// AGP-066: blocks a reorg put in place of the fake chain's: height -> hash, hash -> (height, txids)
+    reorged: Mutex<HashMap<u64, String>>,
+    alt_blocks: Mutex<HashMap<String, (u64, Vec<String>)>>,
 }
 
 impl LnNode {
+    fn new(chain: &Arc<FakeChain>, name: &str) -> Arc<Self> {
+        Arc::new(LnNode { chain: chain.clone(), name: name.into(), txs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()),
+                          txindex: std::sync::atomic::AtomicBool::new(true), reorged: Mutex::new(HashMap::new()),
+                          alt_blocks: Mutex::new(HashMap::new()) })
+    }
+
     fn height_of(&self, bh: &str) -> u64 {
+        if let Some((h, _)) = self.alt_blocks.lock().unwrap().get(bh) {
+            return *h;
+        }
         if bh == common::MAIN_961640 { 961_640 } else { u64::from_str_radix(bh, 16).unwrap_or(0) }
+    }
+
+    /// A reorg replaces the block at `height` with one holding `txids` (`None`: the original comes back).
+    fn reorg(&self, height: u64, txids: Option<Vec<String>>) {
+        match txids {
+            Some(t) => {
+                let hash = format!("a1{:062x}", height);
+                self.alt_blocks.lock().unwrap().insert(hash.clone(), (height, t));
+                self.reorged.lock().unwrap().insert(height, hash);
+            }
+            None => {
+                self.reorged.lock().unwrap().remove(&height);
+            }
+        }
+    }
+
+    /// A funding transaction at (height, pos) whose one input spends `prev_spk` (a coin confirmed at
+    /// `prev_height`) with this witness and scriptSig; output 0 a P2WSH of 100,000 sats. The channel point.
+    fn fund_with(&self, height: u64, pos: usize, prev_spk: Vec<u8>, witness: Vec<Vec<u8>>, script_sig: Vec<u8>, prev_height: u64) -> String {
+        let capacity = 100_000;
+        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8 ^ 0x5a; 32], pos as u32), 0)],
+                               vec![TxOut::new(capacity + 5_000, prev_spk)], height as u32);
+        prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
+        self.place(&prev, prev_height, 8);
+        let mut f = Tx::new(2, vec![TxIn::new(OutPoint::new(prev.txid_bytes(), 0), 0xffff_fffd)],
+                            vec![TxOut::new(capacity, [vec![0u8, 0x20], vec![0x51; 32]].concat())], 0);
+        f.inputs[0].witness = witness;
+        f.inputs[0].script_sig = script_sig;
+        self.place(&f, height, pos);
+        format!("{}:0", f.txid())
     }
 
     fn place(&self, tx: &Tx, height: u64, pos: usize) {
@@ -95,7 +137,20 @@ impl LnNode {
 impl Node for LnNode {
     fn call(&self, method: &str, p: Value) -> xbt402::Result<Value> {
         match method {
+            "getblockhash" => {
+                if let Some(h) = p[0].as_u64().and_then(|h| self.reorged.lock().unwrap().get(&h).cloned()) {
+                    return Ok(json!(h));
+                }
+            }
+            "getblockheader" => {
+                if let Some((h, _)) = self.alt_blocks.lock().unwrap().get(p[0].as_str().unwrap_or("")) {
+                    return Ok(json!({"height": h}));
+                }
+            }
             "getblock" => {
+                if let Some((h, txs)) = self.alt_blocks.lock().unwrap().get(p[0].as_str().unwrap_or("")) {
+                    return Ok(json!({"height": h, "tx": txs}));
+                }
                 let h = self.height_of(p[0].as_str().unwrap_or(""));
                 if let Some(txs) = self.blocks.lock().unwrap().get(&h) {
                     return Ok(json!({"height": h, "tx": txs}));
@@ -296,8 +351,7 @@ impl LnRig {
         let root = root_with(dir.path(), &runbook_policy(pol));
         let ln = FakeLn::new(&chain);
         ln.set(|s| s.network = if name == "main" { "mainnet".into() } else { name.into() });
-        let node = Arc::new(LnNode { chain: chain.clone(), name: name.into(), txs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()),
-                                     txindex: std::sync::atomic::AtomicBool::new(true) });
+        let node = LnNode::new(&chain, name);
         // the default pair: a unified anchors channel whose funding is proven 0x21 on our node, and a taproot one
         let (h1, h2) = (base + 100, base + 101);
         let good = node.fund(h1, 1, 100_000, 0x21, base + 50);
@@ -334,12 +388,9 @@ impl LnRig {
     }
 
     fn invoice_spec(&self, hrp: &str, tag: u8, features: &[usize], desc: Option<&str>, expiry: u64) -> (String, String) {
-        let pre = vec![tag; 32];
-        let hash: [u8; 32] = Sha256::digest(&pre).into();
-        self.ln.set(|s| s.preimages.push((hex::encode(hash), pre)));
-        let inv = invoice(&Spec { hrp, timestamp: self.clock.load(Ordering::SeqCst) - 10, payment_hash: hash, description: desc,
-                                  description_hash: None, expiry_s: Some(expiry), features, include_payee: false }, &payee_key());
-        (inv, hex::encode(hash))
+        let (inv, hash, pre) = make_invoice(self.clock.load(Ordering::SeqCst), hrp, tag, features, desc, expiry);
+        self.ln.set(|s| s.preimages.push((hash.clone(), pre)));
+        (inv, hash)
     }
 
     fn pay(&self, inv: &str, max: i64) -> Value {
@@ -347,32 +398,46 @@ impl LnRig {
     }
 
     fn ledger_net(&self) -> i64 {
-        // AGP-055: the payments are the append-only log next to ledger.json, read here as written:
-        // the header, a payment per line, and amend lines that change or drop the last row of a txid
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(self.root.join(".run/ledger.json")).unwrap()).unwrap();
-        assert!(v.get("payments").is_none(), "ledger.json no longer carries payments");
-        let text = std::fs::read_to_string(self.root.join(".run").join(v["payments_log"].as_str().unwrap())).unwrap();
-        let mut rows: Vec<Value> = vec![];
-        for line in text.lines().skip(1) {
-            let r: Value = serde_json::from_str(line).unwrap();
-            match r.get("amend") {
-                None => rows.push(r),
-                Some(txid) => {
-                    let i = rows.iter().rposition(|p| &p["txid"] == txid).expect("an amend names a row of the log");
-                    if r["amount_sats"].is_null() {
-                        rows.remove(i);
-                    } else {
-                        rows[i]["amount_sats"] = r["amount_sats"].clone();
-                    }
-                }
-            }
-        }
-        rows.iter().filter(|p| p["dest"] == dest()).map(|p| p["amount_sats"].as_i64().unwrap()).sum()
+        ledger_net(&self.root)
     }
 
     fn audit(&self, ty: &str) -> Vec<Value> {
         self.call("history", json!({"limit": 1000}))["events"].as_array().unwrap().iter().filter(|e| e["type"] == ty).cloned().collect()
     }
+}
+
+/// An invoice from the payee dated 10 s before `now`: `(invoice, payment hash, preimage)`.
+fn make_invoice(now: u64, hrp: &str, tag: u8, features: &[usize], desc: Option<&str>, expiry: u64) -> (String, String, Vec<u8>) {
+    let pre = vec![tag; 32];
+    let hash: [u8; 32] = Sha256::digest(&pre).into();
+    let inv = invoice(&Spec { hrp, timestamp: now - 10, payment_hash: hash, description: desc, description_hash: None, expiry_s: Some(expiry),
+                              features, include_payee: false }, &payee_key());
+    (inv, hex::encode(hash), pre)
+}
+
+/// What the policy ledger holds for the payee.
+fn ledger_net(root: &std::path::Path) -> i64 {
+    // AGP-055: the payments are the append-only log next to ledger.json, read here as written:
+    // the header, a payment per line, and amend lines that change or drop the last row of a txid
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(root.join(".run/ledger.json")).unwrap()).unwrap();
+    assert!(v.get("payments").is_none(), "ledger.json no longer carries payments");
+    let text = std::fs::read_to_string(root.join(".run").join(v["payments_log"].as_str().unwrap())).unwrap();
+    let mut rows: Vec<Value> = vec![];
+    for line in text.lines().skip(1) {
+        let r: Value = serde_json::from_str(line).unwrap();
+        match r.get("amend") {
+            None => rows.push(r),
+            Some(txid) => {
+                let i = rows.iter().rposition(|p| &p["txid"] == txid).expect("an amend names a row of the log");
+                if r["amount_sats"].is_null() {
+                    rows.remove(i);
+                } else {
+                    rows[i]["amount_sats"] = r["amount_sats"].clone();
+                }
+            }
+        }
+    }
+    rows.iter().filter(|p| p["dest"] == dest()).map(|p| p["amount_sats"].as_i64().unwrap()).sum()
 }
 
 fn with_point(mut c: Value, cp: &str) -> Value {
@@ -1000,18 +1065,19 @@ fn a_payment_released_as_never_sent_and_settled_late_is_booked_again() {
     rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "FAILED", "htlcs": []})));
     rig.call("watch_tick", json!({}));
     assert_eq!(rig.ledger_net(), 0);
-    assert!(rig.s.ln_book.watched(T0 as f64).is_empty());
+    assert!(rig.s.ln_book.watched(T0 as f64, 6_720).is_empty());
 
-    // the watch ends when the invoice has expired (+10 min): a record after that is not booked
+    // AGP-066: the watch ends once max_cltv_blocks (1,008) + 144 blocks have passed, in blocks from our
+    // tip and in time (not at the invoice's expiry + 10 min, as in AGP-049)
     let rig = LnRig::new(json!({}));
     rig.ln.set(|s| s.mode = Mode::NotSent);
-    let (inv, hash) = rig.invoice(300, 48, XBT);
+    let (inv, _) = rig.invoice(300, 48, XBT);
     rig.pay(&inv, 1000);
-    assert_eq!(rig.s.ln_book.watched(T0 as f64).len(), 1);
-    rig.clock.fetch_add(3_600 + 601, Ordering::SeqCst);
-    rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "0",
-                                          "payment_preimage": hex::encode([48u8; 32]), "htlcs": []})));
-    assert!(rig.s.ln_book.watched(T0 as f64 + 4_201.0).is_empty());
+    let until = T0 as f64 + (1_008 + 144) as f64 * 600.0;
+    assert_eq!(rig.s.ln_book.watched(T0 as f64 + 4_201.0, 6_720).len(), 1);
+    assert_eq!(rig.s.ln_book.watched(until + 1.0, 6_720 + 1_152).len(), 1, "the height has not passed");
+    assert_eq!(rig.s.ln_book.watched(until, 6_720 + 1_153).len(), 1, "the time has not passed");
+    assert!(rig.s.ln_book.watched(until + 1.0, 6_720 + 1_153).is_empty());
 }
 
 #[test]
@@ -1034,4 +1100,307 @@ fn a_crashed_booking_with_an_htlc_out_is_not_released() {
     rig.ln.set(|s| s.channels[0]["pending_htlcs"] = json!([]));
     assert_eq!(rig.call("ln_status", json!({}))["in_flight"], 0);
     assert_eq!(rig.ledger_net(), 0);
+}
+
+// --- AGP-066 (review L1-L5) ------------------------------------------------------------------------
+
+use std::io::{Read as _, Write as _};
+use xbt_signer::ln::LndRest;
+
+/// A v2 macaroon with this identifier and no caveats.
+fn raw_macaroon(id: &[u8]) -> Vec<u8> {
+    let field = |t: u8, d: &[u8]| [vec![t, d.len() as u8], d.to_vec()].concat();
+    [vec![2u8], field(1, b"lnd"), field(2, id), vec![0, 0], field(6, &[9; 32])].concat()
+}
+
+fn macaroon_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let p = dir.join("rail.macaroon");
+    std::fs::write(&p, lnd_macaroon(RAIL_OPS, &[])).unwrap();
+    p
+}
+
+#[test]
+fn l1_plain_http_only_to_a_loopback_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let mac = macaroon_file(dir.path());
+    let new = |u: &str| LndRest::new(u, &mac, None).map(|_| ()).map_err(|e| e.msg);
+    // review L1: the bracket of an IPv6 literal passed as loopback; a name is whatever the resolver says
+    for u in ["http://[::ffff:10.0.0.5]:8080", "http://[fe80::1]:8080", "http://[::]:8080", "http://[::ffff:10.0.0.5]", "http://10.0.0.5:8080",
+              "http://0.0.0.0:8080", "http://127.0.0.1.attacker.example:8080", "http://localhost:8080", "http://127.0.0.1@10.0.0.5:8080",
+              "ftp://127.0.0.1:8080", "http://"] {
+        let e = new(u).expect_err(u);
+        assert!(e.contains("plain http only on loopback"), "{u}: {e}");
+    }
+    for u in ["http://127.0.0.1:8080", "http://127.9.8.7:8080/", "http://[::1]:8080", "http://[::ffff:127.0.0.1]:8080", "http://[::ffff:7f00:2]:8080"] {
+        assert!(new(u).is_ok(), "{u}: {:?}", new(u));
+    }
+    // property: an IPv4 literal is loopback exactly when it is in 127.0.0.0/8, an IPv6 one when it is
+    // ::1 or maps an address in 127.0.0.0/8
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for i in 0..400 {
+        let v4 = std::net::Ipv4Addr::from(next() as u32 | if i % 2 == 0 { 0x7f00_0000 } else { 0 });
+        assert_eq!(new(&format!("http://{v4}:1")).is_ok(), v4.octets()[0] == 127, "{v4}");
+        let mapped = v4.to_ipv6_mapped();
+        assert_eq!(new(&format!("http://[{mapped}]:1")).is_ok(), v4.octets()[0] == 127, "{mapped}");
+        let v6 = std::net::Ipv6Addr::from(((next() as u128) << 64) | next() as u128);
+        assert!(new(&format!("http://[{v6}]:1")).is_err(), "{v6}");
+    }
+}
+
+#[test]
+fn l2_the_mainnet_macaroon_holds_only_the_rails_permissions() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"ln": {"exposure_cap_sats": 500_000}}));
+    rig.ln.set(|s| s.towers = Some(vec![]));
+    let extras: [(&str, &[&str]); 4] = [("uri", &["/lnrpc.Lightning/SendCoins"]), ("signer", &["read"]), ("address", &["write"]),
+                                        ("invoices", &["write"])];
+    for (tag, extra) in (70u8..).zip(extras) {
+        let ops = [RAIL_OPS, &[extra]].concat();
+        rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(&ops, &[])));
+        let (inv, _) = rig.invoice_spec("lnbc1u", tag, XBT, Some("coffee"), 3600);
+        let r = rig.pay(&inv, 1000);
+        let what = format!("{}:{}", extra.0, extra.1[0]);
+        assert_eq!(r["rule"], "ln_macaroon", "{what}: {r}");
+        assert!(r["reason"].as_str().unwrap().contains(&what), "{r}");
+        let st = rig.call("ln_status", json!({}));
+        assert_eq!(st["ready"], false);
+        assert_eq!((&st["macaroon"]["only_needed"], &st["macaroon"]["excess_ops"]), (&json!(false), &json!([what])), "{st}");
+    }
+    // a macaroon whose permissions cannot be read is not least-privilege either
+    rig.ln.set(|s| s.macaroon = Some(raw_macaroon(b"\x02opaque")));
+    let (inv, _) = rig.invoice_spec("lnbc1u", 75, XBT, Some("coffee"), 3600);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_macaroon", "{r}");
+    assert_eq!(rig.ln.sent(), 0);
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(rig.ln.sent(), 1);
+    assert_eq!(rig.call("ln_status", json!({}))["macaroon"]["only_needed"], true);
+}
+
+/// A minimal LND REST server on loopback (plain http is allowed there). `GET /v1/payments` lists the
+/// newest 1,000 payments only, as LND's `max_payments` does; `GET /v2/router/track/{hash}` answers as
+/// LND's TrackPaymentV2 stream does (LF `subscribePayment`: an unknown hash is NotFound, HTTP 404).
+struct RestLnd {
+    url: String,
+    paths: Arc<Mutex<Vec<String>>>,
+}
+
+fn rest_lnd(older: Value, broken_hash: &str) -> RestLnd {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let paths = Arc::new(Mutex::new(vec![]));
+    let (seen, broken) = (paths.clone(), broken_hash.to_string());
+    let newest: Vec<Value> = (0..1000u32).map(|i| json!({"payment_hash": hex::encode(Sha256::digest(i.to_be_bytes())), "status": "SUCCEEDED",
+                                                           "value_msat": "1000", "fee_msat": "0", "htlcs": []})).collect();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { break };
+            let mut head = vec![];
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+                head.push(b[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            assert!(head.to_lowercase().contains("grpc-metadata-macaroon: "), "the macaroon goes with every call");
+            seen.lock().unwrap().push(path.clone());
+            let (code, body) = if path.starts_with("/v1/payments") {
+                (200, json!({"payments": newest}).to_string())
+            } else if let Some(h) = path.strip_prefix("/v2/router/track/") {
+                let h = h.split('?').next().unwrap_or("");
+                let hash = base64::engine::general_purpose::URL_SAFE.decode(h).map(hex::encode).unwrap_or_default();
+                if hash == older["payment_hash"].as_str().unwrap().to_lowercase() {
+                    (200, format!("{}\n", json!({"result": older})))
+                } else if hash == broken {
+                    (500, json!({"code": 2, "message": "database is locked"}).to_string())
+                } else {
+                    (404, json!({"error": {"code": 5, "message": "payment isn't initiated", "details": []}}).to_string())
+                }
+            } else if path.starts_with("/v1/channels") {
+                (200, json!({"channels": []}).to_string())
+            } else {
+                (404, json!({"code": 5, "message": "Not Found"}).to_string())
+            };
+            let _ = s.write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()).as_bytes());
+        }
+    });
+    RestLnd { url, paths }
+}
+
+#[test]
+fn l3_a_payment_is_looked_up_by_its_hash_not_among_the_newest_1000() {
+    let dir = tempfile::tempdir().unwrap();
+    let older = hex::encode([0x66; 32]);
+    let fake = rest_lnd(json!({"payment_hash": older, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "1000",
+                               "payment_preimage": "07".repeat(32), "htlcs": []}), &"0e".repeat(32));
+    let ln = LndRest::new(&fake.url, &macaroon_file(dir.path()), None).unwrap();
+    let p = ln.lookup(&older).unwrap().expect("a payment older than the newest 1,000 is found by its hash");
+    assert_eq!(p["status"], "SUCCEEDED");
+    assert!(fake.paths.lock().unwrap().iter().any(|p| p.starts_with("/v2/router/track/")), "{:?}", fake.paths.lock().unwrap());
+    // the node has no record: None; the node cannot answer: an error, never "no record"
+    assert!(ln.lookup(&"ab".repeat(32)).unwrap().is_none());
+    assert!(ln.lookup(&"0e".repeat(32)).is_err());
+    assert!(ln.lookup("not-a-hash/../../v1/getinfo").is_err());
+}
+
+#[test]
+fn l3_reconcile_does_not_release_a_settled_payment_on_a_busy_node() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    std::env::remove_var("B2_LN_REST");
+    let root = root_with(dir.path(), &runbook_policy(json!({"allowlist": [PROVIDER, dest()], "ln": {"enabled": true, "timeout_s": 5}})));
+    let (inv, hash, pre) = make_invoice(T0, "lnbcrt3u", 90, XBT, Some("coffee"), 3600);
+    // the node settled it, then made 1,000 more payments
+    let fake = rest_lnd(json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "1000",
+                               "payment_preimage": hex::encode(&pre), "htlcs": []}), "");
+    let ln: Arc<dyn LnBackend> = Arc::new(LndRest::new(&fake.url, &macaroon_file(dir.path()), None).unwrap());
+    let clock = Arc::new(AtomicU64::new(T0));
+    let c = clock.clone();
+    let s = Signer::new(&root, SignerOptions { node: Some(FakeChain::new("regtest", 6_720)), transport: Some(Arc::new(Web::default())), ln: Some(ln),
+                                               clock: Some(Arc::new(move || c.load(Ordering::SeqCst) as f64)), ..Default::default() }).unwrap();
+    // a timeout left it booked as sending
+    let d = xbt_signer::bolt11::decode(&inv).unwrap();
+    s.ln_book.put(&hash, xbt_signer::ln::sending_record(&d, &inv, &dest(), 303, 3, T0 as f64, None)).unwrap();
+    s.engine.commit(&xbt_signer::policy::Payment::new(&dest(), 303, "ln"), &format!("ln:{hash}")).unwrap();
+    clock.fetch_add(66, Ordering::SeqCst);
+    call(&s, "watch_tick", json!({}));
+    assert_eq!(s.ln_book.get(&hash).unwrap()["state"], "settled", "{:?}", s.ln_book.get(&hash));
+    assert_eq!(ledger_net(&root), 301, "booked at what it cost, not released");
+}
+
+#[test]
+fn l4_a_late_rebook_that_breaks_the_policy_halts_the_rail_until_the_human_resumes_it() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({"human_threshold_sats": 10_000}));
+    // A: the POST fails and the node has no record, so its booking goes
+    rig.ln.set(|s| s.mode = Mode::NotSent);
+    let (inv_a, hash_a) = rig.invoice(3_000, 60, XBT);
+    assert_eq!(rig.pay(&inv_a, 4_000)["rule"], "ln_payment_failed");
+    // B uses the room A left
+    rig.ln.set(|s| s.mode = Mode::Succeed);
+    let (inv_b, _) = rig.invoice(3_000, 61, XBT);
+    assert_eq!(rig.pay(&inv_b, 4_000)["verdict"], "allow");
+    // the node records A after all, settled: it is booked, and that breaks the policy (daily 6,000)
+    rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash_a, "status": "SUCCEEDED", "value_msat": "3000000", "fee_msat": "2000",
+                                          "payment_preimage": hex::encode([60u8; 32]), "htlcs": []})));
+    rig.call("watch_tick", json!({}));
+    assert_eq!(rig.ledger_net(), 3_002 + 3_002, "what was spent is booked, whatever the policy says");
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["halted"]["payment_hash"], hash_a, "{st}");
+    assert_eq!(st["ready"], false);
+    assert!(st["warnings"].to_string().contains("halted"), "{st}");
+    assert_eq!(rig.audit("ln_halted").len(), 1);
+    let resume = |rig: &LnRig| rig.call("approvals", json!({}))["approvals"].as_array().unwrap().iter()
+        .find(|a| a["kind"] == "ln_resume" && a["state"] == "pending").cloned();
+    assert!(resume(&rig).is_some(), "the human's queue shows it");
+    // a day later the budgets have room again; the rail stays halted
+    rig.clock.fetch_add(86_401, Ordering::SeqCst);
+    let (inv_c, _) = rig.invoice(100, 62, XBT);
+    let r = rig.pay(&inv_c, 1_000);
+    assert_eq!(r["rule"], "ln_halted", "{r}");
+    assert_eq!(rig.ln.sent(), 1, "only B reached the router");
+    // only the human's signature resumes it (the first request has expired: a new one waits)
+    let a = resume(&rig).expect("a live resume request");
+    let (tok, adest, amount, exp) = (a["token"].as_str().unwrap().to_string(), a["dest"].as_str().unwrap().to_string(),
+                                     a["amount_sats"].as_i64().unwrap(), a["expires"].as_i64().unwrap());
+    let r = rig.call("approve", json!({"token": tok, "dest": adest, "amount_sats": amount, "expiry": exp, "signature": "00".repeat(64)}));
+    assert_eq!(r["verdict"], "deny", "{r}");
+    assert_eq!(rig.pay(&inv_c, 1_000)["rule"], "ln_halted");
+    let sig = sign_human(&xbt_signer::approval::canonical_message(&tok, &adest, amount, exp));
+    let r = rig.call("approve", json!({"token": tok, "dest": adest, "amount_sats": amount, "expiry": exp, "signature": sig}));
+    assert_eq!(r["resumed"], true, "{r}");
+    assert_eq!(rig.audit("ln_resumed").len(), 1);
+    assert_eq!(rig.pay(&inv_c, 1_000)["verdict"], "allow");
+    assert!(rig.call("ln_status", json!({}))["halted"].is_null());
+}
+
+#[test]
+fn l4_the_rebook_watch_lasts_as_long_as_the_htlc_can() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({"ln": {"max_cltv_blocks": 200}}));
+    rig.ln.set(|s| s.mode = Mode::NotSent);
+    let (inv, hash) = rig.invoice(300, 63, XBT);
+    rig.pay(&inv, 1000);
+    // the invoice expired an hour ago; the HTLC could still be out until its CLTV: a late settle is booked
+    rig.clock.fetch_add(3_600 + 3_601, Ordering::SeqCst);
+    rig.node.chain.mine(10);
+    rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "0",
+                                          "payment_preimage": hex::encode([63u8; 32]), "htlcs": []})));
+    rig.call("watch_tick", json!({}));
+    assert_eq!(rig.ledger_net(), 300, "booked at what it cost");
+    // past max_cltv_blocks (+ the margin) in blocks and in time, nothing can settle: the watch ends
+    let rig = LnRig::new(json!({"ln": {"max_cltv_blocks": 200}}));
+    rig.ln.set(|s| s.mode = Mode::NotSent);
+    let (inv, hash) = rig.invoice(300, 64, XBT);
+    rig.pay(&inv, 1000);
+    rig.node.chain.mine(200 + 144 + 1);
+    rig.clock.fetch_add((200 + 144 + 1) * 600, Ordering::SeqCst);
+    rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "0",
+                                          "payment_preimage": hex::encode([64u8; 32]), "htlcs": []})));
+    rig.call("watch_tick", json!({}));
+    assert_eq!(rig.ledger_net(), 0);
+}
+
+#[test]
+fn l5_a_proven_funding_is_proven_again_after_a_reorg() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    let (inv, _) = rig.invoice(100, 80, XBT);
+    assert_eq!(rig.pay(&inv, 1000)["verdict"], "allow");
+    // a reorg replaces the funding block (6,100): the funding is no longer at its short channel id
+    rig.node.reorg(6_100, Some(vec!["ee".repeat(32), "ef".repeat(32)]));
+    let (inv, _) = rig.invoice(100, 81, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
+    assert!(r["channels"][0]["refused"].as_str().unwrap().contains("not the channel's funding"), "{r}");
+    assert_eq!(rig.ln.sent(), 1);
+    // the block comes back: proven again, and the evidence names the block
+    rig.node.reorg(6_100, None);
+    assert_eq!(rig.pay(&inv, 1000)["verdict"], "allow");
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["channels"][0]["funding"]["evidence"]["block_hash"], FakeChain::bhash("regtest", 6_100), "{st}");
+}
+
+#[test]
+fn l5_a_0x21_push_the_script_never_checks_proves_nothing() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    let (inv, _) = rig.invoice(100, 82, XBT);
+    let wsh = |script: &[u8]| [vec![0u8, 0x20], Sha256::digest(script).to_vec()].concat();
+    // OP_DROP OP_TRUE: anyone can spend it, on any chain its coin exists on; the 0x21-shaped push is data
+    let anyone = vec![0x75, 0x51];
+    let a = rig.node.fund_with(6_400, 1, wsh(&anyone), vec![der(0x21), anyone.clone()], vec![], 6_350);
+    // a taproot script path: which pushes its leaf checks is not read
+    let tr = [vec![0x51u8, 0x20], vec![7; 32]].concat();
+    let b = rig.node.fund_with(6_401, 1, tr, vec![[vec![5; 64], vec![0x21]].concat(), vec![0x51], vec![0xc0; 33]], vec![], 6_350);
+    rig.ln.set(|s| s.channels = vec![with_point(chan(&scid(6_400, 1), "ANCHORS", true), &a), with_point(chan(&scid(6_401, 1), "ANCHORS", true), &b)]);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
+    let why: Vec<String> = r["channels"].as_array().unwrap().iter().map(|c| c["refused"].as_str().unwrap_or("").to_string()).collect();
+    assert!(why[0].contains("CHECKSIG"), "{why:?}");
+    assert!(why[1].contains("script path"), "{why:?}");
+    assert_eq!(rig.ln.sent(), 0);
+    // what LND's wallet spends: a 2-of-2 P2WSH signed 0x21 twice, and P2SH-P2WPKH (np2wkh)
+    let ms = [vec![0x52, 0x21], vec![2; 33], vec![0x21], vec![3; 33], vec![0x52, 0xae]].concat();
+    let c = rig.node.fund_with(6_402, 1, wsh(&ms), vec![vec![], der(0x21), der(0x21), ms.clone()], vec![], 6_350);
+    let redeem = [vec![0u8, 0x14], vec![9; 20]].concat();
+    let p2sh = [vec![0xa9, 0x14], vec![1; 20], vec![0x87]].concat();
+    let d = rig.node.fund_with(6_403, 1, p2sh, vec![der(0x21), vec![2; 33]], [vec![22u8], redeem].concat(), 6_350);
+    // the same 2-of-2 with one signature 0x01
+    let e = rig.node.fund_with(6_404, 1, wsh(&ms), vec![vec![], der(0x21), der(0x01), ms.clone()], vec![], 6_350);
+    rig.ln.set(|s| s.channels = vec![with_point(chan(&scid(6_402, 1), "ANCHORS", true), &c), with_point(chan(&scid(6_403, 1), "ANCHORS", true), &d),
+                                     with_point(chan(&scid(6_404, 1), "ANCHORS", true), &e)]);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(rig.ln.st.lock().unwrap().sent[0].outgoing_chan_ids, vec![scid(6_402, 1), scid(6_403, 1)]);
 }

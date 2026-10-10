@@ -170,7 +170,7 @@ fn parse_hrp(hrp: &str) -> Result<(String, Option<u64>), String> {
         Some(b'u') => n * 100_000,
         Some(b'n') => n * 100,
         _ => {
-            if n % 10 != 0 {
+            if !n.is_multiple_of(10) {
                 return Err("a pico amount must be a whole number of msat".into());
             }
             n / 10

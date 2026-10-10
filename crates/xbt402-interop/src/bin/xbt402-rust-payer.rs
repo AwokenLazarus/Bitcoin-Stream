@@ -119,7 +119,8 @@ fn run() -> Result<Value> {
         // close fee and payeeNet what the payee output holds, and payer-pays carries neither.
         "provider_report_gross": reported == signed && unpaid == ch.spent_msat.saturating_sub(reported * 1000),
         "provider_report_fee": if p.payee_fee() > 0 {
-            close["payeeFee"] == p.close_fee.to_string() && close["payeeNet"] == payee_out.to_string()
+            close["payeeFee"].as_str() == Some(p.close_fee.to_string().as_str())
+                && close["payeeNet"].as_str() == Some(payee_out.to_string().as_str())
         } else {
             close.get("payeeFee").is_none() && close.get("payeeNet").is_none()
         },

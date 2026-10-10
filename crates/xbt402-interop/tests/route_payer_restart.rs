@@ -23,6 +23,7 @@ use xbt402::route::{ceil_div, AMSAT_PER_SAT, FEE_UNITS_PER_SAT, HUB_ROUTE_PATH};
 use xbt402::route_client::{FileRouteLedger, MemoryRouteLedger, RouteLedger, RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
 use xbt402::signer::{LocalSigner, RouteSigner, StateSigner};
+use xbt402_interop::crash_copy;
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
@@ -422,7 +423,9 @@ fn restart_the_ledger_file_holds_no_payer_key_signature_or_refund() {
     assert!(!raw.contains(&refund[..120]), "the signer's refund is not in the ledger");
     let sig = hex::encode(w.signer.sign_close(&chan).unwrap());
     assert!(!raw.contains(&sig));
-    for (_, v) in ClientLedger::load(&FileRouteLedger::open(&w.file()).unwrap()).unwrap() {
+    let snap = w.file().with_extension("snapshot");
+    crash_copy(&w.file(), &snap).unwrap();
+    for (_, v) in ClientLedger::load(&FileRouteLedger::open(&snap).unwrap()).unwrap() {
         for k in ["secret_key", "payer_secret", "sig", "refund_hex", "best_sig"] {
             assert!(v.get(k).is_none(), "{k} in {v}");
         }

@@ -10,6 +10,7 @@ use xbt_primitives::amount::Amount;
 use crate::client::{Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, UtxoInfo};
+use crate::json::py_str;
 
 /// A JSON-RPC connection to one node (optionally one of its wallets).
 #[derive(Clone)]
@@ -89,6 +90,28 @@ impl ChainBackend for Rpc {
 
     fn has_transaction(&self, txid: &str) -> Result<bool> {
         Ok(self.call("getrawtransaction", json!([txid])).map(|v| !v.is_null()).unwrap_or(false))
+    }
+
+    fn estimate_fee_rate(&self, target: u32) -> Result<Option<f64>> {
+        let r = self.call("estimatesmartfee", json!([target]))?;
+        Ok(r.get("feerate").and_then(Value::as_f64).filter(|f| *f > 0.0).map(|f| f * 1e8 / 1000.0))
+    }
+
+    fn mempool_min_fee(&self) -> Result<Option<f64>> {
+        let r = self.call("getmempoolinfo", json!([]))?;
+        let rate = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0) * 1e8 / 1000.0;
+        Ok(Some(rate("mempoolminfee").max(rate("minrelaytxfee"))).filter(|f| *f > 0.0))
+    }
+
+    /// `submitpackage`: Ok when every tx of the package is in the mempool (or was already).
+    fn submit_package(&self, hexes: &[String]) -> Result<()> {
+        let r = self.call("submitpackage", json!([hexes]))?;
+        if r.get("package_msg").and_then(Value::as_str) == Some("success") {
+            return Ok(());
+        }
+        let errs: Vec<String> = r.get("tx-results").and_then(Value::as_object).into_iter().flatten()
+            .filter_map(|(_, t)| t.get("error").and_then(Value::as_str).map(str::to_string)).collect();
+        fail("rpc_error", format!("submitpackage: {} {}", py_str(r.get("package_msg")), errs.join("; ")))
     }
 }
 

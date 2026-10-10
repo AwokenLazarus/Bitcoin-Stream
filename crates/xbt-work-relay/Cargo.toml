@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 xbt-svc.workspace = true
-tiny_http.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

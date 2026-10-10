@@ -274,7 +274,7 @@ done
   echo "- build host has no system cross toolchain and no sudo. \`tools/zig-cc\` drives \`python -m ziglang cc\` for libsecp256k1 and for rustc's link step."
   echo "- Musl targets are linked with \`-C target-feature=+crt-static\` so boards get a single static binary."
   echo "- Self-test is run only when the host can execute the binary (native x86_64), or when a user-mode emulator is already on PATH. This script never installs binfmt or qemu."
-  echo "- Optional HTTP/RPC features (\`ureq\`, \`tiny_http\`) stay behind crate features and are not part of this matrix."
+  echo "- Optional HTTP/RPC features (\`ureq\`) stay behind crate features and are not part of this matrix."
   echo "- Build logs: \`dist/logs/<target>.<profile>.log\`."
 } > "$DIST/MATRIX.md"
 

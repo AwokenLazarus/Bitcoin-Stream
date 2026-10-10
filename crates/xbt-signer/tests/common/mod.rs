@@ -36,6 +36,9 @@ pub struct State {
     pub reject: Option<String>,
     pub mined_by_signer: u64,
     pub down: bool,
+    pub coinbase: std::collections::HashSet<String>,
+    /// `getdeploymentinfo`; None: the node does not answer it.
+    pub deployments: Option<Value>,
 }
 
 pub struct FakeChain {
@@ -75,6 +78,19 @@ impl FakeChain {
         } else {
             s.mempool.insert(txid.into(), tx);
         }
+    }
+
+    /// A coinbase paying `sats` to `spk`, in a block at the current height.
+    pub fn credit_coinbase(&self, txid: &str, vout: u32, sats: i64, spk: &str) {
+        let mut s = self.st.lock().unwrap();
+        let mut outs: Vec<Value> = (0..vout).map(|n| json!({"n": n, "value": 0, "scriptPubKey": {"hex": ""}})).collect();
+        outs.push(json!({"n": vout, "value": sats as f64 / 1e8, "scriptPubKey": {"hex": spk}}));
+        let tx = json!({"txid": txid, "hex": "", "vin": [{"coinbase": "03c80000", "sequence": 4294967295u32}], "vout": outs});
+        let h = s.height;
+        s.utxos.insert((txid.into(), vout), (sats, spk.into()));
+        s.blocks.entry(h).or_default().push(tx);
+        s.conf_height.insert(txid.into(), h);
+        s.coinbase.insert(txid.into());
     }
 
     pub fn mine(&self, n: u64) {
@@ -165,7 +181,7 @@ impl FakeChain {
             s.height - s.conf_height.get(txid).copied().unwrap_or(s.height) + 1
         };
         json!({"bestblock": Self::bhash(&s.chain, s.height), "confirmations": confs, "value": v as f64 / 1e8,
-               "scriptPubKey": {"hex": spk}, "coinbase": false})
+               "scriptPubKey": {"hex": spk}, "coinbase": s.coinbase.contains(txid)})
     }
 }
 
@@ -234,7 +250,8 @@ impl Node for FakeChain {
                     .filter_map(|d| d.as_str().and_then(|d| d.strip_prefix("raw(")).and_then(|d| d.strip_suffix(')')).map(str::to_string)).collect();
                 let s = self.st.lock().unwrap();
                 let u: Vec<Value> = s.utxos.iter().filter(|((t, _), (_, spk))| want.contains(spk) && !s.mempool.contains_key(t))
-                    .map(|((t, v), (a, spk))| json!({"txid": t, "vout": v, "scriptPubKey": spk, "amount": *a as f64 / 1e8})).collect();
+                    .map(|((t, v), (a, spk))| json!({"txid": t, "vout": v, "scriptPubKey": spk, "amount": *a as f64 / 1e8,
+                                                     "coinbase": s.coinbase.contains(t), "height": s.conf_height.get(t)})).collect();
                 json!({"success": true, "unspents": u})
             }
             "getnewaddress" => json!("bcrt1qmine"),
@@ -247,6 +264,10 @@ impl Node for FakeChain {
                 json!([])
             }
             "getbalances" => json!({"mine": {"trusted": 0, "untrusted_pending": 0, "immature": 0}}),
+            "getdeploymentinfo" => {
+                let d = self.st.lock().unwrap().deployments.clone();
+                d.ok_or_else(|| rpc_err("Method not found"))?
+            }
             "estimatesmartfee" => json!({"feerate": 0.00001}),
             other => panic!("FakeChain: unexpected {other} {p:?}"),
         })

@@ -305,7 +305,7 @@ def main():
     helper("provider", f"printf 'xbt:{RPC_PW}' > /d/rpc-auth && chown -R 10009:10009 /d && chmod 600 /d/rpc-auth")
     docker("run", "-d", "--name", f"{P}-provider", *COMMON, "-p", f"127.0.0.1:{PROV_PORT}:9500", "-v", f"{vol('provider')}:/p",
            "agp038-test-provider:1", "--port", "9500", "--bind", "0.0.0.0", "--rpc-host", f"{P}-knots", "--rpc-port", "18443",
-           "--cookie", "/p/rpc-auth", "--ledger", "/p/ledger.jsonl")
+           "--cookie", "/p/rpc-auth", "--data-dir", "/p", "--ledger", "/p/ledger.jsonl")
     wait_until(lambda: status(f"http://127.0.0.1:{PROV_PORT}/x402/supported") == 200, 60, "the provider")
 
     # --- provisioning: the node credentials only ---------------------------------------------------------------

@@ -364,15 +364,16 @@ fn h2_a_refused_lock_stays_in_the_base_and_blocks_routing_and_rollover() {
     let oc = w.hub.out_channels()[&w.provs[0].0].clone();
     assert_eq!(oc.stale.len(), 1);
     assert_eq!(w.hub.rollover(&oc).unwrap_err().code, "lock_pending");
-    let acts = w.hub.watch_tick();
+    let mut acts = w.hub.watch_tick();
     assert!(!acts.iter().any(|a| a["event"] == "ch2_rollover"), "{acts:?}");
+    // AGP-073: the watcher does not wait for p0 to close that ch2 (or for its refund): it asks now
+    assert!(acts.iter().any(|a| a["event"] == "ch2_close" && a["why"] == "written_off"), "{acts:?}");
     // the reroute is quoted above the held lock
     let r = w.lock(1);
     assert_eq!(r["status"], "paid", "{r}");
     let second = r["amount"].as_u64().unwrap() + r["fee"].as_u64().unwrap();
     assert!(w.st1().best_cum >= routed0 + first + second);
-    w.provs[0].1.inner.close_now(&w.st2(0).params.channel_id()).unwrap();
-    let acts = w.hub.watch_tick();
+    acts.extend(w.hub.watch_tick());
     assert!(acts.iter().any(|a| a["event"] == "secret_from_close"), "{acts:?}");
     assert_eq!(w.routed(), routed0 + first + second);
 }

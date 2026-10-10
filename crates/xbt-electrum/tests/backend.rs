@@ -2,12 +2,14 @@
 //! subscriptions, and lying servers (hidden txs, withheld headers, lying fees, wrong/weaker/stronger
 //! chains, bad proofs, substituted txs, wrong heights, invented spends, bad broadcasts, mute servers).
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use xbt402::funding::ChainBackend;
-use xbt_electrum::sim::{FakeElectrum, Forge, SimChain, CHECKPOINT, TEST_CA};
-use xbt_electrum::{scripthash, Config, ElectrumBackend, Kind, TxStatus};
+use xbt_electrum::sim::{mine_header, FakeElectrum, Forge, SimChain, CHECKPOINT, REGTEST_BITS, T0, TEST_CA};
+use xbt_electrum::backend::TIP_CAP_SPACING_S;
+use xbt_electrum::{scripthash, Config, ElectrumBackend, Kind, Plausibility, TxStatus};
+use xbt_primitives::header::U512;
 use xbt_primitives::tx::TxOut;
 
 fn spk(b: u8) -> Vec<u8> {
@@ -170,7 +172,8 @@ fn headers_catch_up_in_batches_and_persist() {
     let b = ElectrumBackend::new(c.clone()).unwrap();
     assert_eq!(b.block_count().unwrap(), 5_000);
     let calls = s[0].calls.lock().unwrap().clone();
-    assert_eq!(calls.iter().filter(|m| *m == "blockchain.block.headers").count(), 3, "4,899 headers = 3 chunks, one batch");
+    assert_eq!(calls.iter().filter(|m| *m == "blockchain.block.headers").count(), 4,
+               "the 10 below the checkpoint, then 4,899 headers = 3 chunks, one batch");
     drop(b);
     s[0].calls.lock().unwrap().clear();
     chain.lock().unwrap().mine(5);
@@ -468,10 +471,136 @@ fn config_from_env_and_checkpoint_parsing() {
     assert!(xbt_electrum::parse_checkpoint(Some("x:".to_string().as_str())).is_err());
     assert_eq!(xbt_electrum::parse_checkpoint(None).unwrap(), None);
     // mainnet defaults to block 961640 and 2 servers
-    let b = ElectrumBackend::new(Config::new(&["tcp://127.0.0.1:1", "tcp://127.0.0.1:2", "ssl://example.com:50002"], "main")).unwrap();
+    let b = ElectrumBackend::new(Config::new(&["tcp://127.0.0.1:1", "tcp://localhost:2", "ssl://example.com:50002"], "main")).unwrap();
     assert_eq!(b.checkpoint(), (961_640, "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb".to_string()));
     assert_eq!(b.min_servers, 2);
     assert!(ElectrumBackend::new(Config::new(&["http://x:1"], "main")).is_err());
     assert!(ElectrumBackend::new(Config::new(&[], "main")).is_err());
     assert!(ElectrumBackend::new(Config::new(&["tcp://h:1"], "nochain")).is_err());
+    assert!(ElectrumBackend::new(Config::new(&["tcp://h:1"], "testnet4")).is_err(), "no testnet4 header rules: fails closed");
+}
+
+/// review E2: plain TCP on mainnet only to a loopback host (anything else needs ssl://).
+#[test]
+fn mainnet_needs_tls() {
+    for ok in ["tcp://127.0.0.1:50001", "tcp://127.8.9.10:1", "tcp://localhost:1", "tcp://LOCALHOST.:1", "tcp://[::1]:1",
+               "tcp://[::ffff:127.0.0.1]:1", "127.0.0.1:50001:t", "ssl://electrum.example:50002", "electrum.example:50002:s"] {
+        assert!(ElectrumBackend::new(Config::new(&[ok, "ssl://b.example:1"], "main")).is_ok(), "{ok}");
+    }
+    for bad in ["tcp://electrum.example:50001", "tcp://10.0.0.5:50001", "tcp://192.168.1.2:1", "tcp://[::ffff:10.0.0.1]:1",
+                "tcp://localhost.example.com:1", "tcp://127.0.0.1.nip.io:1", "electrum.example:50001:t", "tcp://0.0.0.0:1"] {
+        let e = ElectrumBackend::new(Config::new(&[bad, "ssl://b.example:1"], "main")).err().unwrap_or_else(|| panic!("{bad} accepted"));
+        assert!(e.msg.contains("mainnet needs ssl://"), "{bad}: {e}");
+    }
+    // regtest is not held to it
+    assert!(ElectrumBackend::new({
+        let mut c = Config::new(&["tcp://10.0.0.5:1"], "regtest");
+        c.checkpoint = Some((101, "ab".repeat(32)));
+        c
+    }).is_ok());
+}
+
+/// review E1: a server claiming a tip near 2^32 and streaming junk headers, slowly, neither stalls
+/// the other callers nor costs more than one batch of headers per sync.
+#[test]
+fn hostile_lying_server_cannot_stall() {
+    let chain = sim(300);
+    let honest = FakeElectrum::start(chain.clone(), false);
+    let liar = FakeElectrum::start(chain.clone(), false);
+    {
+        let mut k = liar.knobs();
+        k.fake_tip = Some(mine_header([0x44; 32], [0x45; 32], 4_000_000_000, 1, T0 + 60 * 300, REGTEST_BITS));
+        k.junk_above = Some(300);
+    }
+    let mut c = cfg(&chain, &[&liar, &honest]);
+    c.timeout = Duration::from_secs(5);
+    c.tip_cap_spacing_s = Some(TIP_CAP_SPACING_S);
+    let b = Arc::new(ElectrumBackend::new(c).unwrap());
+    let t = Instant::now();
+    assert_eq!(b.block_count().unwrap(), 300);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(b.flags().iter().any(|f| f.server == liar.url() && f.reason.contains("beyond the plausible")), "{:?}", b.flags());
+    let asked = liar.calls.lock().unwrap().iter().filter(|m| *m == "blockchain.block.headers").count();
+    assert!(asked <= 5, "the first junk chunk ends the fetch: {asked} header requests");
+
+    // the liar now claims the real tip but answers header requests slowly: a sync in flight does
+    // not hold up anyone else
+    {
+        let mut k = liar.knobs();
+        k.fake_tip = None;
+        k.junk_above = None;
+        k.delay_headers_ms = 1_500;
+    }
+    chain.lock().unwrap().mine(1);
+    let b2 = b.clone();
+    let syncing = std::thread::spawn(move || b2.sync(true));
+    std::thread::sleep(Duration::from_millis(300));
+    let t = Instant::now();
+    let _ = b.status();
+    assert!(b.block_hash(300).is_ok());
+    assert!(b.flags().len() < 60);
+    assert!(t.elapsed() < Duration::from_millis(700), "held up {:?} by the slow server's sync", t.elapsed());
+    assert_eq!(syncing.join().unwrap().unwrap(), 301, "the honest server's block still arrives");
+}
+
+/// review E1: the tip cap is a mainnet rule (regtest mines as fast as it is asked to); where it is set,
+/// a chain that outran it is caught up over more than one sync, and the server is flagged.
+#[test]
+fn tip_cap_is_mainnet_only() {
+    let chain = sim(CHECKPOINT + 4_000); // 60 s blocks: faster than one per 150 s
+    let tip_time = (T0 + 60 * (CHECKPOINT + 4_000)) as u64;
+    let s = servers(&chain, 1);
+    let mut c = cfg(&chain, &[&s[0]]);
+    c.clock = Some(Arc::new(move || tip_time));
+    let b = ElectrumBackend::new(c.clone()).unwrap();
+    assert_eq!(b.block_count().unwrap(), CHECKPOINT + 4_000);
+    assert!(b.flags().is_empty(), "{:?}", b.flags());
+
+    c.tip_cap_spacing_s = Some(TIP_CAP_SPACING_S);
+    let capped = ElectrumBackend::new(c).unwrap();
+    let cap = CHECKPOINT + 60 * 4_000 / TIP_CAP_SPACING_S as u32 + 2016;
+    assert_eq!(capped.block_count().unwrap(), cap);
+    assert!(capped.flags().iter().any(|f| f.reason.contains("beyond the plausible")), "{:?}", capped.flags());
+    assert_eq!(capped.sync(true).unwrap(), CHECKPOINT + 4_000);
+}
+
+/// review E2: a fresh client whose only server serves the real checkpoint and then a few cheap
+/// blocks with a fake funding in them believes nothing until the chain is plausible.
+#[test]
+fn hostile_cheap_fork_is_not_believed() {
+    let base = SimChain::new(CHECKPOINT, 0);
+    let mut honest = base.clone();
+    honest.mine(299); // tip 400
+    let mut cheap = base;
+    let fake = cheap.credit(0, 5_000_000, &spk(0x91), true);
+    cheap.mine(19); // tip 121
+    let honest = Arc::new(Mutex::new(honest));
+    let cheap = Arc::new(Mutex::new(cheap));
+    let good = FakeElectrum::start(honest.clone(), false);
+    let liar = FakeElectrum::start(cheap.clone(), false);
+    let per_block = xbt_primitives::header::work_of(REGTEST_BITS).unwrap();
+    let rules = |srv: &[&Arc<FakeElectrum>], now: u32| {
+        let mut c = cfg(&honest, srv);
+        c.plausibility = Some(Plausibility { min_work_above: per_block * U512::from(200u32), floor_spacing_s: 60, floor_slack: 50 });
+        c.clock = Some(Arc::new(move || now as u64));
+        c
+    };
+    let now = T0 + 60 * 400 + 30;
+    let alone = ElectrumBackend::new(rules(&[&liar], now)).unwrap();
+    let e = alone.tx_out(&fake, 0, true).unwrap_err();
+    assert_eq!(e.kind, Kind::Implausible, "{e}");
+    assert!(e.msg.contains("below the minimum"), "{e}");
+    assert_eq!(alone.block_count().unwrap_err().kind, Kind::Implausible);
+    assert!(alone.call("getblockhash", &json!([CHECKPOINT])).is_err(), "nothing is answered from it");
+    assert!(alone.status()["implausible"].is_string());
+    // with an honest server, most work wins and the fake funding has no proof into it
+    let b = ElectrumBackend::new(rules(&[&liar, &good], now)).unwrap();
+    assert_eq!(b.block_count().unwrap(), 400);
+    assert!(b.tx_out(&fake, 0, true).unwrap().is_none());
+    assert!(b.status()["implausible"].is_null());
+    // enough work but a tip far behind what the clock says: withheld as well
+    let late = ElectrumBackend::new(rules(&[&good], T0 + 60 * 500)).unwrap();
+    let e = late.block_count().unwrap_err();
+    assert_eq!(e.kind, Kind::Implausible);
+    assert!(e.msg.contains("implausibly low"), "{e}");
 }

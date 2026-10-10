@@ -23,13 +23,21 @@ stock lnd on a SHA-256 regtest). Run by scripts/ln_rail_regtest.sh, which brings
       tower_policy refuse -> ln_tower_chain; listed in trusted_towers -> paid
   S15 a hold invoice: the payment stays in flight, booked, with its CLTV height; an HTLC lf1 sends
       outside the wallet counts against the budget (ln_htlc_lock) until it is cancelled
+  AGP-066:
+  S16 lf1's TrackPaymentV2 by hash: a settled payment's record; a hash it never paid is 404 "payment
+      isn't initiated"; the wallet holds nothing in flight and is not halted
+  S17 the macaroon report is an allowlist: uri:/lnrpc.Lightning/SendCoins is excess, not least privilege
+  S18 B2_LN_REST http://[::ffff:10.0.0.5]:8080 is refused (plain http only on loopback)
 
 Environment: LAB (the lab checkout), OUT (report dir), BIN (the release binaries), RUN (scratch dir).
 """
+import base64
 import hashlib
+import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -272,6 +280,7 @@ def main():
     try:
         run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs)
         run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env)
+        run_066(mcp, human_pub, lf2_pub, procs, ln_env)
     finally:
         mcp.close()
         for p in procs:
@@ -638,6 +647,65 @@ def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
         bg.kill()
     led = sum(x["amount_sats"] for x in ledger_payments(f"{RUN}/wallet-hold/.run"))
     check("S15 the hold wallet's ledger is exact: 2,000 + 3,000 (direct peer, no fee)", led == 5000, led)
+
+
+# --- AGP-066 ------------------------------------------------------------------------------------------
+
+def lf1_rest(path):
+    """GET lf1's REST API as the signer does (its tls.cert pinned, the rail macaroon): the status and the
+    body, or only its first line for a 200 (TrackPaymentV2 streams one JSON object per line)."""
+    ctx = ssl.create_default_context(cafile=f"{RUN}/lf1.tls.cert")
+    ctx.check_hostname = False
+    c = http.client.HTTPSConnection("127.0.0.1", 34791, context=ctx, timeout=30)
+    with open(f"{RUN}/lf1.macaroon", "rb") as f:
+        mac = f.read().hex()
+    c.request("GET", path, headers={"Grpc-Metadata-macaroon": mac})
+    r = c.getresponse()
+    body = r.readline() if r.status == 200 else r.read()
+    c.close()
+    return r.status, json.loads(body or b"{}")
+
+
+def track_path(hash_hex):
+    return "/v2/router/track/" + base64.urlsafe_b64encode(bytes.fromhex(hash_hex)).decode()
+
+
+def run_066(mcp, human_pub, lf2_pub, procs, ln_env):
+    # S16 (L3): a payment is looked up by its hash; the node's answer for one it never started
+    settled = [h for h, p in payments("lf1").items() if p.get("status") == "SUCCEEDED"]
+    code, known = lf1_rest(track_path(settled[0]))
+    unknown_hash = os.urandom(32).hex()
+    code_u, unknown = lf1_rest(track_path(unknown_hash))
+    REPORT["scenarios"]["S16_lookup_by_hash"] = {"known": [code, known], "unknown": [code_u, unknown], "payments_on_lf1": len(settled)}
+    check("S16 TrackPaymentV2 by hash: a settled payment's record, its hash, SUCCEEDED",
+          code == 200 and known.get("result", {}).get("payment_hash") == settled[0] and known["result"].get("status") == "SUCCEEDED", known)
+    check("S16 a hash lf1 never paid: 404 \"payment isn't initiated\" (the only answer the signer reads as no payment)",
+          code_u == 404 and "payment isn't initiated" in str((unknown.get("error") or unknown).get("message")), [code_u, unknown])
+    st = mcp.tool("ln_status", {})
+    check("S16 after every lookup, the wallet holds nothing in flight and is not halted",
+          st.get("in_flight") == 0 and st.get("halted") is None, {k: st.get(k) for k in ("in_flight", "halted", "ready")})
+
+    # S17 (L2): the macaroon report is an allowlist: one extra URI permission is not least privilege
+    mac = st.get("macaroon", {})
+    bake("lf1", f"{RUN}/uri.macaroon", "uri:/lnrpc.Lightning/SendCoins")
+    s_uri, p = start_policy_signer("wallet-uri", human_pub, lf2_pub, dict(ln_env, B2_LN_MACAROON=f"{RUN}/uri.macaroon"))
+    procs.append(p)
+    mac_uri = rpc_sock(s_uri, "ln_status").get("macaroon", {})
+    stop(p)
+    REPORT["scenarios"]["S17_macaroon_allowlist"] = {"rail": mac, "with_send_coins": mac_uri}
+    check("S17 the rail's own macaroon is least privilege", mac.get("only_needed") is True and mac.get("excess_ops") == [], mac)
+    check("S17 a macaroon adding uri:/lnrpc.Lightning/SendCoins is not (refused on mainnet), though no denylist names it",
+          mac_uri.get("only_needed") is False and "uri:/lnrpc.Lightning/SendCoins" in mac_uri.get("excess_ops", [])
+          and mac_uri.get("dangerous_ops") == [], mac_uri)
+
+    # S18 (L1): plain http to an IPv4-mapped LAN address is not loopback
+    s_v6, p = start_policy_signer("wallet-v6", human_pub, lf2_pub, dict(ln_env, B2_LN_REST="http://[::ffff:10.0.0.5]:8080"))
+    procs.append(p)
+    st_v6 = rpc_sock(s_v6, "ln_status")
+    stop(p)
+    REPORT["scenarios"]["S18_ipv6_mapped_http"] = st_v6
+    check("S18 http://[::ffff:10.0.0.5]:8080 is refused: plain http only on loopback, the macaroon is not sent",
+          st_v6.get("ready") is not True and "must be https" in json.dumps(st_v6), st_v6)
 
 
 if __name__ == "__main__":

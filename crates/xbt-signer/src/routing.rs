@@ -204,6 +204,7 @@ fn deny(rule: &str, reason: String) -> Value {
 }
 
 /// `None` if the routing policy allows this lock, else a deny.
+#[allow(clippy::too_many_arguments)] // public API: bundling the figures would change its signature
 pub fn check_route(policy: &RoutePolicy, spend: &RouteSpend, hub: &str, amount: i64, fee: i64, increase: i64, pending: i64, now: f64) -> Option<Value> {
     if !policy.enabled() {
         return Some(deny("routing_disabled", "routing is off in this policy".into()));

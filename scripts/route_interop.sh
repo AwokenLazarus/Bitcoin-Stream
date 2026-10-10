@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-068}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 PB=${XBT_RS_ROUTE_PORT_BASE:-33100}
 # the RSS and RSSR runs sit at PB+RSS+10*j (j = 0..3); ROUTE_RSS_OFFSET=3 keeps every port below PB+100
 RSS=${ROUTE_RSS_OFFSET:-100}

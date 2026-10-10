@@ -59,7 +59,7 @@ The MCP server can wait for the approval: with `XBT_MCP_APPROVAL_WAIT_S=N`, an o
 | | server-rendered HTML from Rust (chosen) | a small SPA (Svelte/Preact) embedded as assets | a TUI in the browser (ttyd + xterm.js) |
 |---|---|---|---|
 | binary | 0.79 MB aarch64, 0.82 MB armv7, 0.88 MB x86_64 (static musl, `release-small`) | the same server plus a 40–150 kB JS bundle and a node toolchain at build time | a pty server plus about 300 kB of xterm.js, and a TUI to write |
-| arm/v7 and small boxes | tiny_http, no async runtime; about 1 MB RSS idle | the same server; the phone does more work | a pty and a process per session |
+| arm/v7 and small boxes | std HTTP server (`xbt_svc::http`), no async runtime; about 1 MB RSS idle | the same server; the phone does more work | a pty and a process per session |
 | security surface | no JSON API for changes, only form POSTs with CSRF tokens; strict CSP (`script-src 'self'`, no inline script, no eval); one 20 kB script, used only for keys and signing | a JSON API, so CORS and CSRF on every endpoint; larger third-party dependency trees | a shell-like surface; hard to put behind the proxy's auth |
 | accessibility | semantic HTML, labels, keyboard focus, readable without JS (JS is needed only to sign) | depends on care; broken without JS | poor: screen readers and phones |
 | offline, Tor, proxies | relative URLs, no external resources; works on an .onion and under any prefix | the same only with care (router base paths) | WebSocket through Tor and proxies is fragile |

@@ -69,7 +69,8 @@ fn p2_open_waits_for_min_conf_then_the_watcher_or_a_call_finishes_it() {
     rig.fund_hot(1, 12_000);
     let r = rig.pay();
     assert_eq!((r["rule"].as_str(), r["charged_sats"].as_i64(), r["min_conf"].as_i64()), (Some("funding_unconfirmed"), Some(0), Some(1)));
-    assert!(!rig.web.requests.lock().unwrap().iter().any(|(_, u)| u.ends_with("/open")), "no open before the confirmation");
+    // AGP-067 (C2): the one /open so far is the preflight sent before funding
+    assert_eq!(rig.web.requests.lock().unwrap().iter().filter(|(_, u)| u.ends_with("/open")).count(), 1, "no open before the confirmation");
     assert_eq!(rig.call("watch_tick", json!({}))["actions"], json!([]), "still unconfirmed: nothing to do");
     rig.chain.mine(1);
     let acts = rig.call("watch_tick", json!({}))["actions"].clone();

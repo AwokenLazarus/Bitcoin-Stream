@@ -13,9 +13,28 @@ pub mod route_vectors;
 pub mod stub;
 pub mod vectors;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The workspace's `vectors/` directory (pinned copies of the published vector files).
 pub fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors")
+}
+
+/// A crash, in one test process: `from` (a file, or a directory tree) copied to `to` as it is on
+/// disk now, without the `.lock` sidecars. A ledger takes one opener (AGP-067), so the next
+/// "process" opens the copy while the old instance, still alive in the test, keeps its own files,
+/// as a dead process's later writes never reach its successor.
+pub fn crash_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_file() {
+        std::fs::copy(from, to).map(|_| ())
+    } else {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)? {
+            let p = e?.path();
+            if p.extension().is_none_or(|x| x != "lock") {
+                crash_copy(&p, &to.join(p.file_name().unwrap_or_default()))?;
+            }
+        }
+        Ok(())
+    }
 }

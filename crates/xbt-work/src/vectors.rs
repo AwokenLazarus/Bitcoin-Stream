@@ -472,8 +472,9 @@ fn rows_push_rest(stored: &Value, pk: &ed25519_dalek::VerifyingKey, rows: &mut V
         ck(ok, format!("pricing: {} is not the least that covers {}", p["workUnits"], p["priceSats"]));
     }
     for a in stored["auth"].as_array().into_iter().flatten() {
-        let req = hex::encode(Sha256::digest(format!("{}|{}|{}", a["method"].as_str().unwrap_or(""), a["target"].as_str().unwrap_or(""),
-                                                     a["body"].as_str().unwrap_or("")).as_bytes()));
+        // request binding v2 (AGP-074): the digest is recomputed here, not taken from the file
+        let req = crate::auth::request_digest(a["method"].as_str().unwrap_or(""), a["target"].as_str().unwrap_or(""),
+                                               a["body"].as_str().unwrap_or("").as_bytes());
         ck(Some(req.as_str()) == a["req"].as_str(), format!("req digest n={}", a["n"]));
         let key = hex::decode(a["authKey"].as_str().unwrap_or("")).unwrap_or_default();
         let mut m = Hmac::<Sha256>::new_from_slice(&key).expect("key");

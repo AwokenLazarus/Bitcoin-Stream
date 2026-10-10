@@ -13,7 +13,13 @@
 //!   each header's BLAKE2b PoW, nBits (Knots' retarget), linkage, committed height and time are
 //!   checked, and the most-work chain any server shows wins. A server cannot move us to a chain with
 //!   less work, or below the checkpoint. Servers that answer but cannot serve the checkpoint are the
-//!   wrong chain ([`Kind::CheckpointMismatch`]).
+//!   wrong chain ([`Kind::CheckpointMismatch`]). Knots' header rules hold from the first header
+//!   (the ten below the checkpoint are fetched and hash-linked for the median), chunks are checked as
+//!   they arrive, and a claimed tip is believed only up to what the time since our tip allows.
+//! * **A believable chain** (mainnet, [`Plausibility`]): until the chain reaches the pinned block
+//!   964264 (Knots' assumevalid), carries Knots' nMinimumChainWork and is not implausibly short for its
+//!   age, every chain answer fails with [`Kind::Implausible`]. Mainnet servers need TLS (`ssl://`),
+//!   except on a loopback host.
 //! * **Transactions**: a raw tx is accepted only if it re-serializes byte for byte and hashes to the
 //!   txid asked for. It counts as confirmed only with a Merkle proof into one of our headers whose
 //!   committed transaction count fits the proof (depth `ceil(log2(txcount))`, position below the
@@ -33,6 +39,7 @@ pub mod error;
 #[cfg(feature = "sim")]
 pub mod sim;
 
-pub use backend::{parse_checkpoint, scripthash, Config, ElectrumBackend, FeeEstimate, Flag, TxOutInfo, TxStatus, Utxo};
+pub use backend::{is_loopback_host, parse_checkpoint, scripthash, Config, ElectrumBackend, FeeEstimate, Flag, Plausibility, TxOutInfo,
+                  TxStatus, Utxo};
 pub use conn::{parse_server, tls_config, Connection, ServerAddr};
 pub use error::{ElectrumError, Kind, Result};

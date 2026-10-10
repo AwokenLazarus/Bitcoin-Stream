@@ -175,7 +175,7 @@ fn a_close_not_yet_on_our_node_is_counted_on_a_later_tick_or_read_and_only_once(
     rig.call("hot_reconcile", json!({}));
     rig.call("watch_tick", json!({}));
     assert_eq!(rig.hot_sats(), 1_400 + 8_854);
-    assert_eq!(rig.channel(&r["chan"].as_str().unwrap().to_string())["close_change"], "counted");
+    assert_eq!(rig.channel(r["chan"].as_str().unwrap())["close_change"], "counted");
 }
 
 #[test]
@@ -212,6 +212,6 @@ fn a_change_already_spent_is_final_and_never_counted() {
     let n = rig.chain.tx(&close).outputs.iter().position(|o| hex::encode(&o.script_pubkey) == hot_spk).unwrap() as u32;
     rig.chain.st.lock().unwrap().utxos.remove(&(close.clone(), n));
     rig.call("watch_tick", json!({}));
-    assert_eq!(rig.channel(&r["chan"].as_str().unwrap().to_string())["close_change"], "spent");
+    assert_eq!(rig.channel(r["chan"].as_str().unwrap())["close_change"], "spent");
     assert_eq!(rig.hot_sats(), 1_400);
 }

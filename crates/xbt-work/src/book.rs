@@ -11,7 +11,7 @@
 //! credited or held: the Prime signed for all of it, so the audit bound never depends on the caps.
 //! Without caps nothing is held and the book behaves exactly as the reference.
 //!
-//! AGP-065 (Guida P2): a pass releases only the credit its bound counted. Each receipted increase is
+//! AGP-065 (review P2): a pass releases only the credit its bound counted. Each receipted increase is
 //! a [`Span`]; an audit at `H` with window start `ws` covers a span only when `ws < lo` and `hi < H`
 //! (the spans `L_H` sums). A span with `lo ≤ ws` is **skipped**: the window moved past it, so no
 //! audit will ever count it. Skipped credit is forgiven up to [`CreditCaps::skipped`] in total and
@@ -155,7 +155,7 @@ impl ReceiptBook {
     }
 
     fn open_credit(&self, invoice: Option<&str>) -> u64 {
-        self.spans.iter().filter(|s| s.coverage == Coverage::Open && invoice.map_or(true, |v| v == s.invoice))
+        self.spans.iter().filter(|s| s.coverage == Coverage::Open && invoice.is_none_or(|v| v == s.invoice))
             .fold(0u64, |a, s| a.saturating_add(s.credited))
     }
 
@@ -380,7 +380,7 @@ impl ReceiptBook {
             let (state, h) = match s.coverage { Coverage::Open => ("open", 0), Coverage::Covered(h) => ("covered", h), Coverage::Skipped(h) => ("skipped", h) };
             Value::from(vec![Value::from(s.invoice.clone()), s.lo.into(), s.hi.into(), s.work.into(), s.credited.into(), state.into(), h.into()])
         }).collect();
-        let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).map_or(true, |l| l.receipt.seq != s.receipt.seq)).collect();
+        let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).is_none_or(|l| l.receipt.seq != s.receipt.seq)).collect();
         held.sort_by(|a, b| (&a.receipt.invoice, a.receipt.seq).cmp(&(&b.receipt.invoice, b.receipt.seq)));
         obj([("last", last.into()), ("credited", Value::Object(cr)), ("intervals", iv.into()),
              ("fraud", self.fraud.iter().map(Equivocation::to_json).collect::<Vec<_>>().into()),
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(c.intervals, b.intervals);
     }
 
-    /// Guida P2: a pass releases only what its bound counted; the rest is skipped, forgiven up to the
+    /// review P2: a pass releases only what its bound counted; the rest is skipped, forgiven up to the
     /// allowance, and a reorg reopens what an orphaned audit resolved.
     #[test]
     fn a_pass_covers_only_the_spans_its_bound_counts() {

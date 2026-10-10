@@ -230,6 +230,7 @@ fn one_process_sells_and_buys_with_injected_ledgers_and_restarts() {
     #[cfg(unix)]
     assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&cl_path).unwrap().permissions()) & 0o777, 0o600);
     // a signer-held channel cannot be restored without the signer
+    drop(buyer);
     let e = client(&chain, &net).with_ledger(Box::new(FileClientLedger::open(&cl_path).unwrap())).err().unwrap();
     assert_eq!(e.code, "no_signer");
 }
