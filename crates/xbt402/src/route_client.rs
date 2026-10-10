@@ -537,9 +537,8 @@ impl RoutePayer {
         }
         let pubk = self.signer.new_key(&self.hub_url)?;
         let payer_spk = self.signer.payer_spk()?;
-        let lo = py_u64(ex.get("minExpiryBlocks")).unwrap_or(0) + 6;
-        let hi = py_u64(ex.get("maxExpiryBlocks")).unwrap_or(u64::MAX).saturating_sub(1);
-        let expiry = (self.height)()? + (self.cfg.expiry_blocks as u64).max(lo).min(hi) as u32;
+        let blocks = crate::funding::offer_expiry_blocks(&ex, self.cfg.expiry_blocks as u64)?;
+        let expiry = (self.height)()? + u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?;
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
@@ -570,7 +569,7 @@ impl RoutePayer {
     }
 
     /// ch1's `/open` channel object (no outpoint before the funding) and the hub's open URL.
-    fn open_req(&self, p: &ChannelParams, acc: &Value) -> (Value, String) {
+    fn open_req(&self, p: &ChannelParams, acc: &Value) -> Result<(Value, String)> {
         let mut c = json!({"capacity": p.capacity, "expiry": p.expiry, "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk),
                            "redeemScript": hex::encode(p.script())});
         if p.funding.is_some() {
@@ -581,14 +580,15 @@ impl RoutePayer {
             c["closeFeePayer"] = p.close_fee_payer.as_str().into();
         }
         let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
-        (c, format!("{}{}", self.hub_url, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH)))
+        // the hub names this URL: it stays on the hub's origin (AGP-080 X1)
+        Ok((c, crate::wire::seller_url(&self.hub_url, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH))?))
     }
 
     /// Ask the hub whether it opens ch1 on exactly these terms before anything is funded (review C2,
     /// AGP-073; [`crate::client::Client`] does the same with a provider). A hub from before the
     /// preflight answers `bad_request` (no outpoint): the open goes ahead.
     fn preflight(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
-        let (c, open_url) = self.open_req(p, acc);
+        let (c, open_url) = self.open_req(p, acc)?;
         match self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "preflight": true, "channel": c})) {
             Ok(r) if r.get("preflight") != Some(&Value::Bool(true)) => fail("bad_open", "the hub did not answer the open preflight"),
             Ok(r) if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() => {
@@ -601,7 +601,7 @@ impl RoutePayer {
     }
 
     fn post_open(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
-        let (c, open_url) = self.open_req(p, acc);
+        let (c, open_url) = self.open_req(p, acc)?;
         let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
         if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() {
             return fail("bad_fee_payer", "the hub opened the channel with another closeFeePayer");
@@ -623,6 +623,7 @@ impl RoutePayer {
     /// invoice (the hub never touches either).
     /// With a ledger, a session it holds for `url` is resumed instead (no new 402).
     pub fn shard(&self, url: &str, method: &str) -> Result<Arc<Shard>> {
+        crate::wire::no_fragment(url)?;
         if let Some(sh) = lk(&self.shards).get(url).cloned() {
             if self.ledger.is_some() {
                 return Ok(sh);
@@ -988,6 +989,7 @@ impl RoutePayer {
         let mut pl = pl.clone();
         pl["seq"] = ch.seq.into();
         let chan = ch.params.channel_id();
+        crate::wire::no_fragment(&self.hub_url)?;
         pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), body.as_bytes()))?.into();
         Ok(pl)
     }
@@ -1144,7 +1146,7 @@ impl RoutePayer {
             let st = lk(&self.st);
             let ch = st.ch.as_ref().ok_or_else(|| ChannelError::code("no_channel"))?;
             let cu = ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH).to_string();
-            (ch.params.channel_id(), format!("{}{cu}", self.hub_url))
+            (ch.params.channel_id(), crate::wire::seller_url(&self.hub_url, &cu)?)
         };
         let sig = hex::encode(self.signer.sign_close(&chan)?);
         self.post(&url, &json!({"chan": chan, "sig": sig}))

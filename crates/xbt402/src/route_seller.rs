@@ -911,7 +911,8 @@ impl Provider {
 
     /// Complete one adaptor-locked ch2 state (the ledger lock is held by the caller, and the hub's
     /// channel auth has passed). Checks the lock, completes it with the window's t, saves the plain
-    /// state write-ahead, and only then credits the session and returns t.
+    /// state write-ahead, and only then credits the session and returns t. Every `Ok` has written
+    /// `st` (and with it the seq the request spent); after an `Err` the caller writes it.
     ///
     /// ch2's cumulative amount is `next_cum(routed, d, min_amount)`: the routed total with the
     /// channel's floor, which the hub pre-pays once per channel and later locks use up. A lock the
@@ -936,6 +937,7 @@ impl Provider {
                 return fail("bad_invoice", "lockId already completed with other terms");
             }
             let routed = py_u64(st.extra.get("routed_sat")).unwrap_or(0);
+            self.save_state(l, st)?;                              // the seq this answer spent (AGP-078)
             return Ok(routes.lock_answer(&rs, &chan, routed, &lock_id, done));
         }
         let s = rs.sessions.get(&sid).cloned().ok_or_else(|| ChannelError::code("unknown_session"))?;
@@ -963,6 +965,7 @@ impl Provider {
         let amount = u64::try_from(amount).map_err(|_| ChannelError::new("bad_amount", "lock amount out of range"))?;
         if rs.no_reveal {
             rs.held.push(json!({"lockId": lock_id, "cum": cum.to_string().parse::<u64>().ok(), "pre": pl.get("adaptor"), "chan": chan}));
+            self.save_state(l, st)?;
             return Ok(json!({"held": lock_id}));
         }
         let routed = py_u64(st.extra.get("routed_sat")).unwrap_or(0);
@@ -1032,14 +1035,30 @@ impl Provider {
         if !self.authentic(&st, &pl, method, bind, body) {
             return err_json(401, "bad_auth", "");
         }
-        st.seq = py_u64(pl.get("seq")).unwrap_or(st.seq);
+        st.seq = py_u64(pl.get("seq")).unwrap_or(st.seq);        // spent, whatever happens next
         l.channels.insert(cid.clone(), st.clone());
+        let (resp, saved) = self.lock_authed(&mut l, &mut st, &pl, &route);
+        if !saved {
+            // AGP-078 (review T4): the seq is durable before any answer that did not write it
+            // leaves. Kept only in memory it came back after a restart, and the refused header
+            // authenticated again
+            if let Err(e) = self.save_state(&mut l, &st) {
+                return err_json(500, &e.code, &e.to_string());
+            }
+        }
+        resp
+    }
+
+    /// A `/lock` whose auth passed and whose seq is in `st`: the answer, and whether `st` was
+    /// written to disk on the way to it.
+    fn lock_authed(&self, l: &mut Ledger, st: &mut ChannelState, pl: &Value, route: &Value) -> (HttpResponse, bool) {
         let height = match self.height() {
             Ok(h) => h,
-            Err(e) => return err_json(500, "node_error", &e.to_string()),
+            Err(e) => return (err_json(500, "node_error", &e.to_string()), false),
         };
-        if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
-            return err_json(400, "channel_closing", "");
+        // AGP-084: nor on a ch2 whose close or rollover the node errored on (it can still confirm)
+        if crate::provider::closing(st) || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
+            return (err_json(400, "channel_closing", ""), false);
         }
         if st.suspended {
             // AGP-057: `suspended` is the watcher's last look, and a block that came during that look
@@ -1047,39 +1066,34 @@ impl Provider {
             // block, so it was no zero-conf child either). A hub looks at the chain itself before it
             // sends a lock: so do we before refusing one on an unconfirmed child
             let pending = st.extra.get("zero_conf").is_some_and(|z| z.is_object() && !crate::json::truthy(z.get("confirmed")));
-            if !(pending && matches!(self.zc_confirmed(&mut st, true), Ok(true))) {
-                return err_json(400, "unconfirmed", "");
+            if !(pending && matches!(self.zc_confirmed(st, true), Ok(true))) {
+                return (err_json(400, "unconfirmed", ""), false);
             }
             st.suspended = false;
-            let _ = self.save_state(&mut l, &st);
         }
         if let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object() && !crate::json::truthy(z.get("confirmed"))).cloned() {
             // AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
-            let Some(cum) = crate::json::py_int(pl.get("cum")) else { return err_json(400, "bad_payload", "") };
+            let Some(cum) = crate::json::py_int(pl.get("cum")) else { return (err_json(400, "bad_payload", ""), false) };
             let until = py_u64(zc.get("until")).unwrap_or(0);
             let max = py_u64(zc.get("maxCum")).unwrap_or(0);
             // past a bound: look at the chain first (it may have confirmed since the watcher's tick)
             if height as u64 >= until || cum > max as i128 {
-                match self.zc_confirmed(&mut st, true) {
-                    Ok(true) => {
-                        let _ = self.save_state(&mut l, &st);
-                    }
-                    Ok(false) if height as u64 >= until => return err_json(400, "unconfirmed", "rollover unconfirmed at the parent's close margin"),
-                    Ok(false) => return err_json(400, "zero_conf_cap", &format!("cum {cum} > {max} while the rollover is unconfirmed")),
-                    Err(e) => return err_json(500, "node_error", &e.to_string()),
+                match self.zc_confirmed(st, true) {
+                    Ok(true) => {}
+                    Ok(false) if height as u64 >= until => return (err_json(400, "unconfirmed", "rollover unconfirmed at the parent's close margin"), false),
+                    Ok(false) => return (err_json(400, "zero_conf_cap", &format!("cum {cum} > {max} while the rollover is unconfirmed")), false),
+                    Err(e) => return (err_json(500, "node_error", &e.to_string()), false),
                 }
             }
         }
-        match self.complete_lock(&mut l, &mut st, &pl, &route) {
+        // what the checks above changed (a child seen confirmed) is written with the seq: by
+        // complete_lock when it answers, by the caller when it refuses
+        match self.complete_lock(l, st, pl, route) {
             Ok(out) => {
-                l.channels.insert(cid, st);
                 let status = if out.get("held").is_some() { 202 } else { 200 };
-                HttpResponse::new(status, vec![("Content-Type".into(), "application/json".into())], dumps(&out))
+                (HttpResponse::new(status, vec![("Content-Type".into(), "application/json".into())], dumps(&out)), true)
             }
-            Err(e) => {
-                let _ = self.save_state(&mut l, &st);
-                err_json(400, &e.code, &e.to_string())
-            }
+            Err(e) => (err_json(400, &e.code, &e.to_string()), false),
         }
     }
 

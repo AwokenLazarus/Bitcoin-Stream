@@ -148,7 +148,8 @@ impl KeyStore {
 
     /// Open a sealed blob; refuses another format, another `aad`, another kdf, a wrong key or a
     /// tampered blob.
-    pub fn open(&self, blob: &Value, aad: &str) -> Result<Vec<u8>> {
+    /// The plaintext is wiped when the caller drops it (AGP-080 K1).
+    pub fn open(&self, blob: &Value, aad: &str) -> Result<Zeroizing<Vec<u8>>> {
         if blob.get("v").and_then(Value::as_i64) != Some(1) || blob.get("alg").and_then(Value::as_str) != Some("aes-256-gcm") {
             return Err(err("keystore", "unknown sealed-key format"));
         }
@@ -171,7 +172,7 @@ impl KeyStore {
                 .ok_or_else(|| err("keystore", format!("sealed blob log_n must be {SCRYPT_LOG_N_LEGACY}..={SCRYPT_LOG_N_MAX}")))? as u8,
         };
         let cipher = Aes256Gcm::new_from_slice(&*self.wrap_key(&salt, log_n)?).map_err(|_| err("keystore", "key length"))?;
-        cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: aad.as_bytes() })
+        cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: aad.as_bytes() }).map(Zeroizing::new)
             .map_err(|_| err("keystore", "cannot open sealed key: wrong wrapping key or tampered file"))
     }
 }
@@ -280,7 +281,7 @@ mod tests {
     fn seal_open_roundtrip_and_refusals() {
         let ks = KeyStore::with_key([7u8; 32]);
         let blob = ks.seal(b"secret", "b2/hot-key", None).unwrap();
-        assert_eq!(ks.open(&blob, "b2/hot-key").unwrap(), b"secret");
+        assert_eq!(ks.open(&blob, "b2/hot-key").unwrap().as_slice(), b"secret");
         assert!(ks.open(&blob, "b2/channel-keys").is_err());
         assert!(KeyStore::with_key([8u8; 32]).open(&blob, "b2/hot-key").is_err());
         let mut bad = blob.clone();
@@ -295,7 +296,7 @@ mod tests {
         let ks = KeyStore::with_passphrase(b"correct horse");
         let blob = ks.seal(b"x", "a", None).unwrap();
         assert_eq!(blob["kdf"], "scrypt");
-        assert_eq!(KeyStore::with_passphrase(b"correct horse").open(&blob, "a").unwrap(), b"x");
+        assert_eq!(KeyStore::with_passphrase(b"correct horse").open(&blob, "a").unwrap().as_slice(), b"x");
         assert!(KeyStore::with_passphrase(b"wrong").open(&blob, "a").is_err());
     }
 
@@ -315,7 +316,7 @@ mod tests {
         let old = KeyStore::with_key(*k15).seal(b"old", "a", Some(&salt)).unwrap();
         let mut old = old;
         old["kdf"] = "scrypt".into();
-        assert_eq!(KeyStore::with_passphrase(b"pw").open(&old, "a").unwrap(), b"old");
+        assert_eq!(KeyStore::with_passphrase(b"pw").open(&old, "a").unwrap().as_slice(), b"old");
         for bad in [14u64, 19, 30, 255] {
             let mut b = blob.clone();
             b["log_n"] = bad.into();

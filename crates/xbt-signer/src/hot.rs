@@ -51,6 +51,12 @@ pub struct HotKey {
     pub retired_at: f64,
 }
 
+impl Drop for HotKey {
+    fn drop(&mut self) {
+        self.secret.non_secure_erase(); // AGP-080 K1: every copy of a hot key is wiped when it goes
+    }
+}
+
 impl HotKey {
     pub fn new(secret: SecretKey, hrp: &str, retired_at: f64) -> Result<Self> {
         let pubkey = ecdsa::pubkey(&secret);
@@ -236,10 +242,10 @@ impl HotWallet {
         }
         match &self.keystore {
             None => {
-                d.insert("secret".into(), hex::encode(k.secret.secret_bytes()).into());
+                d.insert("secret".into(), hex::encode(zeroize::Zeroizing::new(k.secret.secret_bytes())).into());
             }
             Some(ks) => {
-                d.insert("sealed".into(), ks.seal(&k.secret.secret_bytes(), AAD, None)?);
+                d.insert("sealed".into(), ks.seal(&*zeroize::Zeroizing::new(k.secret.secret_bytes()), AAD, None)?);
             }
         }
         Ok(Value::Object(d))
@@ -252,13 +258,13 @@ impl HotWallet {
             SecretKey::from_slice(&b).map_err(|_| err("keystore", "hot key file: not a secret key"))?
         } else {
             let h = d.get("secret").and_then(Value::as_str).ok_or_else(|| err("keystore", "hot key file: no key"))?;
-            let b = hex::decode(h).map_err(|_| err("keystore", "hot key file: secret is not hex"))?;
-            let mut padded = [0u8; 32];
+            let b = zeroize::Zeroizing::new(hex::decode(h).map_err(|_| err("keystore", "hot key file: secret is not hex"))?);
+            let mut padded = zeroize::Zeroizing::new([0u8; 32]);
             if b.len() > 32 {
                 return Err(err("keystore", "hot key file: secret too long"));
             }
             padded[32 - b.len()..].copy_from_slice(&b);
-            SecretKey::from_slice(&padded).map_err(|_| err("keystore", "hot key file: not a secret key"))?
+            SecretKey::from_slice(&*padded).map_err(|_| err("keystore", "hot key file: not a secret key"))?
         };
         let retired_at = d.get("retired_at").and_then(Value::as_f64).unwrap_or(0.0);
         let k = HotKey::new(secret, &self.hrp, retired_at)?;
@@ -788,7 +794,7 @@ impl HotWallet {
             g.retired.push(old.clone());
             g.current = new.clone();
             self.persist_keys(&g)?; // the new key is on disk before any coin moves to it
-            (old.address.clone(), old.spk_hex(), new.address, new.spk, Self::retired_utxos(&g))
+            (old.address.clone(), old.spk_hex(), new.address.clone(), new.spk.clone(), Self::retired_utxos(&g))
         };
         let coins = self.spendable(&coins).0;
         let mut out = json!({"old_address": old_addr, "new_address": new_addr, "sweep": null});

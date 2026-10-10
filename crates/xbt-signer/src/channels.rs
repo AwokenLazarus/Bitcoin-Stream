@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 use xbt402::channel::{channel_auth_key, sign_with_type, ChannelParams, Payer};
 use xbt402::conditional::ConditionalParams;
 use xbt_primitives::ecdsa;
@@ -83,6 +84,11 @@ pub struct ChannelRecord {
     pub close_scan_from: i64,
     pub close_hex: String,
     pub close_fee_payer: String,
+    /// AGP-080: the channel was marked closed on its provider's word and our node has not shown
+    /// the funding spent. Such a record stays with the refund watcher and is not replaced by a new
+    /// channel. Not written when false, so a record keeps B2's field set.
+    #[serde(skip_serializing_if = "is_false")]
+    pub close_unproven: bool,
 }
 
 impl Default for ChannelRecord {
@@ -93,7 +99,7 @@ impl Default for ChannelRecord {
                closed_txid: String::new(), refund_txid: String::new(), open_height: 0, spent_sats: -1, open_url: String::new(),
                network: String::new(), min_conf: 0, funding_hex: String::new(), funding_height: 0, open_error: String::new(),
                last_sig: String::new(), acked_sats: 0, ledger_booked_sats: -1, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
-               close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into() }
+               close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into(), close_unproven: false }
     }
 }
 
@@ -101,8 +107,17 @@ fn ledger_booked_is_legacy(v: &i64) -> bool {
     *v < 0
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn has_lock(v: &Value) -> bool {
     v.as_object().is_some_and(|m| !m.is_empty())
+}
+
+/// A lock (pending or given up) that was booked when it was pre-signed (AGP-080).
+pub fn lock_booked(lk: &Value) -> bool {
+    crate::pyjson::truthy(lk.get("booked"))
 }
 
 fn lk_int(lk: &Value, k: &str) -> i64 {
@@ -127,6 +142,12 @@ impl ChannelRecord {
 
     pub fn has_pending_lock(&self) -> bool {
         has_lock(&self.pending_lock)
+    }
+
+    /// Sats of this channel the policy ledger holds: the highest amount any signature that left
+    /// this book commits the channel to. `-1` is a pre-AGP-063 record: `used_sats` counts as booked.
+    pub fn booked_through(&self) -> i64 {
+        if self.ledger_booked_sats < 0 { self.used_sats } else { self.ledger_booked_sats }
     }
 
     pub fn public(&self) -> Value {
@@ -183,6 +204,21 @@ struct Inner {
     secrets: HashMap<String, SecretKey>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for s in self.secrets.values_mut() {
+            s.non_secure_erase(); // K1: payer keys do not outlive the book in memory
+        }
+    }
+}
+
+/// Forget a payer key: wiped, then dropped.
+fn wipe(secret: Option<SecretKey>) {
+    if let Some(mut s) = secret {
+        s.non_secure_erase();
+    }
+}
+
 pub struct ChannelBook {
     pub records_path: PathBuf,
     pub keys_path: PathBuf,
@@ -198,11 +234,11 @@ pub struct ChannelBook {
 }
 
 /// The keys file's plaintext document: every secret, sorted by channel.
-fn keys_doc(g: &Inner) -> String {
+fn keys_doc(g: &Inner) -> Zeroizing<String> {
     let mut secrets: Vec<(&String, String)> = g.secrets.iter().map(|(k, v)| (k, secret_hex(v))).collect();
     secrets.sort();
     let sm: serde_json::Map<String, Value> = secrets.into_iter().map(|(k, v)| (k.clone(), v.into())).collect();
-    dumps_indent(&json!({"secrets": sm}), 2, false)
+    Zeroizing::new(dumps_indent(&json!({"secrets": sm}), 2, false))
 }
 
 fn doc_hash(doc: &str) -> [u8; 32] {
@@ -325,7 +361,7 @@ impl ChannelBook {
         let mut on_disk = self.keys_seen();
         if *on_disk != Some(hash) {
             let out = match &self.keystore {
-                Some(ks) => dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false),
+                Some(ks) => Zeroizing::new(dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false)),
                 None => doc,
             };
             write_private(&self.keys_path, &out)?;
@@ -339,6 +375,21 @@ impl ChannelBook {
             body["archived"] = g.archived.clone().into();
         }
         write_private(&self.records_path, &dumps_indent(&body, 2, true))
+    }
+
+    /// `(chan, key, sats, hub, lockId, at)` for every lock a record holds (pending or given up)
+    /// that was pre-signed as booked (AGP-080): what the ledgers must hold for it.
+    pub fn presigned_bookings(&self) -> Vec<(String, Value)> {
+        let g = self.lock();
+        let mut out = vec![];
+        for r in g.records.values() {
+            for lk in std::iter::once(&r.pending_lock).chain(r.given_up.iter()).filter(|lk| lock_booked(lk) && lk_int(lk, "booked_sats") > 0) {
+                let s = |k: &str| lk.get("route").and_then(|x| x.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
+                out.push((r.chan.clone(), json!({"key": format!("lock:{}:{}", r.chan, lk_int(lk, "cum")), "amount": lk_int(lk, "booked_sats"),
+                                                 "hub": s("hub"), "lockId": s("lockId"), "at": lk.get("at").cloned().unwrap_or(Value::Null)})));
+            }
+        }
+        out
     }
 
     /// `(chan, booking)` for the resolved locks every record still remembers, whatever its state.
@@ -530,7 +581,7 @@ impl ChannelBook {
     pub fn issue_key(&self, origin: &str) -> Result<String> {
         let (s, pubk) = self.new_payer_key();
         let mut g = self.lock();
-        g.secrets.insert(format!("pending:{origin}"), s);
+        wipe(g.secrets.insert(format!("pending:{origin}"), s)); // an issued key never used is replaced
         self.persist(&g)?;
         Ok(pubk)
     }
@@ -569,6 +620,7 @@ impl ChannelBook {
             if old.state == "open" || old.state == "pending" {
                 return Err(err(&format!("channel_{}", old.state), format!("{dest} already has a {} channel {}", old.state, &old.chan[..old.chan.len().min(16)])));
             }
+            Self::replaceable(&old)?;
             g.archived.push(serde_json::to_value(&old).unwrap_or(Value::Null));
         }
         let mut rec = Self::record_of(dest, p, origin, cap_sats, open_height);
@@ -592,7 +644,7 @@ impl ChannelBook {
             _ => return Ok(()),
         }
         g.records.shift_remove(dest);
-        g.secrets.remove(chan);
+        wipe(g.secrets.remove(chan));
         if g.archived.last().and_then(|a| a.get("dest")).and_then(Value::as_str) == Some(dest) {
             let a = g.archived.pop().unwrap();
             if let Ok(r) = serde_json::from_value::<ChannelRecord>(a) {
@@ -629,17 +681,28 @@ impl ChannelBook {
         self.persist(&g)
     }
 
+    /// AGP-080: a closed record whose close our node has not shown is not archived: an archived
+    /// record is no longer watched, and its funding may still need the refund.
+    fn replaceable(old: &ChannelRecord) -> Result<()> {
+        if old.state == "closed" && old.close_unproven {
+            return Err(err("close_unproven", format!("the close of channel {} is not on this node yet: its funding may still need a refund, so it is not replaced",
+                                                     &old.chan[..old.chan.len().min(16)])));
+        }
+        Ok(())
+    }
+
     /// A channel funded and opened elsewhere (the external client and routing paths): open at once.
     pub fn add_funded(&self, dest: &str, secret: SecretKey, p: &ChannelParams, origin: &str, cap_sats: Option<i64>, open_height: i64) -> Result<ChannelRecord> {
         let rec = Self::record_of(dest, p, origin, cap_sats, open_height);
         let mut g = self.lock();
         if let Some(old) = g.records.get(dest).cloned() {
-            if old.state == "pending" {
-                return Err(err("channel_pending", format!("{dest} has a pending channel {}", &old.chan[..old.chan.len().min(16)])));
+            // AGP-080: a live record is never overwritten: its funding would leave the refund watcher
+            if old.state == "pending" || old.state == "open" {
+                return Err(err(&format!("channel_{}", old.state), format!("{dest} has {} channel {}", if old.state == "open" { "an open" } else { "a pending" },
+                                                                         &old.chan[..old.chan.len().min(16)])));
             }
-            if old.state != "open" {
-                g.archived.push(serde_json::to_value(&old).unwrap_or(Value::Null));
-            }
+            Self::replaceable(&old)?;
+            g.archived.push(serde_json::to_value(&old).unwrap_or(Value::Null));
         }
         g.records.insert(dest.into(), rec.clone());
         g.secrets.insert(p.channel_id(), secret);
@@ -759,7 +822,11 @@ impl ChannelBook {
 
     /// Pre-sign state(cum) under `T1 = T + r·G` (`point` = T, the provider's invoice point; r fresh
     /// here). One pending lock per channel; (lock, r, T) are persisted before this returns.
-    pub fn sign_state_adaptor(&self, dest: &str, cum: i64, point: &str, route: Value, a: &dyn AdaptorScheme) -> Result<Value> {
+    /// `booked` (AGP-080): the sats the caller books for this lock before the pre-signature
+    /// leaves it (`Some(0)`: all of it is booked already). They are written with the lock, so a
+    /// start after a crash books a lock the record holds and the ledgers do not, and resolving a
+    /// lock so marked books nothing more. `None`: booked when it resolves (the pre-AGP-080 way).
+    pub fn sign_state_adaptor(&self, dest: &str, cum: i64, point: &str, route: Value, a: &dyn AdaptorScheme, booked: Option<i64>) -> Result<Value> {
         let mut g = self.lock();
         let k = Self::key_of(&g, dest)?;
         let mut rec = g.records[&k].clone();
@@ -786,6 +853,11 @@ impl ChannelBook {
         let t1_hex = hex::encode(t1.serialize());
         rec.pending_lock = json!({"cum": cum, "pre": pre, "r": secret_hex(&r), "T": point.to_lowercase(), "T1": t1_hex,
                                   "route": route, "prev_used": rec.used_sats, "at": ts_value((now_f64() * 1000.0).round() / 1000.0)});
+        if let Some(sats) = booked {
+            rec.pending_lock["booked"] = true.into();
+            rec.pending_lock["booked_sats"] = sats.into();
+            rec.ledger_booked_sats = rec.ledger_booked_sats.max(cum);
+        }
         let mut pre_bytes = hex::decode(pre.get("R").and_then(Value::as_str).unwrap_or("")).unwrap_or_default();
         pre_bytes.extend(hex::decode(pre.get("s1").and_then(Value::as_str).unwrap_or("")).unwrap_or_default());
         audit_rec(&self.audit, "adaptor_presig", &pre_bytes, &rec.chan, &rec.dest,
@@ -829,7 +901,8 @@ impl ChannelBook {
         rec.last_sig.clear();
         rec.pending_lock = json!({});
         let route = lk.get("route").cloned().unwrap_or(json!({}));
-        let booking = note_resolved(rec, cum, cum - lk_int(&lk, "prev_used"), &route);
+        // a lock booked when it was pre-signed has nothing left to book (AGP-080)
+        let booking = if lock_booked(&lk) { Value::Null } else { note_resolved(rec, cum, cum - lk_int(&lk, "prev_used"), &route) };
         self.persist(&g)?;
         Ok(json!({"t": hex::encode(t), "cum": cum, "amount": cum - lk_int(&lk, "prev_used"), "route": route, "booking": booking}))
     }
@@ -841,8 +914,14 @@ impl ChannelBook {
         let rec = g.records.get_mut(&k).unwrap();
         let lk = std::mem::replace(&mut rec.pending_lock, json!({}));
         if has_lock(&lk) {
-            rec.given_up.push(json!({"cum": lk_int(&lk, "cum"), "prev_used": lk_int(&lk, "prev_used"),
-                                     "route": lk.get("route").cloned().unwrap_or(json!({})), "at": ts_value((now_f64() * 1000.0).round() / 1000.0)}));
+            let mut gu = json!({"cum": lk_int(&lk, "cum"), "prev_used": lk_int(&lk, "prev_used"),
+                                "route": lk.get("route").cloned().unwrap_or(json!({})), "at": ts_value((now_f64() * 1000.0).round() / 1000.0)});
+            if lock_booked(&lk) {
+                // the booking stays: the hub still holds the pre-signature
+                gu["booked"] = true.into();
+                gu["booked_sats"] = lk_int(&lk, "booked_sats").into();
+            }
+            rec.given_up.push(gu);
             let n = rec.given_up.len();
             if n > 16 {
                 rec.given_up.drain(..n - 16);
@@ -868,7 +947,7 @@ impl ChannelBook {
         rec.spent_sats = rec.spent().max(cum);
         rec.acked_sats = rec.used_sats;
         let route = gu.get("route").cloned().unwrap_or(json!({}));
-        let booking = if amount != 0 { note_resolved(rec, cum, amount, &route) } else { Value::Null };
+        let booking = if amount != 0 && !lock_booked(&gu) { note_resolved(rec, cum, amount, &route) } else { Value::Null };
         self.persist(&g)?;
         Ok(json!({"cum": cum, "amount": amount, "route": route, "booking": booking}))
     }
@@ -982,6 +1061,48 @@ impl ChannelBook {
             }
         }
         self.persist(&g)
+    }
+
+    /// Closed channels whose close our node has not shown (AGP-080): still the watcher's.
+    pub fn unproven_close_records(&self) -> Vec<ChannelRecord> {
+        self.filtered(|r| r.state == "closed" && r.close_unproven)
+    }
+
+    /// Record whether our node shows a closed channel's funding spent, and by which transaction.
+    pub fn note_close_proof(&self, key: &str, proven: bool, spender: &str) -> Result<()> {
+        let mut g = self.lock();
+        let k = Self::key_of(&g, key)?;
+        let rec = g.records.get_mut(&k).unwrap();
+        if rec.state != "closed" {
+            return Ok(());
+        }
+        let before = (rec.close_unproven, rec.closed_txid.clone());
+        rec.close_unproven = !proven;
+        if proven && !spender.is_empty() {
+            rec.closed_txid = spender.into(); // the transaction that spent the funding, not a reported one
+        }
+        if before != (rec.close_unproven, rec.closed_txid.clone()) {
+            self.persist(&g)?;
+        }
+        Ok(())
+    }
+
+    /// A channel marked closed whose funding is still unspent was never closed: open again, so
+    /// the refund can take it.
+    pub fn reopen_unproven(&self, key: &str) -> Result<()> {
+        let mut g = self.lock();
+        let k = Self::key_of(&g, key)?;
+        let rec = g.records.get_mut(&k).unwrap();
+        if rec.state == "closed" && rec.close_unproven {
+            rec.state = "open".into();
+            rec.close_unproven = false;
+            rec.closed_txid.clear();
+            rec.close_change.clear();
+            rec.close_hex.clear();
+            rec.close_scan_from = 0;
+            self.persist(&g)?;
+        }
+        Ok(())
     }
 
     pub fn note_close_change(&self, key: &str, change: &Value) -> Result<()> {

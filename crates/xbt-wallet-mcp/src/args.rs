@@ -40,7 +40,9 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
                                    opt("max_sats", Ty::Int, || Value::from(1000))];
     static COUNTERPARTY: [Arg; 1] = [req("counterparty", Ty::Str)];
     static TXID: [Arg; 1] = [req("txid", Ty::Str)];
-    static LN_PAY: [Arg; 3] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty)];
+    // AGP-082: amount_sats, for a BOLT 12 offer that names no amount (0: not given)
+    static LN_PAY: [Arg; 4] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty),
+                               opt("amount_sats", Ty::Int, || Value::from(0))];
     Some(match tool {
         "balance" | "channels" | "forward_status" => &[],
         "quote_payment" | "pay" => &PAYMENT,

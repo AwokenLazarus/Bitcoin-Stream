@@ -186,3 +186,76 @@ fn the_shared_slowloris_checks_pass_on_the_bare_server() {
     const OK: &str = "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n";
     slowloris::an_endless_header_line_is_refused(&a, OK);
 }
+
+/// Connections that sent half a head and wait: each holds a connection slot until the head deadline.
+fn hold(addr: &str, n: usize) -> Vec<TcpStream> {
+    (0..n)
+        .map(|_| {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET /x HTTP/1.1\r\nHost: h\r\n").unwrap();
+            s
+        })
+        .collect()
+}
+
+/// AGP-081 (review T1): the connection cap was one global number, so one address holding every slot
+/// kept every other client at 503. An address gets at most `Limits::per_address` of them.
+#[test]
+fn one_address_cannot_hold_every_connection() {
+    let limits = xbt_svc::http::Limits::default();
+    assert!(limits.per_address > 0 && limits.per_address < limits.connections);
+    // dual-stack where the host has IPv6: a 127.0.0.1 client and a ::1 client are two addresses
+    let (l, v6) = match TcpListener::bind("[::]:0") {
+        Ok(l) => {
+            let v6 = TcpStream::connect(("::1", l.local_addr().unwrap().port())).is_ok();
+            (l, v6)
+        }
+        Err(_) => (TcpListener::bind("127.0.0.1:0").unwrap(), false),
+    };
+    let run = serve(Arc::new(T), l, 2).unwrap();
+    let port = run.addr.port();
+    let v4 = format!("127.0.0.1:{port}");
+    std::thread::sleep(Duration::from_millis(100)); // the probe connection above is gone
+    let held = hold(&v4, limits.connections);
+    std::thread::sleep(Duration::from_millis(300));
+    // the address is at its cap: its next connection is refused, with slots still free
+    let r = raw(&v4, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(
+        r.starts_with("HTTP/1.1 503 "),
+        "one address took more than its share: {r:?}"
+    );
+    if v6 {
+        let r = raw(
+            &format!("[::1]:{port}"),
+            b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n",
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 200 OK\r\n"),
+            "another address was shut out by one address's connections: {r:?}"
+        );
+    } else {
+        eprintln!(
+            "no IPv6 loopback here: the second-address half ran only as the unit test in http.rs"
+        );
+    }
+    // its slots come back when its connections end
+    drop(held);
+    std::thread::sleep(Duration::from_millis(300));
+    let r = raw(&v4, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r:?}");
+    run.stopper().stop();
+}
+
+/// AGP-081 (review T2): a request target with a `#` is refused before any handler sees it.
+#[test]
+fn a_target_with_a_fragment_is_refused() {
+    let (_run, a) = start();
+    for t in ["/x#y", "/x?a=1#y", "/#", "#"] {
+        let r = raw(
+            &a,
+            format!("GET {t} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes(),
+        );
+        assert!(r.starts_with("HTTP/1.1 400 "), "{t}: {r:?}");
+    }
+    assert!(raw(&a, b"GET /x?a=%23 HTTP/1.1\r\nHost: h\r\n\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
+}

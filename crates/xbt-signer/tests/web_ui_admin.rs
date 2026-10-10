@@ -231,7 +231,7 @@ fn the_signed_rotation_and_the_backup_export() {
     let opened = xbt_signer::keystore::KeyStore::with_passphrase(b"correct horse battery")
         .open(&doc["wrapping_sealed"], "xbt-agentwallet-backup-wrapping").unwrap();
     let want = if key.len() == 32 { key } else { hex::decode(String::from_utf8(key).unwrap().trim()).unwrap() };
-    assert_eq!(opened, want, "the backup's wrapping secret opens with the backup passphrase");
+    assert_eq!(*opened, want, "the backup's wrapping secret opens with the backup passphrase");
     assert!(xbt_signer::keystore::KeyStore::with_passphrase(b"wrong horse battery").open(&doc["wrapping_sealed"], "xbt-agentwallet-backup-wrapping").is_err());
 }
 

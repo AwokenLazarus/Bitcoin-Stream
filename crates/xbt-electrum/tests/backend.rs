@@ -604,3 +604,114 @@ fn hostile_cheap_fork_is_not_believed() {
     assert_eq!(e.kind, Kind::Implausible);
     assert!(e.msg.contains("implausibly low"), "{e}");
 }
+
+// --- AGP-081: one server can no longer stall or exhaust the client (closure audit, review E1) ----
+
+/// A server that serves the real chain one header per answer, each just inside the timeout, held
+/// the whole sync round and was never flagged. The first answer with fewer headers than asked ends
+/// its part of the round, with the headers it did serve kept.
+#[test]
+fn a_trickled_header_sync_is_cut_off_and_flagged() {
+    let chain = sim(CHECKPOINT + 120);
+    let trickler = FakeElectrum::start(chain.clone(), false);
+    {
+        let mut k = trickler.knobs();
+        k.headers_per_answer = Some(1);
+        k.delay_headers_ms = 100;
+    }
+    let b = backend(&chain, &[&trickler]);
+    let t = Instant::now();
+    assert_eq!(b.block_count().unwrap(), CHECKPOINT + 1, "the one header it served is kept");
+    assert!(t.elapsed() < Duration::from_secs(2), "the trickle held the round for {:?}", t.elapsed());
+    assert!(b.flags().iter().any(|f| f.server == trickler.url() && f.reason.contains("withheld headers")), "{:?}", b.flags());
+    let asked = trickler.calls.lock().unwrap().iter().filter(|m| *m == "blockchain.block.headers").count();
+    assert!(asked <= 2, "{asked} header requests in one round");
+    // beside an honest server the tip arrives at once (the trickler is asked for nothing we hold)
+    let honest = FakeElectrum::start(chain.clone(), false);
+    let b = backend(&chain, &[&trickler, &honest]);
+    let t = Instant::now();
+    assert_eq!(b.block_count().unwrap(), CHECKPOINT + 120);
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
+
+/// One server's part of a sync round ends at the deadline, however slowly it answers inside the
+/// request timeout.
+#[test]
+fn a_slow_header_sync_ends_at_its_deadline() {
+    let chain = sim(CHECKPOINT + 50);
+    let slow = FakeElectrum::start(chain.clone(), false);
+    let mut c = cfg(&chain, &[&slow]);
+    c.timeout = Duration::from_secs(5);
+    c.sync_deadline = Some(Duration::from_millis(300));
+    let b = ElectrumBackend::new(c).unwrap();
+    assert_eq!(b.block_count().unwrap(), CHECKPOINT + 50);
+    slow.knobs().delay_headers_ms = 2_000;
+    chain.lock().unwrap().mine(3);
+    let t = Instant::now();
+    assert_eq!(b.sync(true).unwrap(), CHECKPOINT + 50, "nothing new was proven in time");
+    assert!(t.elapsed() < Duration::from_millis(1_500), "the round ran {:?} past a 300 ms deadline", t.elapsed());
+    assert!(b.flags().iter().any(|f| f.reason.contains("sync deadline")), "{:?}", b.flags());
+    slow.knobs().delay_headers_ms = 0;
+    assert_eq!(b.sync(true).unwrap(), CHECKPOINT + 53);
+}
+
+/// A line is held to what the waiting requests allow before it is parsed: a long one is cut off
+/// while it arrives, a short dense one (many values) is refused whole. Either drops the server.
+#[test]
+fn an_oversized_line_is_dropped_before_it_is_parsed() {
+    let chain = sim(150);
+    let s = servers(&chain, 1);
+    let b = backend(&chain, &[&s[0]]);
+    assert_eq!(b.block_count().unwrap(), 150);
+    for (what, line) in [("bytes", "[],".repeat(4 << 20 >> 2)), ("JSON values", "0,".repeat(5_000))] {
+        let line = format!("[{}0]", line);
+        s[0].knobs().line_before = Some(("blockchain.estimatefee".into(), Arc::new(line.into_bytes())));
+        let e = b.estimate_fee(6).expect_err("a line no request allows was read and parsed");
+        assert_eq!(e.kind, Kind::Unreachable, "{e}");
+        assert!(b.flags().iter().any(|f| f.reason.contains("a line over the limit") && f.reason.contains(what)), "{what}: {:?}", b.flags());
+        // dropped, not trusted less: the next request reconnects
+        s[0].knobs().line_before = None;
+        assert!(b.estimate_fee(6).unwrap().feerate.is_some());
+    }
+    // and the calls that follow are answered as before
+    let fund = spk(0x31);
+    let f = chain.lock().unwrap().credit(0, 50_000, &fund, true);
+    assert!(b.tx_out(&f, 0, false).unwrap().is_some());
+}
+
+/// Invented history entries cost a bounded number of fetches and are flagged: a history over
+/// MAX_HISTORY entries is not used at all, and an entry that neither pays nor spends the script
+/// flags the server that listed it.
+#[test]
+fn an_invented_history_is_bounded_and_flagged() {
+    use xbt_electrum::conn::MAX_HISTORY;
+    use xbt_electrum::sim::coinbase;
+    let chain = sim(200);
+    let fund = spk(0x41);
+    let f = chain.lock().unwrap().credit(0, 70_000, &fund, true);
+    let sh = scripthash(&fund);
+    let gets = |s: &Arc<FakeElectrum>| s.calls.lock().unwrap().iter().filter(|m| *m == "blockchain.transaction.get").count();
+    let (liar, honest) = (FakeElectrum::start(chain.clone(), false), FakeElectrum::start(chain.clone(), false));
+    // 50 real-looking transactions that have nothing to do with the script
+    {
+        let mut k = liar.knobs();
+        let invented: Vec<_> = (0..50).map(|n| coinbase(1_000_000 + n, 9)).collect();
+        k.extra_history.insert(sh.clone(), invented.iter().map(|t| (t.txid(), 150)).collect());
+        k.invented = invented.into_iter().map(|t| (t.txid(), t)).collect();
+    }
+    let b = backend(&chain, &[&liar, &honest]);
+    assert!(b.tx_out(&f, 0, false).unwrap().is_some());
+    assert!(b.flags().iter().any(|fl| fl.server == liar.url() && fl.reason.contains("neither pays nor spends")), "{:?}", b.flags());
+    assert!(!b.flags().iter().any(|fl| fl.server == honest.url()), "{:?}", b.flags());
+    // more entries than any script we answer for: the answer is not used, nothing in it is fetched
+    liar.knobs().extra_history.insert(sh.clone(), (0..MAX_HISTORY as u32 + 1).map(|n| (coinbase(2_000_000 + n, 9).txid(), 150)).collect());
+    let b = backend(&chain, &[&liar, &honest]);
+    let before = gets(&liar) + gets(&honest);
+    assert!(b.tx_out(&f, 0, false).unwrap().is_some(), "the honest server's history still answers");
+    assert!(b.flags().iter().any(|fl| fl.server == liar.url() && fl.reason.contains("at most")), "{:?}", b.flags());
+    assert!(gets(&liar) + gets(&honest) - before < 20, "{} fetches for an unusable history", gets(&liar) + gets(&honest) - before);
+    // with no other server, the call fails: it is never answered from an empty history
+    let b = backend(&chain, &[&liar]);
+    let e = b.tx_out(&f, 0, false).expect_err("answered from a history no server gave");
+    assert_eq!(e.kind, Kind::Unreachable, "{e}");
+}

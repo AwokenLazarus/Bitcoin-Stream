@@ -188,5 +188,21 @@ mod tests {
         for n in LN_TOOL_NAMES {
             assert!(crate::args::spec(n).is_some() && !FORBIDDEN.contains(&n));
         }
+        // AGP-082: the published schema of each LN tool names exactly the arguments the server takes
+        let listed = tools_for(true);
+        for t in listed["tools"].as_array().unwrap().iter().filter(|t| LN_TOOL_NAMES.contains(&t["name"].as_str().unwrap())) {
+            let spec = crate::args::spec(t["name"].as_str().unwrap()).unwrap();
+            let mut props: Vec<&str> = t["inputSchema"]["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            let mut args: Vec<&str> = spec.iter().map(|a| a.name).collect();
+            props.sort_unstable();
+            args.sort_unstable();
+            assert_eq!(props, args, "{}", t["name"]);
+            let required: Vec<&str> = spec.iter().filter(|a| a.default.is_none()).map(|a| a.name).collect();
+            let listed: Vec<&str> = t["inputSchema"].get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            assert_eq!(required, listed, "{}", t["name"]);
+        }
+        let ln_pay = &listed["tools"][10];
+        assert!(ln_pay["description"].as_str().unwrap().contains("ln-offer:<offer id>"));
+        assert_eq!(ln_pay["inputSchema"]["properties"]["amount_sats"]["default"], 0);
     }
 }

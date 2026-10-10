@@ -173,7 +173,7 @@ fn main() {
     println!("== hub funds one channel per provider process from its own wallet (providers open nothing)");
     let committed0 = hub.committed_sat();
     for n in NAMES {
-        let cap = if n == "D" { 30_000 } else { 150_000 };
+        let cap = if n == "D" { 40_000 } else { 150_000 };
         let oc = hub.connect(&urls[n], Some(cap), None).expect("connect");
         println!("   ch2 hub->{n}: {}... capacity {}", &oc.params.channel_id()[..20], oc.params.capacity);
     }
@@ -183,7 +183,7 @@ fn main() {
     ck.check("hub-funded ch2 open to all 4 providers", opened.len() == 4, opened.join(","));
     ck.check("one ch2 per provider process: A and B (one payTo key, two ledgers) have a ch2 each, 4 funded",
              ch2("A").params.channel_id() != ch2("B").params.channel_id() && hub.out_channels().len() == 4
-             && hub.committed_sat() - committed0 == 150_000 * 3 + 30_000
+             && hub.committed_sat() - committed0 == 150_000 * 3 + 40_000
              && provs["B"].channel_state(&ch2("B").params.channel_id()).is_some()
              && provs["A"].channel_state(&ch2("B").params.channel_id()).is_none(),
              format!("{} ch2s, {} sat committed", hub.out_channels().len(), hub.committed_sat() - committed0));

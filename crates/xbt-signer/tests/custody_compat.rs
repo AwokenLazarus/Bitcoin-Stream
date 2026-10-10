@@ -29,9 +29,9 @@ fn keyfile(v: &Value) -> KeyStore {
 #[test]
 fn opens_b2_sealed_blobs() {
     let v = vectors();
-    assert_eq!(keyfile(&v).open(&v["blobs"]["keyfile"], "b2/test").unwrap(), b"hello rust");
+    assert_eq!(keyfile(&v).open(&v["blobs"]["keyfile"], "b2/test").unwrap().as_slice(), b"hello rust");
     let kp = KeyStore::with_passphrase(v["passphrase"].as_str().unwrap().as_bytes());
-    assert_eq!(kp.open(&v["blobs"]["passphrase"], "b2/test").unwrap(), b"hello rust");
+    assert_eq!(kp.open(&v["blobs"]["passphrase"], "b2/test").unwrap().as_slice(), b"hello rust");
     assert!(KeyStore::with_passphrase(b"wrong").open(&v["blobs"]["passphrase"], "b2/test").is_err());
     assert!(keyfile(&v).open(&v["blobs"]["keyfile"], "b2/hot-key").is_err(), "the AAD binds the blob to its file");
 }
@@ -174,8 +174,8 @@ fn opens_a_b2_routed_wallet_books_its_unbooked_lock_once_and_resolves_its_pendin
 
 /// The reverse: the Rust signer writes the same kind of directory (plus the ledger lines only it
 /// writes: a Lightning booking amended, and one dropped), and `vectors/rust_routed_wallet.json`
-/// holds it for B2 (b2 `tests/test_agp055_rust_wallet.py` opens a copy). `XBT_GEN_VECTORS=1`
-/// rewrites the vector; without it the same steps run and are checked here.
+/// holds the directory these steps wrote before AGP-080 for B2 (b2 `tests/test_agp055_rust_wallet.py`
+/// opens a copy). The steps still run and are checked here; the vector is not rewritten (see the end).
 #[test]
 fn writes_a_routed_wallet_for_b2() {
     let v = vectors();
@@ -211,7 +211,9 @@ fn writes_a_routed_wallet_for_b2() {
     let o2 = rs.sign_state_adaptor(chan, 1_500, &pt(&t(2)), route(499, "L2")).unwrap();
     book.resolve_lock(hub, &y(&t(2), &o2)).unwrap(); // on disk, and the process dies before its rows
     let o3 = rs.sign_state_adaptor(chan, 1_800, &pt(&t(3)), route(299, "L3")).unwrap();
-    assert_eq!((rs.spend.since(0.0), lock_txids(&engine).len(), book.get(hub).unwrap().resolved.len()), (1_000, 1, 2));
+    // AGP-080: every lock is in both ledgers from the moment it is pre-signed, so a resolve has
+    // nothing left to book and the record remembers no unbooked one
+    assert_eq!((rs.spend.since(0.0), lock_txids(&engine).len(), book.get(hub).unwrap().resolved.len()), (1_800, 3, 0));
     let read = |f: &str| std::fs::read_to_string(d.path().join(f)).unwrap();
     let doc = json!({
         "generator": "cargo test -p xbt-signer --test custody_compat writes_a_routed_wallet_for_b2 (XBT_GEN_VECTORS=1)",
@@ -225,8 +227,9 @@ fn writes_a_routed_wallet_for_b2() {
         "pending": {"cum": 1800, "amount": 300, "adaptor": o3["adaptor"], "secret": y(&t(3), &o3), "t": hex::encode(t(3).secret_bytes())},
     });
     assert!(doc["ledger.payments.jsonl"].as_str().unwrap().contains("{\"amend\":\"ln:bb\",\"amount_sats\":null}\n"));
-    if std::env::var("XBT_GEN_VECTORS").is_ok_and(|x| x == "1") {
-        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vectors/rust_routed_wallet.json");
-        std::fs::write(p, xbt_signer::pyjson::dumps_indent(&doc, 1, true) + "\n").unwrap();
-    }
+    // `vectors/rust_routed_wallet.json` was written by these steps before AGP-080, when a lock was
+    // booked at its resolve: it holds a resolved lock with no rows ("unbooked"), which this signer
+    // no longer produces. It is kept as written: both signers must still open such a wallet and
+    // book that lock at start (b2 `tests/test_agp055_rust_wallet.py`), so it is not regenerated.
+    assert_eq!(doc["pending"]["cum"], 1800);
 }

@@ -710,6 +710,42 @@ fn ht_a_close_fee_within_both_bounds_is_funded_and_fair_expiry_clamped() {
     assert_eq!(oc.params.expiry, chain.height() + 2_000); // the hub's max, not the provider's 8640
 }
 
+/// AGP-076: a ch2 opens with minExpiryBlocks + minConf + closeMarginBlocks blocks at least, each from
+/// the provider's /terms (`funding::open_expiry_floor`): its funding has that long to confirm before
+/// the provider's `left >= minExpiryBlocks` check, made at its tip when the funded open arrives.
+fn ch2_blocks(extra: Value) -> u32 {
+    let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
+    let origin = "http://ok.test";
+    let prov = provider(&chain, &net, &dir, origin); // minExpiryBlocks 500, minConf 1, closeMarginBlocks 36
+    wrap(&net, origin, &prov, terms_edit(extra));
+    let mut cfg = hub_cfg();
+    cfg.ch2_expiry_blocks = 100; // below every floor here
+    cfg.ch2_max_expiry_blocks = 2_000;
+    let h = RouteHub::new(chain.clone(), chain.clone(), Box::new(ChainWallet(chain.clone())), Box::new(NetTransport(net.clone())), sk(0x4B4B), NET,
+                          Some(&dir.0.join("hub")), cfg).unwrap();
+    let before = chain.height();
+    let oc = h.connect(origin, None, None).unwrap();
+    oc.params.expiry - before
+}
+
+#[test]
+fn ht_ch2_expiry_floor_is_the_terms_min_expiry_plus_min_conf_plus_close_margin() {
+    // three margins, three answers: a slack that mirrors one provider's default fails two of them
+    assert_eq!(ch2_blocks(json!({})), 500 + 1 + 36);
+    assert_eq!(ch2_blocks(json!({"closeMarginBlocks": 144})), 500 + 1 + 144);
+    assert_eq!(ch2_blocks(json!({"closeMarginBlocks": 5, "minConf": 0})), 500 + 5);
+}
+
+#[test]
+fn ht_close_margin_1e6() {
+    assert!(hostile(json!({"closeMarginBlocks": 1_000_000}), hub_cfg()).contains("minExpiryBlocks + minConf + closeMarginBlocks"));
+}
+
+#[test]
+fn ht_close_margin_not_a_number() {
+    assert!(hostile(json!({"closeMarginBlocks": null}), hub_cfg()).contains("malformed /terms: closeMarginBlocks"));
+}
+
 // --- 6 refill hook ------------------------------------------------------------------------------------
 
 #[test]

@@ -1,0 +1,356 @@
+{
+ "chains": {
+  "mainnet": "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000",
+  "regtest": "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+ },
+ "invoices": [
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9z52329g4z52329g4z52329g4zq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcv4qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pa2yzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkppqwa0w6yupg6437mqgkysx65dre9kshvsnahqutrqrzs5qjdwvnkzdgy3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqspwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxgqqsqsyqcy5gwqqqqraqqqqqryqq5qqqqqqqqqqqqpqqqqqp8rk2fqqqqq5szx4vfmw6nqyrss4qs89ntwss3vgplmd5ycdy83zv9hmmt7ctmltcwnp0va2g0sz5mr0ya2qvpapy9wgyqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsqqzczzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxr8cyq8v8aryashyg8ya2huszcv62msurr83sfe4g04gjy7x5unp36mgf02yt8teuysd36tz27klseyy35hzm3qdz9v4tdg8rlak3le88zejq",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "payer_accepts": true
+   },
+   "name": "for the regtest offer",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "regtest, 250000 msat, issuer id",
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "payer_id": "03baf7689c0a3558fb604589036a8d1e4b685d909f6e0e2c6018a14049ae64ec26",
+   "payment_hash": "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793",
+   "preimage": "0101010101010101010101010101010101010101010101010101010101010101",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9y5jj2ff9y5jj2ff9y5jj2ff9yq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcv4qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pa2yzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkppq2wp7kz64qrk9705gk8ksp5h3da7ldrv0d52lqknn93s0yllrg44pgy3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqspwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxgqqsqsyqcy5gwqqqqraqqqqqryqq5qqqqqqqqqqqqpqqqqqp8rk2fqqqqq5szx4vfmw6nqyrss4qs8tpmmkswnjw6lhpz4eeswekxa5qqaqcckf943fha8lz2k2mhv5j42qvpapy9wgyqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsqqzczzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxr8cyp0jpzgk0m8gtpuhkasle8dxrwc6xzr5s55atrshaaapq0ah9ywslg6yy7r4s8wj45fuc5ledtqpxkstetvwmh92r95e5uxze6k7z9jxs",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "payer_accepts": true
+   },
+   "name": "the same offer again: another payer key",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "regtest, 250000 msat, issuer id",
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "payer_id": "029c1f585aa80762f9f4458f6806978b7befb46c7b68af82d399630793ff1a2b50",
+   "payment_hash": "75877bb41d393b5fb8455ce60ecd8dda001d06316496b14dfa7f895656eeca4a",
+   "preimage": "0202020202020202020202020202020202020202020202020202020202020202",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 7000,
+   "bolt12": "lni1qqg9x56n2df4x56n2df4x56n2df4xq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8s5pr5d9c8xrzpqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese2qsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzr6jqgd4s4zpqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqtqssx9pg7w34xtl5789vwrmjj2l66pk3qdlcqrhgswd4d6a6j9az96gq5zgs88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqsrn7lg4kvwh93xqhqf632phul2f72nyv3ku0tjnqjwj33hv9s0wqcsqpqpqgpsgqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxryqqgqgzqvz2y8qqqqp7sqqqqpjqq2qqqqqqqqqqqqqsqqqqqn3m9ysqqqq2gpr2kyahdfszpcg2sgry32ju270mxrec4a6ym97kajzqc753yaaynxsd0q8nuuc5ajsfpw4qyx6c4eqszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzqqqtqggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcvlqsrhangulyhh07cfe7ys3j6vc3c7mt206lyu3hra494qxc503htg5kncux5jg5r6tj4k7vfmst29ryzhrj5jwkhdqv378ehjayevz8pk7",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "payer_accepts": true
+   },
+   "name": "any-amount offer, 7000 msat asked",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "regtest, any amount",
+   "offer_id": "bd33d65e7d4acaba0e2ce7c9da9b5d988db038d05af31aa0982f1115302efdb2",
+   "payer_id": "031428f3a3532ff4f1cac70f7292bfad06d1037f800ee8839b56ebba917a22e900",
+   "payment_hash": "648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b",
+   "preimage": "0303030303030303030303030303030303030303030303030303030303030303",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9g4z52329g4z52329g4z52329gzqrq0gfqzsxvdhkven9v5xyzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj4zpqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqtqssxytzl7s0drw6j7punc7yr8kcyjsgds2efhydxvenqcqkvytnnh7p5zgs88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqsrn7lg4kvwh93xqhqf632phul2f72nyv3ku0tjnqjwj33hv9s0wqcsqpqpqgpsgqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxryqqgqgzqvz2y8qqqqp7sqqqqpjqq2qqqqqqqqqqqqqsqqqqqn3m9ysqqqq2gpr2kyahdfszpcg2sgylf7mg70sa4jpzqtu65kquuzalram9mu8f4s7gc4lzpa594w4cak4qxq7sjzhyzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgqqpvppqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpnuzqw7023sstgkneph3xxaq0sk7g8ux7j4q3fmrlpd2dfaruksdkrnpej6jgrezgu0p6c4hr34en8gdu9e5a7u6fn9p2cg3xwp0vn9kvf5q",
+   "chain": "mainnet",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "payer_accepts": true
+   },
+   "name": "chain-less offer on mainnet",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "no chain (mainnet), option_blake2b",
+   "offer_id": "fba6a84ec8986a5a063648fb59567e88efbbabc70b77830af6c80c4dddf9831d",
+   "payer_id": "031162ffa0f68dda9783c9e3c419ed824a086c1594dc8d3333306016611739dfc1",
+   "payment_hash": "9f4fb68f3e1dac82202f9aa581ce0bbf1f765df0e9ac3c8c57e20f685abab8ed",
+   "preimage": "0404040404040404040404040404040404040404040404040404040404040404",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg92424242424242424242424242q3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpplgpfypel052mx8tjcnqtsyag4qm704yl9fjxgmw84efsf8fgcmkzc8hqvgrn7lg4kvwh93xqhqf632phul2f72nyv3ku0tjnqjwj33hv9s0wqcsyqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxyqqgqgzqvzq9rkyy3wkzc9r097cfzpve9elyrsuhwh50dmug6gq5kek4lwzgk23qqzqzqsrqspel052mx8tjcnqtsyag4qm704yl9fjxgmw84efsf8fgcmkzc8hqvgrn7lg4kvwh93xqhqf632phul2f72nyv3ku0tjnqjwj33hv9s0wqcsxqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxyqqgqgzqvzq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqspmsvfsmcx38pje9lnmnaq87hc6arcahywhwtjgfv7crhc05t5g7fqqqsqsyqcy2qsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzr65gyqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvzzq56cgpnt6ecw6xjq547rkau8j8kz7zqw3vw28ntftfz78v3wkyftwsfzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypel052mx8tjcnqtsyag4qm704yl9fjxgmw84efsf8fgcmkzc8hqvgzqw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqqyqypqxpqrhqcnphsdzwr9jtl8h86q0a034683mwgawuhysjeas80slghg3ujqqpqpqgpsfgsuqqqq86qqqqqxgqpgqqqqqqqqqqqqzqqqqqzw8v5jqqqqpfqyd2cnka4xqg8pp2pqlpyavue9lt8sg9mmce3m9hz5gpgcx8zcnm6cr4qj7t46gjp5ua725qcr6zg2usgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqq9syypmsvfsmcx38pje9lnmnaq87hc6arcahywhwtjgfv7crhc05t5g7f8sgpmwu0s0qv42wr6t8ar2zdsnakj5czhfwkj6nkynm5m0npxla7t8g4d7r948694d8072hllje4zrnp8wyp6kqswhwdg672ujw7sylrc5",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "payer_accepts": true
+   },
+   "name": "blinded offer, signed by the second path's last node",
+   "node_id": "03b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24",
+   "offer": "regtest, two blinded paths, no issuer id",
+   "offer_id": "b5e43d1a7651e2bc64e1080b4fae583643658df38377bfa4970d58740c0ba7ec",
+   "payer_id": "029ac20335eb38768d2052be1dbbc3c8f6178407458e51e6b4ad22f1d91758895b",
+   "payment_hash": "f849d67325facf04177bc663b2dc544051831c589ef581d412f2eba44834e77c",
+   "preimage": "0505050505050505050505050505050505050505050505050505050505050505",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9v4jk2et9v4jk2et9v4jk2et9vq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcv4qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pa2yzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkppqwy8kvfm2htuvurqxll8h425xe86enlzr0px2232dg9s6upxckz74gy3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqspwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxgqqsqsyqcy5gwqqqqraqqqqqryqq5qqqqqqqqqqqqpqqqqqp8rk2fqqqqq5szx4vfmw6nqyrss4qswsqsgdtt2rctt0q6j44efd542hkp4kxckm054rcgntwtudr3fmqd2qvpapy9wqvpqqq9syypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvx0sgzcpsznj37plarlnf4e3kq47cxtdgenaffrklvrslz7wxz0lwnf48s890sy2mmkvjczkvx0tqm8m33ka5hwa5pf9gm0n4kr8qm9gwzpa",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "error": "invoice does not set option_blake2b",
+    "payer_accepts": false
+   },
+   "name": "invoice without option_blake2b",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "regtest, 250000 msat, issuer id",
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "payer_id": "03887b313b55d7c6706037fe7bd554364faccfe21bc2652a2a6a0b0d7026c585ea",
+   "payment_hash": "e802086ad6a1e16b78352ad7296d2aabd835b1b16dbe951e1135b97c68e29d81",
+   "preimage": "0606060606060606060606060606060606060606060606060606060606060606",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9w46h2at4w46h2at4w46h2at4wq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcv4qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pa2yzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkppqt8233v9jgqu4cjka0z2nnr32sp3d3face4wgv5glwyq0shm34vvrgy3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqsp44drgneqq5jskpncpe4z8xzz954rk3hu9glwd7peaje83p8cccvqqqsqsyqcy5gwqqqqraqqqqqryqq5qqqqqqqqqqqqpqqqqqp8rk2fqqqqq5szx4vfmw6nqyrss4qsyhvr03e8r5ac46gqa2u7s4fprwch9tk4avx3vqgnclftvcmfffc92qvpapy9wgyqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsqqzczzq66k35fusq2fgtqeuqu63rnppz623mgm7z50hxlqu7evncsnuvvxrcyqy3txdmtqn3eqetp23dvhqhnn3n3atdp823q9gyn7qu8m737682mg7e54puh0uftt4ten9xekruv9g9dhflm7tv092grkpp8565svy8s",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "error": "invoice_node_id does not match offer_issuer_id",
+    "payer_accepts": false
+   },
+   "name": "signed by a key that is not the issuer",
+   "node_id": "035ab4689e400a4a160cf01cd44730845a54768df8547dcdf073d964f109f18c30",
+   "offer": "regtest, 250000 msat, issuer id",
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "payer_id": "02cea8c5859201cae256ebc4a9cc71540316c53dc66ae43288fb8807c2fb8d58c1",
+   "payment_hash": "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0",
+   "preimage": "0707070707070707070707070707070707070707070707070707070707070707",
+   "relative_expiry": 3600
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lni1qqg9skzctpv9skzctpv9skzctpv9sq3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqcr6zgq5pnrdanxvet9p3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcv4qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pa2yzqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkppqfztn33t9eq0jc3uv8kyvjpfead0f8s2h7vumtz4vng9zkxa7k5jtgy3qw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypq88a73tvcawtzvpwqn4z5r0e75nu4xgerdc7h9xpya9rrwctq7up3qqzqzqsrqspwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxgqqsqsyqcy5gwqqqqraqqqqqryqq5qqqqqqqqqqqqpqqqqqp8rk2fqqqqq5szx4vfmw6nqyrss4qsz27xvlpj9ktgacyxyvhhlss6ct9c08flzy2t2jt9d2h2gngnjqu42qvpapy9wgyqsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsqqzczzqhwcuj966ma9n9nqwqtl032xeyv6755yeflt235pmww58egx6rxr8cyp06qe3fdmcxru9gp4wctwlkm2d63z3zq5ck8f3aaeyy26dzavwtcmdzte8u0jlzhyzy3vzf4cq39vv4dcn6p3am27unfjsngh8yflt9s",
+   "chain": "regtest",
+   "created_at": 1789999990,
+   "lightning_fork": {
+    "error": "BOLT 12 signature is invalid",
+    "payer_accepts": false
+   },
+   "name": "invoice_node_id the issuer's, signature another key's",
+   "node_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "offer": "regtest, 250000 msat, issuer id",
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "payer_id": "0244b9c62b2e40f9623c61ec464829cf5af49e0abf99cdac5564d05158ddf5a925",
+   "payment_hash": "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072",
+   "preimage": "0808080808080808080808080808080808080808080808080808080808080808",
+   "relative_expiry": 3600
+  }
+ ],
+ "now": 1790000000,
+ "offers": [
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcgqvpapyq2qe3k7enxv4jscsgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "payable": true
+    }
+   },
+   "name": "regtest, 250000 msat, issuer id",
+   "num_paths": 0,
+   "offer_id": "5cad804c28169a75e656040139ad7a87dd143761863b606f4dfe4220b6855ff3",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f080303d0900a06636f666665650c410100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 0,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrc2q36xjurnp3qszqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpvggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcvs",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "tips",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "payable": true
+    }
+   },
+   "name": "regtest, any amount",
+   "num_paths": 0,
+   "offer_id": "bd33d65e7d4acaba0e2ce7c9da9b5d988db038d05af31aa0982f1115302efdb2",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0a04746970730c410100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcgqvpapyq2qe3k7enxv4j3vggzamrjghtt05kvkvpcp0a79gmy3nt6jsn98ad2xs8de6sl9qmgvcvs",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "error": "offer does not set option_blake2b",
+     "payable": false
+    }
+   },
+   "name": "regtest, no option_blake2b",
+   "num_paths": 0,
+   "offer_id": "cff2a9e1c833fda077cac1bb87345cd22e0a63be6d34622c1a82ea87b21922e9",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f080303d0900a06636f66666565162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1pqps85yspgrxxmmxvejk2rzpqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese",
+   "chains": null,
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "payable": true
+    },
+    "regtest": {
+     "error": "offer does not support our chain",
+     "payable": false
+    }
+   },
+   "name": "no chain (mainnet), option_blake2b",
+   "num_paths": 0,
+   "offer_id": "fba6a84ec8986a5a063648fb59567e88efbbabc70b77830af6c80c4dddf9831d",
+   "tlv": "080303d0900a06636f666665650c410100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1pqps85yspgrxxmmxvejk293pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj",
+   "chains": null,
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not set option_blake2b",
+     "payable": false
+    },
+    "regtest": {
+     "error": "offer does not support our chain",
+     "payable": false
+    }
+   },
+   "name": "no chain, no option_blake2b",
+   "num_paths": 0,
+   "offer_id": "44fdb8866712888bd96e7297592d54c4241b20015aee331eac4de14d323965eb",
+   "tlv": "080303d0900a06636f66666565162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsxlc5vp2m0rvmjcxn2y34wv0m5lyc7sdj7zksgn35dvxgqqqqqqqqgqvpapyq2qe3k7enxv4jscsgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg",
+   "chains": [
+    "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "payable": true
+    },
+    "regtest": {
+     "error": "offer does not support our chain",
+     "payable": false
+    }
+   },
+   "name": "mainnet named, option_blake2b",
+   "num_paths": 0,
+   "offer_id": "a2cf0cc23e30e4acf1fe00c0a31349a200bfcece5c4a2a8e9ffef6ffa43981d6",
+   "tlv": "02206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000080303d0900a06636f666665650c410100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcgqvpapyq2qe3k7enxv4jscsgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsl5q5jqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypel052mx8tjcnqtsyag4qm704yl9fjxgmw84efsf8fgcmkzc8hqvgzqw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqqyqypqxpqz3mzzghtpvz3hjlvy3qkvjuljpcwtht68ka7ydyq2tvm2lhpyt9gsqpqpqgpsgqulh69dnr4evfs9czw52sdl86j0j5erydhr6u5cyn55vdmpvrmsxypel052mx8tjcnqtsyag4qm704yl9fjxgmw84efsf8fgcmkzc8hqvgrqw0mazke36ukyczup829gxlnaf8e2v3jxm3aw2vzf62xxaskpacrzqqyqypqxpqrn7lg4kvwh93xqhqf632phul2f72nyv3ku0tjnqjwj33hv9s0wqcsqpqpqgpsgqacxycdurgnsevjleae7srltudw3uwmj8th9eyyk0vpmu8696y0ysqqgqgzqvzq",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "payable": true
+    }
+   },
+   "name": "regtest, two blinded paths, no issuer id",
+   "num_paths": 2,
+   "offer_id": "b5e43d1a7651e2bc64e1080b4fae583643658df38377bfa4970d58740c0ba7ec",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f080303d0900a06636f666665650c41010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010fd0149039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f7031039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f703102039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f7031000401020304028ec4245d6160a3797d84882cc973f20e1cbbaf47b77c46900a5b36afdc245951000401020304039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f7031039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f703103039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f7031000401020304039fbe8ad98eb962605c09d4541bf3ea4f95323236e3d729824e946376160f703100040102030403b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24000401020304"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcgqvpapyq2qe3k7enxv4jscsgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwq34tzwmlzcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "error": "offer has expired",
+     "payable": false
+    }
+   },
+   "name": "regtest, expired",
+   "num_paths": 0,
+   "offer_id": "9cefca51aae8a6c86a1b139a0461755ad594896c77f7e255fd5c04afb88e4880",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f080303d0900a06636f666665650c4101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e046ab13b7f162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  },
+  {
+   "amount_msat": 250000,
+   "bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcgqvpapyq2qe3k7enxv4jscsgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwq34tz0wczcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese",
+   "chains": [
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   ],
+   "description": "coffee",
+   "hrp": "lno",
+   "issuer_id": "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+   "lightning_fork": {
+    "mainnet": {
+     "error": "offer does not support our chain",
+     "payable": false
+    },
+    "regtest": {
+     "payable": true
+    }
+   },
+   "name": "regtest, expires later",
+   "num_paths": 0,
+   "offer_id": "d90923d88451aefdcb6fbbde65e5ea2dbc207d79b0373a42a934e8705095d2ae",
+   "tlv": "022006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f080303d0900a06636f666665650c4101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e046ab13dd8162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"
+  }
+ ],
+ "source": "Lightning Fork bolt12 package, v0.21.3-beta-blake2b.17 (cebc10fe), by cmd/agp082vec (xbt-rs scripts/ln_rail/agp082vec.go)"
+}

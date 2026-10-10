@@ -12,10 +12,10 @@
 //!
 //! Not ported (see the crate README): the forward rail, the treasury, the presigned vault and the
 //! Electrum light backend; their methods answer that they are unavailable.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use xbt402::channel::ChannelParams;
@@ -24,7 +24,7 @@ use xbt_primitives::tx::Tx;
 
 use crate::anchor::{AnchorClient, Anchorer};
 use crate::approval::{recover_message, sweep_message, verify, verify_approval, x2b};
-use crate::channels::{AdaptorScheme, ChannelBook};
+use crate::channels::{AdaptorScheme, ChannelBook, ChannelRecord};
 use crate::hot::{HotWallet, DEFAULT_FEE};
 use crate::keystore::KeyStore;
 use crate::ln::{LnBackend, LnBook, LndRest};
@@ -33,7 +33,7 @@ use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, Poli
 use crate::pyjson::{now_f64, py_int, str_or_empty, truthy, ts_value};
 use crate::routing::{RoutePolicy, RouteSigner};
 use crate::sanitize::sanitize;
-use crate::session::{origin_of, MineFn, Session};
+use crate::session::{origin_of, FundingSpend, MineFn, Session};
 use crate::sigaudit::{self, check_chain, SigAudit};
 use crate::{err, Result};
 
@@ -176,7 +176,7 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 /// Codes that are B2 RuntimeErrors (reported as `deny/xbt402`), not xbt402 `ChannelError` codes.
-const INTERNAL: [&str; 10] = ["xbt402", "rpc_error", "transport_error", "io", "keystore", "hot", "sigaudit", "chain", "poisoned", "anchor"];
+const INTERNAL: [&str; 11] = ["xbt402", "rpc_error", "rpc_refused", "transport_error", "io", "keystore", "hot", "sigaudit", "chain", "poisoned", "anchor"];
 
 /// A witness-v0 address of this chain's hrp (B1 `address_to_spk(addr, hrp)`, P5).
 pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
@@ -228,6 +228,10 @@ pub struct Signer {
     pub session: Session,
     pub routing: RouteSigner,
     open_tried: Mutex<HashMap<String, f64>>,
+    /// AGP-080: channels a socket client said it closed before our node showed the spend. The
+    /// watcher marks each closed once the chain does (memory only: at expiry the refund finds a
+    /// close by the chain anyway).
+    close_claims: Mutex<HashSet<String>>,
     pub watch_interval: f64,
     /// AGP-048 `rail=ln`: the LN node (None: not configured), a configuration error that keeps the
     /// rail shut, and the write-ahead payment book.
@@ -322,7 +326,7 @@ impl Signer {
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
-                                keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval,
+                                keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
                                 ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), enroll: Mutex::new(Default::default()) });
         if s.human_key().is_empty() {
             s.issue_enroll_code()?;
@@ -638,9 +642,14 @@ impl Signer {
             return Ok(deny("refund_disabled", "refunds are off in this policy"));
         }
         let dest = if key.is_empty() { None } else { self.book.find_dest(key) };
-        let Some((dest, rec)) = dest.and_then(|d| self.book.get(&d).map(|r| (d, r))) else {
+        let Some((dest, mut rec)) = dest.and_then(|d| self.book.get(&d).map(|r| (d, r))) else {
             return Ok(deny("unknown_channel", format!("no channel for {key}")));
         };
+        if rec.state == "closed" && rec.close_unproven {
+            // AGP-080: closed on the provider's word only. The chain decides: proven, or open again
+            self.settle_unproven(&dest);
+            rec = self.book.get(&dest).unwrap_or(rec);
+        }
         let base = json!({"dest": dest, "chan": rec.chan, "expiry": rec.expiry});
         if rec.state == "refunded" {
             // idempotent: report the refund already made, never a second one
@@ -691,6 +700,32 @@ impl Signer {
                                         "ts": ts_value(self.now())}));
         self.anchor_after("refund");
         Ok(with(json!({"verdict": "allow", "rule": "refund"}), with(base, json!({"txid": txid, "sats": sats, "to": self.hot.address(), "auto": auto}))))
+    }
+
+    /// AGP-080 W3: a channel marked closed on its provider's word. Our node decides: the funding is
+    /// spent (the close is proven, by the transaction that spent it), or it is still unspent at
+    /// expiry (it was never closed: open again, for the refund). The caller holds the spend lock.
+    fn settle_unproven(&self, dest: &str) {
+        let Some(rec) = self.book.get(dest).filter(|r| r.state == "closed" && r.close_unproven) else { return };
+        let spend = self.session.funding_spend(&rec);
+        if let Ok(FundingSpend::Spent(sp)) = &spend {
+            if self.book.note_close_proof(dest, true, sp).is_ok() {
+                self.notice_close_change(dest);
+            }
+        } else if spend == Ok(FundingSpend::Unspent) && self.height().is_ok_and(|h| h >= rec.expiry) && self.book.reopen_unproven(dest).is_ok() {
+            self.engine.audit.append(json!({"type": "close_unproven", "dest": dest, "chan": rec.chan, "reported_txid": rec.closed_txid,
+                                            "ts": ts_value(self.now())}));
+        }
+    }
+
+    /// Mark a channel closed because our node shows its funding spent by `spender` (empty: the node
+    /// cannot name the transaction; `hint` is then where the change is looked for).
+    fn close_by_chain(&self, dest: &str, rec: &ChannelRecord, spender: &str, hint: &str, scan_from: i64) -> Result<()> {
+        let txid = if spender.is_empty() { hint } else { spender };
+        let change = self.session.learn_close_change(rec, txid, scan_from, "");
+        self.book.mark_closed(dest, txid, Some(&change), "")?;
+        self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).remove(dest);
+        Ok(())
     }
 
     /// AGP-016/022: learn a closed channel's still-unspent change once; a final answer is never
@@ -761,6 +796,37 @@ impl Signer {
             };
             if act["state"] == "open" || act.get("error").is_some() {
                 actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act}));
+            }
+        }
+        // AGP-080 W3: closes the chain has not shown. Proven ones are settled; one still unspent at
+        // expiry is open again here and refunded by the loop below.
+        for rec in self.book.unproven_close_records() {
+            let _g = self.lock();
+            let _c = sigaudit::context(Some("watcher"), None);
+            self.settle_unproven(&rec.dest);
+            match self.book.get(&rec.dest) {
+                Some(r) if r.state == "closed" && !r.close_unproven => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_proven": r.closed_txid,
+                                                                                            "close_change": r.close_change, "closed_txid": r.closed_txid})),
+                Some(r) if r.state == "open" => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_unproven": "the funding is unspent at expiry: refunding"})),
+                _ => {}
+            }
+        }
+        let claims: Vec<String> = self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect();
+        for dest in claims {
+            let _g = self.lock();
+            let _c = sigaudit::context(Some("watcher"), None);
+            let rec = self.book.get(&dest).filter(|r| r.state == "open" || r.state == "pending");
+            let spend = rec.as_ref().map(|r| self.session.funding_spend(r));
+            match (rec, spend) {
+                (Some(r), Some(Ok(FundingSpend::Spent(sp)))) => {
+                    if self.close_by_chain(&dest, &r, &sp, "", 0).is_ok() {
+                        actions.push(json!({"dest": dest, "chan": r.chan, "height": h, "close_proven": sp}));
+                    }
+                }
+                (Some(r), _) if h < r.expiry => {} // not on our node yet
+                _ => {
+                    self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest);
+                }
             }
         }
         for rec in self.book.unsettled_records() {
@@ -866,9 +932,21 @@ impl Signer {
             return self.channel_pay(&pay, &dest, d.as_value(), human);
         }
         let xbt = format!("{:.8}", pay.amount_sats as f64 / XBT_SATS as f64);
-        let txid = self.node.call("sendtoaddress", json!([pay.dest, xbt, pay.memo, "", false]))?;
-        let txid = txid.as_str().unwrap_or("").to_string();
+        // AGP-080 K1: booked before the node is asked to send. A crash, or a node that never
+        // answers, leaves the payment counted; only the node's own refusal takes it back.
+        let ahead = format!("onchain:unconfirmed:{}", crate::policy::token_urlsafe());
+        self.engine.commit(&pay, &ahead)?;
+        let txid = match self.node.call("sendtoaddress", json!([pay.dest, xbt, pay.memo, "", false])) {
+            Ok(t) => t.as_str().unwrap_or("").to_string(),
+            Err(e) if e.code == node::REFUSED => {
+                self.engine.store.amend(&ahead, None)?;
+                return Err(e);
+            }
+            Err(e) => return Err(err(&e.code, format!("{}; the node may have sent this payment, so it stays in the ledger as {ahead}", e.msg))),
+        };
+        // the row under the txid first: a crash here counts the payment twice, never not at all
         self.engine.commit(&pay, &txid)?;
+        self.engine.store.amend(&ahead, None)?;
         Ok(with(d.as_value(), json!({"txid": txid, "rail": "onchain"})))
     }
 
@@ -913,6 +991,7 @@ impl Signer {
         if dest.is_empty() {
             return Ok(deny("dest", "destination required"));
         }
+        self.settle_unproven(&dest);
         if let Some(existing) = self.book.get(&dest).filter(|r| r.state == "open") {
             return Ok(with(json!({"verdict": "allow", "already": true}), existing.public()));
         }
@@ -1071,8 +1150,12 @@ impl Signer {
             return Ok(with(deny("hot_balance_cap", e.msg), json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats()})));
         }
         let dest = normalize_dest(&origin);
+        self.settle_unproven(&dest);
         if let Some(r) = self.book.get(&dest).filter(|r| r.state == "open" || r.state == "pending") {
             return Ok(deny(&format!("channel_{}", r.state), format!("{dest} already has a {} channel", r.state)));
+        }
+        if self.book.get(&dest).is_some_and(|r| r.state == "closed" && r.close_unproven) {
+            return Ok(deny("close_unproven", format!("{dest}: the last channel's close is not on this node yet")));
         }
         let prep = self.hot.prepare_fund(&params.spk(), sats, DEFAULT_FEE)?;
         let funded = params.with_funding(&prep.txid, 0, sats as u64)?;
@@ -1119,6 +1202,7 @@ impl Signer {
         if max_sats < 0 {
             return deny("amount", "max_sats must be >= 0");
         }
+        self.settle_unproven(&dest); // AGP-080: a close our node has shown by now makes room for a new channel
         let (exp, cap) = (self.config().channel_expiry_blocks, self.config().per_counterparty_cap_sats);
         if max_sats == 0 {
             // free-only: allowlisted dest, no channel open or update; a >0 price is refused in pay_once
@@ -1322,6 +1406,13 @@ impl Signer {
                 Err(e) => deny(&e.code, e.msg),
             };
         }
+        // AGP-080 W3: the next channel replaces the live one only when our node shows the rollover:
+        // the live channel's funding spent by the transaction that pays this next channel's script.
+        // (Such a transaction needs this signer's `xbt402_sign_rollover`, which checked `next`.)
+        let Some(old) = self.book.get(&dest) else { return deny("unknown_channel", format!("no channel for {dest} to roll over")) };
+        if let Err(e) = self.rollover_on_chain(&old, &params) {
+            return deny(&e.code, e.msg);
+        }
         if let Err(e) = self.check_client_channel(&origin, &params) {
             return deny(&e.code, e.msg);
         }
@@ -1333,9 +1424,41 @@ impl Signer {
             Err(e) => return deny(&e.code, e.msg),
         };
         let open_height = self.height_safe();
+        if old.state == "open" || old.state == "pending" {
+            // the rollover closed it: archived by add_funded, with its change looked for first
+            if let Err(e) = self.close_by_chain(&dest, &old, &params.funding_txid(), "", 0) {
+                return deny(&e.code, e.msg);
+            }
+        }
         match self.book.add_funded(&dest, secret, &params, &base, Some(params.max_amount() as i64), open_height) {
             Ok(rec) => json!({"chan": rec.chan, "dest": dest}),
             Err(e) => deny(&e.code, e.msg),
+        }
+    }
+
+    /// `next` (funded) is what a rollover of `old` created, by our own node: its funding output is
+    /// there with the next channel's script and capacity, and the transaction it is in is the one
+    /// that spent `old`'s funding. Waits up to the policy's `open_wait_s` for the node to see it.
+    fn rollover_on_chain(&self, old: &ChannelRecord, next: &ChannelParams) -> Result<()> {
+        let (txid, vout) = (next.funding_txid(), next.funding_vout());
+        let seen = || -> Result<bool> {
+            let out = self.node.call("gettxout", json!([txid, vout, true]))?;
+            let script = out.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).unwrap_or("");
+            if out.is_null() || script != hex::encode(next.spk()) || node::sats(out.get("value")) != next.capacity as i64 {
+                return Ok(false);
+            }
+            Ok(self.session.funding_spend(old)? == FundingSpend::Spent(txid.clone()))
+        };
+        let deadline = Instant::now() + Duration::from_secs_f64((self.config().open_wait_s as f64).clamp(0.0, 30.0));
+        loop {
+            if seen()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(err("rollover_unproven", "this node does not show a rollover of the live channel that funds this next channel; \
+                                                     attach again once it does (the issued key and the live channel are kept)"));
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 
@@ -1350,16 +1473,37 @@ impl Signer {
         }
     }
 
-    /// The external client closed a channel: learn its change, then mark it closed.
+    /// The external client says it closed a channel (AGP-080 W3). The caller's word closes
+    /// nothing: the channel is marked closed, with its change, only when our node shows the funding
+    /// spent. Until then it stays open (or pending) and refundable; the claim is remembered, and
+    /// the watcher marks the channel closed when the spend arrives.
     fn mark_closed(&self, p: &Value) -> Value {
         let chan = str_or_empty(p.get("chan"));
         let Some(dest) = self.book.find_dest(&chan) else { return deny("unknown_channel", format!("no channel for {chan}")) };
+        self.settle_unproven(&dest);
         let Some(rec) = self.book.get(&dest) else { return deny("unknown_channel", chan) };
         let txid = str_or_empty(p.get("txid"));
         let txid = if txid.len() == 64 && txid.bytes().all(|c| c.is_ascii_hexdigit()) { txid.to_lowercase() } else { String::new() };
-        let change = self.session.learn_close_change(&rec, &txid, py_int(p.get("scan_from")).unwrap_or(0), "");
-        if let Err(e) = self.book.mark_closed(&dest, &txid, Some(&change), "") {
-            return deny(&e.code, e.msg);
+        let scan_from = py_int(p.get("scan_from")).unwrap_or(0);
+        if rec.state == "open" || rec.state == "pending" {
+            let done = match self.session.funding_spend(&rec) {
+                Ok(FundingSpend::Spent(sp)) => self.close_by_chain(&dest, &rec, &sp, &txid, scan_from),
+                Ok(_) => {
+                    self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).insert(dest.clone());
+                    return with(deny("close_unproven", "this node does not show the channel's funding spent: the channel stays refundable, and is marked \
+                                                        closed when the spend is seen"), json!({"chan": rec.chan, "state": rec.state}));
+                }
+                Err(e) => return deny("close_rpc", trunc(&e.msg, 200)),
+            };
+            if let Err(e) = done {
+                return deny(&e.code, e.msg);
+            }
+        } else if rec.state == "closed" {
+            // already closed: one more attempt at its change (the txid is the chain's, not the caller's)
+            let change = self.session.learn_close_change(&rec, "", scan_from, "");
+            if let Err(e) = self.book.mark_closed(&dest, "", Some(&change), "") {
+                return deny(&e.code, e.msg);
+            }
         }
         self.anchor_after("close");
         with(self.book.get(&dest).map(|r| r.public()).unwrap_or(json!({})), json!({"verdict": "allow"}))

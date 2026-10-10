@@ -104,9 +104,10 @@ fn one(step: u64, torn: bool) -> Option<probe::Counts> {
     if finished {
         assert_eq!((rec.used_sats, pending), (CUM1, false), "{tag}");
     }
-    // a resolve that reached disk is booked exactly once in both budgets, whether the rows were
-    // written before the crash or by the restart; nothing else is booked
-    let want = if rec.used_sats == CUM1 { (300, 1) } else { (0, 0) };
+    // a lock that reached disk (AGP-080: booked when it is pre-signed, not when it resolves) is
+    // booked exactly once in both budgets, whether the rows were written before the crash or by
+    // the restart; nothing else is booked
+    let want = if rec.used_sats == CUM1 || pending { (300, 1) } else { (0, 0) };
     assert_eq!((spent(&rig) - spent0, lock_rows(&rig) - rows0), want, "{tag}");
     rig.restart().unwrap();
     assert_eq!((rig.s.routing.recovered_bookings, spent(&rig) - spent0, lock_rows(&rig) - rows0), (0, want.0, want.1), "{tag}: a second start books nothing more");

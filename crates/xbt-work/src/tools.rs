@@ -1,11 +1,10 @@
 //! Helpers for the interop binaries (feature `tools`): the node's view of the chain (network id,
 //! the epoch's nBits, pool coinbases) and the Prime's window statements, fed to the audit.
 use serde_json::{json, Value};
-use xbt402::client::Transport;
 use xbt402::rpc::Rpc;
 use xbt_primitives::network::network_id;
 
-use crate::audit::{window_from_doc, PrimeTerms, SignedDeferral, SignedWindow};
+use crate::audit::PrimeTerms;
 use crate::chain::{ChainBlock, Maturity};
 use crate::error::{Result, WorkError};
 
@@ -116,17 +115,5 @@ pub fn paid_to(outs: &[(String, u64)], identity: &str) -> u64 {
     outs.iter().filter(|(a, _)| a.eq_ignore_ascii_case(identity)).map(|(_, s)| *s).sum()
 }
 
-/// The Prime's statement for a pool block (`GET <window_url>?height=H`): None when the Prime
-/// answers 404 (it has none for that height); any other status is an error, never "none"
-/// (review P4: an unreachable Prime must not look like a block with nothing to audit).
-pub fn window(t: &dyn Transport, window_url: &str, height: u32) -> Result<Option<(SignedWindow, Vec<SignedDeferral>, Value)>> {
-    let r = t.request("GET", &format!("{window_url}?height={height}"), b"", &[])?;
-    match r.status {
-        200 => {}
-        404 => return Ok(None),
-        s => return Err(WorkError::new("prime", format!("window statement for {height}: HTTP {s}"))),
-    }
-    let doc = xbt402::json::parse_slice(&r.body).map_err(|_| WorkError::new("prime", "window statement is not JSON"))?;
-    let (w, d) = window_from_doc(&doc).map_err(|e| WorkError::new("prime", e.0))?;
-    Ok(Some((w, d, doc)))
-}
+/// The Prime's statement for a pool block: [`crate::provider::window_statement`].
+pub use crate::provider::window_statement as window;

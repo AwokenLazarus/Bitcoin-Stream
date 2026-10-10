@@ -1,18 +1,23 @@
 # rail=ln overlay on lightning-fork-lab (a5cadc5): publish only what the regtest needs, on loopback, and
-# cap every container's CPU. Ports: AGP-049's range 34700-34799 (AGP-048 used 34681/34691/34693).
-#   knots-b2b RPC   127.0.0.1:34781  (the signer's own node)
-#   lf1 REST        127.0.0.1:34791  (the agent's Lightning Fork node; wtclient on, AGP-049)
-#   lnd-sha REST    127.0.0.1:34793  (a stock lnd on the SHA-256 regtest: the wrong-chain backend)
+# cap every container's CPU. Ports: below the kernel's ephemeral range (AGP-083; AGP-049 used 34781/
+# 34791/34793 in the reserved range 30000-34999, AGP-048 34681/34691/34693).
+#   knots-b2b RPC   127.0.0.1:17481  (the signer's own node)
+#   lf1 REST        127.0.0.1:17491  (the agent's Lightning Fork node; wtclient on, AGP-049)
+#   lnd-sha REST    127.0.0.1:17493  (a stock lnd on the SHA-256 regtest: the wrong-chain backend)
+#   lf3 REST        127.0.0.1:17495  (AGP-083: a Lightning Fork node that opens one channel, from a coin
+#                                     confirmed above the split, so every channel it has is proven: the
+#                                     node BOLT 12 offers are paid from. lf1 keeps its taproot and
+#                                     pre-split channels and so pays none)
 # lf2 also runs a watchtower (AGP-049 S14). lf1/lf2's commands repeat the lab's, plus those flags.
 services:
   knots-b2b:
     cpus: 2
-    ports: ["127.0.0.1:34781:18443"]
+    ports: ["127.0.0.1:17481:18443"]
   bitcoind-sha:
     cpus: 1
   lf1:
     cpus: 2
-    ports: ["127.0.0.1:34791:8080"]
+    ports: ["127.0.0.1:17491:8080"]
     command:
       - --noseedbackup
       - --bitcoin.regtest
@@ -60,9 +65,39 @@ services:
       - --watchtower.active
       - --watchtower.listen=0.0.0.0:9911
       - --watchtower.externalip=lf2:9911
+  lf3:
+    image: lightning-fork:dev
+    restart: "no"
+    networks: [lab]
+    depends_on:
+      knots-b2b:
+        condition: service_healthy
+    cpus: 2
+    ports: ["127.0.0.1:17495:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots-b2b:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots-b2b:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf3:9735
+      - --tlsextradomain=lf3
+      - --alias=lf3
+      - --debuglevel=info,PEER=debug,CRTR=debug,FNDG=debug
+      - --accept-keysend
+    volumes:
+      - lf3-data:/root/.lnd
   lnd-sha:
     cpus: 1
-    ports: ["127.0.0.1:34793:8080"]
+    ports: ["127.0.0.1:17493:8080"]
     command:
       - --noseedbackup
       - --bitcoin.regtest
@@ -79,3 +114,6 @@ services:
       - --tlsextradomain=lnd-sha
       - --alias=lnd-sha
       - --debuglevel=info
+
+volumes:
+  lf3-data:

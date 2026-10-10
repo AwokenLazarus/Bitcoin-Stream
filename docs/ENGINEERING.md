@@ -1042,7 +1042,8 @@ human's ed25519 signature.
   The dest must be allowlisted, and `cap_sats`, `expiry_blocks` and `close_fee` must stay inside the
   owner's bounds.
 - **`xbt402_attach`** of a funded channel must match the pending record `fund` wrote. A `/next`
-  channel passes the same checks as `fund`.
+  channel passes the same checks as `fund`, and is attached only once the signer's own node shows
+  the rollover that funds it (AGP-080; `deny/rollover_unproven` until then).
 - **`xbt402_sign_rollover`** needs `next`: the unfunded params of the channel's own next channel. Its
   script must be `next_spk`; it must have the same close fee and fee payer; its capacity must be
   exactly `rollover_next_capacity(amount)`; and it passes the `fund` checks for `<origin>/next`.
@@ -1130,7 +1131,8 @@ terms it was given, so a server-side check of one would never fire.
   `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`
   with `f(x) = LE64(len(x)) ‖ x`. Scheme and host are lowercased, the port is decimal or the
   scheme's default, userinfo and fragment are dropped. A provider reached at another origin, or a
-  `|` moved between target and body, gives another digest. A bare target binds no origin.
+  `|` moved between target and body, gives another digest. A bare target binds no origin. Since
+  AGP-081 a URL or target with a `#` is refused by payer and provider before the digest is taken.
 - The client binds `origin + path`, and the server binds the URL it rebuilt from the request.
 - Receipts are `tagged_hash("xbt402/receipt/v2", …)` over the length-prefixed chan, seq, cum,
   charged, spentMsat, req, status and bodyHash (sha256 of the body sent). The client checks status
@@ -1146,7 +1148,7 @@ terms it was given, so a server-side check of one would never fire.
 **HTTP server (`http-server` feature).** It is now `std::net`:
 
 - header lines are capped at 8 KiB and the header block at 32 KiB (431);
-- at most 64 connections, then 503;
+- at most 64 connections, then 503 (since AGP-081 at most 48 of them from one client address);
 - the head must arrive within 10 s (408) and the body within 30 s, both as absolute deadlines;
 - only Content-Length bodies (Transfer-Encoding gives 501), and `Expect: 100-continue` is honoured;
 - `Connection: close` on every answer;
@@ -1385,7 +1387,7 @@ workspace (`Cargo.lock` loses it; `cargo tree -i tiny_http` finds nothing).
 
 **Limits** (`xbt_svc::http::Limits::default()`, the same as AGP-068): 8 KiB header line and 32 KiB
 head (431), the head within 10 s (408) and the body within 30 s, both absolute; at most 64
-connections (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
+connections, 48 from one client address since AGP-081 (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
 body byte is read; Transfer-Encoding is 501); `Expect: 100-continue`; `Connection: close`.
 
 **What changed in the server while moving it:**
@@ -1599,6 +1601,324 @@ test.
 * The write does not fsync the directory after the rename, as before: no extra IO per call. A
   follow-up could add it.
 
+## Hub closure-audit fixes: rollover with a lock open, refused seqs, the lock bound (AGP-078)
+The closure audit of the external review (AGP-077) found three hub items still open on `main`
+(`50ab5f5`). Each was the neighbour of a path an earlier fix had closed. The same changes are in B1
+`agp-078`, with the same test names. The hub stays **experimental**.
+
+**H1 and H2 through a ch1 rollover.** AGP-064 made a ch1 close refuse `lock_pending` while a routed
+lock is open. `POST /x402/xbt-channel/rollover` spends the same funding and was not checked: a client
+rolled ch1 over at its old state while a lock was in flight, or held after a write-off, and the hub
+still paid the provider on ch2.
+* `Provider::rollover` now makes the same test as the close (`locks_open`: the lock in flight, or a
+  written-off lock above `best_cum`) and refuses `lock_pending` (400). The test is made under the
+  ledger lock that is held until the rollover is sent, the lock `route()` writes its ch1 lock under.
+* It refuses whatever `amount` the rollover pays, as a close refuses whatever state its payload
+  carries. A rollover that paid for the open lock would be safe for the hub's coins, but the hub's
+  counters and `complete_ch1` read `best_cum`, which a rollover does not move.
+* The hub drops a lock it never forwarded before a ch1 rollover, as before a close (the same sweep),
+  so an orphan does not keep ch1 from rolling over.
+
+Every path that spends or replaces ch1, and its lock test:
+
+| path | lock test |
+|---|---|
+| `POST /x402/xbt-channel/close` (`Provider::close`) | `locks_open`, refused `lock_pending` (AGP-064) |
+| `POST /x402/settle` (`facilitator_settle`) | calls `close`: the same |
+| `POST /x402/xbt-channel/rollover` (`Provider::rollover`) | `locks_open`, refused `lock_pending` (this change) |
+| `Provider::close_channel` (embedder API, AGP-059) | `locks_open`, refused `lock_pending` |
+| the margin close (`close_due`) | waits for a lock in flight in the first half of the margin; never for a written-off lock (AGP-064, a stated limit) |
+| `adopt_intent` (the watcher, `close_channel`) | records a spend already sent by `close` or `rollover`, which made the test before writing the intent |
+| `Provider::close_now` | none, by design: the operator's own close, not reachable over HTTP. A lock completed after it is not counted as routed |
+| the hub's ch2 `rollover` / `close_ch2` | ch2, not ch1: `rollover` refuses `lock_pending` on a pending or written-off ch2 lock (AGP-064) |
+
+**A seq spent on a refusal (review T4), on `/x402/route` and `/x402/xbt-channel/lock`.** AGP-068
+saved the seq of a refused paid call. The hub's `/route` and the provider's `/lock` still kept it
+only in memory, so after a restart the refused header authenticated again.
+* `/route`: the checks after auth moved into `RouteHub::admit`; any answer it returns without
+  writing the lock (every refusal, and the replayed answer of a completed lock) saves ch1's row
+  first. If that save fails the answer is a 500.
+* `/lock`: every answer saves the row once: `complete_lock` on each answer it gives, the caller on
+  each refusal. A lock that completes still costs one fsync, as before.
+* A request that fails auth changes nothing, as before.
+
+**`max_lock_sat`.** The bound (at most half of `ch2_capacity`, not 0) was made only by
+`HubConfig::from_json`. It is now `HubConfig::validate`, which `from_json` and `RouteHub::new` both
+call, so a config built as a struct is refused `bad_config` before anything is written. The bound is
+against the configured `ch2_capacity`; a ch2 opened with another capacity (`connect(.., Some(cap), ..)`)
+is not checked against it.
+
+**For embedders (cmp).**
+* A ch1 rollover with a routed lock open is refused `lock_pending` (400). Retry it after the lock
+  resolves, as for a close.
+* `RouteHub::new` returns `bad_config` for a `HubConfig` with `max_lock_sat` 0 or above half of
+  `ch2_capacity`.
+* A refused `/route` or `/lock` now costs one ledger write (an fsync).
+
+Tests, each failing on `main` and passing here (B1: `tests/security/test_agp078_hub_closure.py`):
+* `hub_routing_safety.rs`: `h1_a_ch1_rollover_while_a_lock_is_in_flight_is_refused`,
+  `h2_a_ch1_rollover_below_a_held_written_off_lock_is_refused` (the audit's two, from branch
+  `agp-077`), `h1_a_lock_the_hub_never_forwarded_does_not_keep_ch1_from_rolling_over`;
+* `routing_checks.rs`: `t4b_a_seq_spent_on_a_refused_route_survives_a_hub_restart`,
+  `t4b_a_seq_spent_on_a_refused_lock_survives_a_provider_restart`,
+  `hub_bounds_max_lock_sat_however_its_config_was_built`.
+
+## Fix wave 2 leftovers: an errored ch1 spend, the lock bound per ch2, unpaid blocks (AGP-084)
+
+Three things AGP-078 and AGP-079 reported as found and not fixed. B1 has the two hub items with the
+same test names (`tests/security/test_agp084_hub_leftovers.py`); pay-with-work is Rust only.
+
+| item | before | now | tests |
+|---|---|---|---|
+| a ch1 close or rollover whose broadcast errored | the intent stayed, the channel went on taking states; if the tx confirmed later, a lock routed in between sat above it (the hub paid 3,000 on ch2 over a ch1 spent at 3,007) | a channel with an unresolved intent takes no state: paid call, `/lock` and `/route` answer `channel_closing` | `hub_routing_safety.rs::h1_no_lock_is_routed_above_a_ch1_spend_the_node_errored_on`, `h1_a_provider_takes_no_lock_on_a_ch2_whose_spend_its_node_errored_on`; `lifecycle.rs::a_channel_whose_spend_the_node_errored_on_serves_nothing_above_it` |
+| the same, resolving it | only the margin close, or the node showing the tx | the watcher sends an errored **close** again each tick; a close or rollover request first records an earlier spend the node has after all | `h1_a_ch1_close_the_node_errored_on_goes_through_at_the_next_tick`, `the_watcher_sends_a_close_the_node_errored_on_again`, `a_spend_that_reached_the_chain_is_recorded_before_another_replaces_it` |
+| `max_lock_sat` against a ch2 opened with another capacity | checked against the configured `ch2_capacity` only | `ch2_terms` (so `connect` and `connect_next`) refuses `bad_config` when `2 x max_lock_sat` is above the capacity it would fund, before anything is funded | `routing_checks.rs::hub_bounds_max_lock_sat_against_the_capacity_a_ch2_is_opened_with` |
+| an unpaid block with no statement | no verdict, nothing recorded | still no verdict; counted while credit is unpaid (`unpaidBlocks` in the report), with an optional stop | `agp084_unpaid_blocks.rs` (6) |
+
+**The errored spend.** `close` and `rollover` write `close_intent` and then send (M8). When the node
+answers with an error and does not know the tx, the answer is `close_failed` and the channel stays
+open. The tx is complete all the same, and the provider cannot know that it will never confirm: a
+node can take a tx and still answer with an error. So `provider::closing(st)` is true for a closed
+channel and for one with an open intent, and every path that takes a state asks it: the paid-call
+path, `/x402/verify`, the provider's `/x402/route/lock` and the hub's `/x402/route`. Nothing is
+signed or served above a spend that can still land. The intent ends in one of four ways:
+
+- the node shows the tx: `adopt_intent` records it (as before; now also at the start of `close` and
+  `rollover`, so a new intent never overwrites one that is already on the chain). A rollover's
+  intent carries `next`, so a rollover adopted later gets its `rollover_to`;
+- it is a close: the watcher sends it again every tick (`close_locked`, with the AGP-067 bump), and
+  the failure shows in `close_error` until it goes through;
+- the client rolls over again or closes: the new spend replaces the intent. No state was taken in
+  between, so whichever of the two confirms pays at least the best state;
+- the margin close, as before.
+
+The watcher never sends a **rollover** again. Its client was answered `close_failed`, and the
+library client then no longer holds the next channel's key (below): sent later, the rollover would
+fund a channel nobody can spend from before its refund.
+
+Limits. After a failed close the channel routes and serves nothing until that close is on the node;
+that is the point of the fix, and it changes what a failed close means for the client (it could go
+on paying before). A replaced intent is forgotten: if the first spend errored, a second one errored
+too, and then the *first* confirms, the ledger has the second one's intent and the close is never
+recorded (the channel shows as suspended; no state sits above either spend). Found on the way and
+not fixed, both in the payer library (`client.rs`), not in the provider:
+
+- after a rollover the provider answered with an error, `Client::close` is refused `bad_sig`: the
+  payer's watermark moved to the rollover's amount and its kept signature did not;
+- `Client::rollover` drops the next channel's key when the POST fails (an error answer or a lost
+  one). If the provider did broadcast, the leftover is in a channel the client cannot sign for.
+
+**The lock bound.** AGP-064's rule is that a lock is at most half of a ch2. A ch2 funded with an
+explicit capacity went around the check on the configured one. A rollover's child is not held to
+it: its capacity is what the parent left, and it is replaced when a lock no longer fits. The route
+demo's small ch2 (provider D) is 40,000 now, twice its `max_lock_sat`.
+
+**Unpaid blocks.** A block that paid the identity nothing, with no statement, may be the Prime's or
+any other pool's; the provider has nothing that tells them apart (no share-log commitment yet), and
+on a chain with other miners most blocks are of this kind. So the decision on "do N such blocks
+distrust the Prime" is no: distrust is a verdict and is never undone, and this is not evidence.
+What is done instead:
+
+- **Recorded.** While credit is unpaid, each such block extends a run kept in the state file and
+  shown in the report: `"unpaidBlocks": {"from", "to", "count", "refused"}` (`refused`: those that
+  came with a statement the audit refused). A block walked twice counts once. A coinbase that pays
+  for credit ends the run; with no unpaid credit nothing is counted.
+- **An operator's stop.** `--max-unpaid-blocks N` (`WorkConfig::max_unpaid_blocks`, off by default)
+  stops new credit (`frozen: "unpaid_blocks"`) once the run reaches N and lifts it when a coinbase
+  pays. It is a stop, not distrust. N has to come from how often the Prime's pool finds a block,
+  which the provider cannot measure; set too low it stops an honest Prime during a run of bad luck.
+- **Signed garbage is a failure.** A refused statement that did verify under the pinned key for
+  this Prime and this block (`bad_window`, `window_start_regressed`) is the Prime saying the block
+  is its own. On an unpaid block it had no verdict; now it fails the audit and distrusts the Prime
+  (`refused_statement`), as on a paid block. A statement that does not bind the Prime to the block
+  (`bad_window_sig`, `wrong_prime`, `wrong_block`) is counted in the run.
+
+Without `--max-unpaid-blocks` the loss to a Prime that never pays is what it was: the total cap
+(1,000 calls with the shipped defaults), once. For embedders: `WorkConfig` gains
+`max_unpaid_blocks`; the state file gains an optional `unpaid` (version stays 3; older state loads
+with no run); the freeze rules are applied again when the state loads.
+
+## Transport, light-client and rollover closure fixes (AGP-081)
+
+The closure audit of the external review (AGP-077, list 1 items 8, 9 and 10) found these still open
+on `main` (`a8250f4`). Each is the neighbour of a path an earlier fix closed. B1 `agp-081`
+(`45eac8a`) and B2 `agp-081` (`239cd62`) carry the same changes where they have the code, with the
+same test names (`test_` prefixed): B1 `tests/security/test_agp081_closure_audit.py` (receipt,
+fragment, per-address cap, the ASGI path held to loopback and documented as needing a proxy, and
+payers opening at `minExpiryBlocks + minConf + closeMarginBlocks`), B2
+`tests/test_agp081_closure_audit.py` (the Electrum limits, where B2 had no line limit at all, and
+the fragment), with B2's own measurements from `tests/e1_attacks.py`.
+
+**A paid answer needs its receipt (T4c).** `Client::request` checked a PAYMENT-RESPONSE only when
+the header was there: with it stripped on the way, any body passed as the paid answer.
+* An answer below 400 to a request that carried a payment, with no PAYMENT-RESPONSE, is
+  `bad_receipt` ("paid call returned no receipt"). Nothing is adopted from it.
+* An answer of 400 or above may have none (the provider's own failures carry no receipt). It goes
+  back as it is; the caller must not read it as the answer it paid for.
+
+| paying path | receipt |
+|---|---|
+| `Client::request` / `request_with`, channel | required below 400 (this change) |
+| `Client::request_conditional` | required below 400 (this change); the hash lock stays pending, so `recover_conditional` still reads k from the provider's claim |
+| `Client` with a scheme payer (`with_payer`, xbt-work) | required below 400 (this change); what it proves on that rail is less, see below |
+| `xbt-signer` `pay_once` (the wallet) | a missing or bad receipt below 400 is reported as `receipt_error` with `charged_sats` 0; the signed state stays booked, and the body goes to the agent marked untrusted, as every provider body does (unchanged) |
+| the stream's chunk calls (`xbt-signer`) | no receipt needed: each chunk is checked against the manifest's Merkle root before the state paying for it is signed (unchanged) |
+| `RoutePayer` (routed calls) | none per call, by design: a ROUTE-STATE is a running meter (a stated limit) |
+| close, rollover, open | control requests: their answers are checked against the transaction we signed |
+
+**A `#` in a URL or target (T2).** The digest drops a fragment and the server routes on the target
+as it arrives, so a payment for `/a` also authenticated `/a#b`. The digest and its vectors are
+unchanged; a `#` is refused on both sides (`xbt402::wire::no_fragment`):
+* payer, `bad_request` before anything is sent, numbered or signed: `Client::request`,
+  `request_conditional`, every payload it authenticates (`Client::auth`), `RoutePayer::shard` and its
+  hub URL, the wallet (`origin_of`, `with_auth`), a seller's `openUrl` / `closeUrl` / `chunkUrl`
+  (`seller_url`), and the provider origin of a routed lock at the hub;
+* provider, HTTP 400 before anything is authenticated or routed: `Provider::serve` (paid, control,
+  `/lock`, facilitator and other-scheme paths alike), `RouteHub::serve`, and the shared server
+  itself (`xbt_svc::http`, so the MCP, the UI and the relay too).
+
+**One address cannot hold every connection (T1).** The cap was one global number. `Limits` has
+`per_address` (default 48 of the 64): a client address above it gets 503 while other addresses are
+still served. An address is an IPv4 address (an IPv4-mapped IPv6 address counts as its IPv4) or an
+IPv6 /64. `XBT_HTTP_MAX_PER_ADDRESS` sets it for a process (0: no cap per address, for a server
+whose only peer is its reverse proxy; anything but a whole number stops the server from starting).
+* Why 48: behind a reverse proxy every connection comes from the proxy's address, so a low default
+  would cut such a deployment to a fraction of its slots, and one address that sends 32 slow heads
+  must still be able to make a request (the AGP-068 slowloris checks). 48 leaves 16 slots that one
+  address cannot take.
+* The limit that remains: four addresses fill the server. A public listener still belongs behind a
+  proxy or firewall with its own per-client limits.
+
+**One Electrum server cannot stall or exhaust the light client (E1).**
+* *Line limit, before parsing.* Every request has an answer cap from its method
+  (`conn::answer_cap`): bytes and JSON values. A line, complete or still arriving, is held to the
+  sum of the caps of the requests waiting on that connection plus 16 KiB for notifications, and to
+  8 MiB in any case (`MAX_LINE`, down from 64 MiB). A server that sends more is dropped and flagged.
+  The values bound (`values_in`: commas and opening brackets, plus one) is there because a dense
+  line costs many times its size as a parsed tree.
+
+  | request | bytes | values |
+  |---|---|---|
+  | `blockchain.block.headers` (n headers) | 4,096 + 328 n (2016: 665,344) | 64 |
+  | `blockchain.transaction.get` | 2,001,024 (a transaction of 1,000,000 bytes) | 64 |
+  | `blockchain.scripthash.get_history`, `listunspent` | 1,604,096 (10,000 entries) | 60,016 |
+  | `blockchain.transaction.get_merkle` | 8,192 | 128 |
+  | everything else, and each notification | 16,384 | 64 |
+
+* *Sync.* One server's part of a round ends at `Config::sync_deadline` (default four times the
+  request timeout), each request inside it waiting no longer than what is left, or at the first
+  answer with fewer headers than asked (all below the tip the server itself claimed). Either way
+  the headers it proved are kept and it is flagged. A batch that fails no longer drops the headers
+  proven before it.
+* *History and cache.* A history or unspent list of more than `MAX_HISTORY` (10,000) entries is not
+  used and its server is flagged. Transactions are fetched 16 per batch (`TX_BATCH`), not one batch
+  of everything. The transaction cache holds 32 MiB of raw transactions (`TX_CACHE_BYTES`), oldest
+  out first, and a cached proof goes with its transaction. A history entry that neither pays the
+  script nor spends an output that pays it flags the server that listed it. A history or unspent
+  call that no server answered is an error; before, it was an empty list.
+
+Measured with `crates/xbt-electrum/examples/e1_attacks.rs` on a Ryzen 9 9950X3D, release build, the
+hostile server in a child process, wall time and the client's peak resident memory. "Before" is the
+same file built in a worktree of `main` (`a8250f4`):
+
+```
+for a in trickle bigline history "history 20000"; do
+  cargo run -q --release --offline -p xbt-electrum --example e1_attacks -- $a
+done
+```
+
+| attack | before | after |
+|---|---|---|
+| trickle: 120 headers, one per answer, 400 ms each, an honest server beside it; the first `block_count()` | 48.45 s, 4.0 MiB, no flag | 0.40 s, 4.0 MiB, flagged `withheld headers` |
+| a 16 MiB line of `[[],[],…]` ahead of one small answer | 0.62 s, 403.6 MiB, parsed, no flag | 0.005 s, 3.9 MiB, dropped at 32,768 bytes and flagged; the call fails |
+| 8,000 invented history entries, each served | 11.75 s, 28.8 MiB, 8,001 fetches, no flag | 11.55 s, 17.4 MiB, 8,001 fetches, flagged |
+| 20,000 invented history entries | 138.85 s, 64.4 MiB, 40,001 fetches, no flag | 0.03 s, 5.1 MiB, 1 fetch, dropped at the line cap and flagged; the call fails |
+
+The 8,000-entry row is under the bound, so its fetches still happen: what changed is that they come
+in batches of 16, stay inside the cache, and are flagged. Most of its time is the simulator's.
+
+Limits, stated: a script with more than 10,000 history entries, or a transaction above 1,000,000
+bytes, is not answered by this backend (every standard transaction is at most 400,000 bytes). An
+invented transaction that pays the script cannot be told from an unconfirmed payment, so that flag
+catches only entries unrelated to the script. A server that trickles full-size answers just inside
+the timeout is cut at the deadline every round, and with no honest server beside it the tip still
+advances only as fast as that server allows (`status()["tip_age_s"]`, and on mainnet the stale-tip
+rule, show it). A server whose `blockchain.block.headers` maximum is below 2016 is treated as
+withholding.
+
+**A rollover keeps its next channel from before the request leaves (C3).** `rollover_inner`
+returned at a failed POST before the next key was bound or a refund produced, while the provider
+may have broadcast the one transaction we signed: a client with a local key then held no key and no
+refund for the next channel.
+* The next channel is recorded in `Client::next_rolled` and saved to the injected ledger (record
+  `next <origin>`) before the POST. With a local key its refund is produced and handed to
+  `on_refund` at that point too.
+* With a signer, the key was always the signer's (`new_key`), and the wallet's signer binds a next
+  channel only once its own node shows the rollover (AGP-080). The record therefore carries the
+  funded params; the bind (`attach`) and the refund follow the reply. Before, an `attach` refused
+  `rollover_unproven` after a good reply lost the next channel's params as well.
+* `Client::adopt_rolled(origin, txid)` makes a recorded next channel the live one when the reply
+  was lost or an error and the embedder sees the rollover transaction on chain; then `open_rolled`
+  as usual. A record stays until it is adopted; one whose transaction can no longer confirm (the old
+  channel was closed another way) is the embedder's to remove from `next_rolled`.
+
+| path that signs a rollover | next channel kept |
+|---|---|
+| `Client::rollover`, local key | key, refund and record before the POST (this change) |
+| `Client::rollover`, signer (`RemoteSigner`, `LocalSigner`) | record before the POST; bound and refunded after the reply or by `adopt_rolled` (this change) |
+| the hub's ch2 rollover (`RouteHub`) | already safe: the next ch2, its key and its refund are written to the hub's book before the request (`hub.rs`, "write-ahead"), and only a 400/401/403 answer clears them |
+| `xbt-signer` `xbt402_new_key` / `xbt402_sign_rollover` | already safe on the signer's side: the issued key is sealed to disk at once as `pending:<origin>/next`, and `next` is checked at signing |
+
+**The xbt-work rail, stated limits.** Its request binding is taken over the bare target (as the
+published XBT-053 vectors are): no scheme, host or port. Its PAYMENT-RESPONSE is unsigned and covers
+neither the status nor the body. The client now requires that response on every call paid with
+work, and a `#` is refused as on the channel rail; raising the rest to the channel rail's level is
+a change to the xbt-work spec and its vectors, not made here. The module docs of `xbt_work::payer`
+say the same. Run this rail over TLS to the provider.
+
+**For embedders (cmp).**
+* A paid call below 400 with no PAYMENT-RESPONSE is now `Err(bad_receipt)`, and a URL with a `#` is
+  `Err(bad_request)`.
+* `xbt_svc::http::Limits` has a new field, `per_address`; `Limits::default()` sets it.
+* `xbt_electrum::Config` has a new field, `sync_deadline` (`None`: four times `timeout`), and
+  `MAX_LINE` is 8 MiB. `history`-backed calls (`tx_out`, `spending_tx`, `unspent`) return an error
+  when no server answered, where they returned "nothing" before.
+* After a failed `Client::rollover`, look at `next_rolled`: the refund of each record is the way
+  back for that next channel if its rollover confirms.
+
+Found and not fixed here: the hub's ch2 rollover writes the next ch2 ahead, but clears it when the
+provider answers 400, 401 or 403 ("refused: nothing was broadcast"). A provider that answers so
+and broadcasts anyway leaves the hub without the next ch2's key. Same in B1; a B1-only change is
+parked on B1 branch `agp-081-hub-rollover`, not reviewed, for a hub task in both languages.
+
+Noticed and not changed: after one answer lost on the way, the next receipt shows two calls' growth
+in `spentMsat` and the client refuses it `bad_receipt` (`Client::receipt` has no slack for a lost
+answer; the 402 path has one call of slack).
+
+Tests, each failing on `main` and passing here unless marked:
+* `xbt402/tests/lifecycle.rs`: `a_paid_answer_without_a_receipt_is_refused`,
+  `a_conditional_answer_without_a_receipt_is_refused`,
+  `a_target_with_a_fragment_is_refused_by_the_payer`,
+  `a_target_with_a_fragment_is_refused_by_the_provider`,
+  `a_rollover_binds_the_next_channel_before_the_request_leaves`; and, using the new
+  `adopt_rolled` (so they do not build on `main`),
+  `a_signer_backed_rollover_keeps_its_next_channel_until_the_signer_binds_it`,
+  `a_rollover_whose_reply_was_lost_is_adopted_from_the_chain`;
+* `xbt-work/tests/rail.rs`: `a_paid_answer_without_a_receipt_is_refused`;
+* `xbt-svc/tests/http_server.rs`: `one_address_cannot_hold_every_connection` (two addresses over a
+  dual-stack listener; without IPv6 loopback only its same-address half runs),
+  `a_target_with_a_fragment_is_refused`; unit tests in `http.rs`
+  (`an_address_at_its_cap_is_refused_and_no_other_is`,
+  `one_address_is_an_ipv4_address_or_an_ipv6_slash_64`);
+* `xbt-electrum/tests/backend.rs`: `a_trickled_header_sync_is_cut_off_and_flagged`,
+  `an_oversized_line_is_dropped_before_it_is_parsed`, `an_invented_history_is_bounded_and_flagged`,
+  and `a_slow_header_sync_ends_at_its_deadline` (uses the new `sync_deadline`); unit tests
+  `conn::tests::answer_caps_fit_the_largest_legitimate_answer`,
+  `conn::tests::values_in_never_undercounts`,
+  `backend::tests::the_transaction_cache_drops_the_oldest_at_its_cap`.
+
+New dependency: none (`cargo tree -d` is unchanged).
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
@@ -1799,8 +2119,8 @@ interleaved with the same example built on main:
 
 **What this does not fix.**
 
-- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^53 hashes per
-  block. The floor only raises the bar for a fork that also hides the real tip. Releases should bump
+- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^56 hashes per
+  block (2^72 / 0xf0b5). The floor only raises the bar for a fork that also hides the real tip. Releases should bump
   the pins, and operators can set a later checkpoint.
 - A call that fans out to every server waits for the slowest one, up to the timeout (no lock held).
 - One batch can fetch up to 4×2016 junk headers before the first is checked (B2 fetches chunk by
@@ -1941,7 +2261,8 @@ first run against `main` and failed there.
   allows one credit per hash per height (about 1507–1527); then the TIDES ledger is credited and, for a
   `.pw-<invoice>` username, so is the receipt (`work_receipts.credit`, about 1563–1566). The audit does
   not re-check shares: it cannot see them. It bounds what the Prime can claim about them.
-* **P2: a pass releases only what it covered.** The book keeps one `Span` per receipted increase:
+* **P2: a pass releases only what it covered.** (Replaced by AGP-079 below: a pass now covers only
+  what the coinbase paid for, and nothing is forgiven. What follows is the AGP-065 design.) The book kept one `Span` per receipted increase:
   invoice, `lo..hi`, work, credited, coverage (`Open`, `Covered(h)`, `Skipped(h)`). A passing audit at `H`
   with window start `ws` covers only open spans with `lo > ws` and `hi < H`, exactly the intervals its
   bound counted. Spans at or below `ws` are `Skipped`: no later window can count them. Up to
@@ -1952,14 +2273,14 @@ first run against `main` and failed there.
   (`chain::ChainBlock { height, hash, value_sats, paid_sats, bits, prev_bits }`). A statement for another
   height or hash fails with `wrong_block` (`p3_statement_height_must_be_the_blocks`: `height = u32::MAX`
   and `height = window_start + 1`).
-* **P4: a missing statement is never skipped.** `tools::window`: 200 is a statement, 404 (primed's
+* **P4: a missing statement is never skipped.** `provider::window_statement` (`tools::window`): 200 is a statement, 404 (primed's
   "no window statement", `stats.rs` 434) is `Statement::Missing`, and anything else is an error.
   `WorkProvider::audit_chain`: a missing statement for a coinbase that paid the identity fails the
   audit and distrusts the Prime (`missing_statement`); for one that paid nothing it records nothing and
   the credit stays held. The audit loop stops at a Prime or node error and resumes at that block.
   Tests: `p4_a_statement_error_is_not_a_missing_statement`, `p4_a_missing_statement_fails_or_holds`.
 * **P5: default caps.** With no cap flag, `xbt-work-provider` caps unaudited credit at 100 calls per invoice
-  and 1,000 calls in total, and forgives at most 100 calls of skipped credit. `--cap-*-calls N` (new)
+  and 1,000 calls in total (AGP-065 also forgave 100 calls of skipped credit; AGP-079 forgives none). `--cap-*-calls N` (new)
   sets a cap in calls at `--price`, and `off` removes a cap. The library's `CreditCaps::default()` is
   still uncapped (the reference's book, which the vectors pin). Test: `p5_the_binary_ships_non_zero_caps`.
 * **P6: invoices, issuance, state, reorgs.**
@@ -2017,8 +2338,9 @@ first run against `main` and failed there.
 | `xbt-work-provider` | caps off by default | 100/1,000/100 calls; Prime terms flags; reorg check; admin from loopback peers only |
 | xbt402 HTTP server | | sets `X-Xbt402-Peer` to the TCP peer on every request |
 
-The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: the
-same logic lives in XBT-053 (lazarus-xbt), and the spec diff is routed there. The vectors are unchanged
+The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: there is
+none. XBT-053's Python (`receipts.py`) has the v1 draft audit only, with none of P1–P4; this crate is
+the reference for them (see AGP-079 below). The vectors are unchanged
 (`work_conformance.sh`: 91/91 and 124/0, byte-identical).
 
 Results on 2026-10-08: `cargo test --workspace` (464 passed) and `scripts/conformance.sh`;
@@ -2042,6 +2364,138 @@ beside it; pass lines declared before measuring):
 The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verifications (AGP-032), of
 which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
 makes one pass over the spans; before, it recomputed the caps' room for each open span.
+
+## Pay-with-work closure fixes: credit is covered by what coinbases paid (AGP-079, P1 and P4)
+
+The closure audit (AGP-077) reproduced four routes by which a Prime colluding with a payer still got
+unmined work credited and released, and two ways an underpaid block escaped the audit. All were present
+on `main` (`50ab5f5`). Tests: `crates/xbt-work/tests/agp077_closure_audit.rs` (10; the six that state
+the findings failed before the fix), `review_p.rs`, and the book's unit tests.
+
+**The cause.** AGP-065 bounded every number in a window statement, but a *passing* audit still released
+all the credit its bound counted, whatever the coinbase paid. A pass is cheap for the Prime to arrange:
+a deferral line it signs counts as paid, `expected < min_payout` passes with nothing paid, a window
+that starts above the credit expects nothing, and a block with no statement has no verdict at all.
+
+**Options weighed.**
+
+| option | verdict |
+|---|---|
+| Cover a span after it was counted in N passing blocks (N = `window`) | No. An honest pool finds a Poisson(8) number of blocks while a share is in its window: fewer than 8 about 45% of the time. Which blocks are pool blocks and where the window starts are the Prime's word. |
+| Price a haircut for the risk | No. Paying one block of eight is a discount of 7/8; no usable haircut prices that. |
+| Default carry caps only | Not enough. They stop the deferral route after a few blocks, and do nothing for the other three. Kept as a second line. |
+| **Cover credit only by what coinbases paid, at the provider's own price** | Chosen. It uses nothing the Prime signs, so it closes the four routes and any other way of arranging a pass. |
+
+**The rule.** `ReceiptBook` keeps credit in the order it was granted (`credits`). When a block's audit
+passes, `WorkProvider::paid_work(&ChainBlock)` turns what its coinbase paid the identity (from the
+provider's own node) into work units at the price the provider sells work for, at that block's own
+difficulty and value: under exact pricing, the work `paidSats` buys by §6.2 with the pinned fee and the
+haircut; with a fixed amount per call, `paidSats × amount / invoice_price_sats`. `ReceiptBook::pay(h,
+work)` records it per height and the paid-for work covers the oldest credit first. Unaudited credit, the
+thing the §13.1 caps count, is the credit no coinbase has paid for yet. A failed audit pays for nothing.
+Auditing a block again replaces its payment, a reorg removes it (`uncover`), and `settle` forgets only
+payments deeper than `SETTLE_DEPTH` together with the credit they cover; a settled block audited again
+is not paid for twice (`settled_through`). Work paid for beyond the credit granted is room for new credit. The `Span`/`Coverage` states and the skipped allowance are gone.
+
+So a Prime gets credit released only by paying the provider, in coinbases of real blocks, the price of
+the calls. What it has not paid for stays inside the caps: 1,000 calls in total with the shipped
+defaults, once, not per block.
+
+| route (closure audit, list 1 item 2 and 4) | before | now | test |
+|---|---|---|---|
+| deferral lines, no carry cap | 5,000 units credited over a cap of 1,000, nothing paid | the lines pass the audit and cover nothing; the shipped carry cap freezes credit after the first | `p1_deferral_lines_do_not_release_credit_no_coinbase_paid_for`, `p1_deferral_lines_release_nothing_even_without_a_carry_cap` |
+| `min_payout` excuse | 2,000 units, nothing paid | the pass covers nothing; the total cap binds | `p1_the_min_payout_excuse_does_not_release_credit` |
+| `window_start` moved forward | all credit for 1/8 of its price | 1/8 paid covers about 1/8 (14% at the 10% haircut) | `p1_a_window_start_moved_forward_does_not_release_unpaid_credit`, `p1_one_block_of_eight_pays_for_an_eighth_under_the_shipped_defaults` |
+| unpaid pool blocks answered 404 | seven unpaid blocks vanish, the eighth releases everything | unpaid blocks cover nothing | `p4_unpaid_blocks_with_no_statement_do_not_vanish_from_the_audit` |
+| a statement the audit refuses, on a paid block | logged, no verdict, never retried | a failed audit, the Prime distrusted (`refused_statement`), exactly as with no statement | `p4_a_refused_statement_on_an_underpaid_block_is_a_failed_audit`, `p4_every_refused_statement_on_a_paid_block_distrusts_the_prime` |
+| the honest case | one pass released everything | the eight blocks of a window pay for all of it | `an_honest_window_pays_for_all_the_credit_under_the_shipped_defaults` |
+
+**P4.** `WorkProvider::audit_chain` treats a statement that `audit` refuses with one of
+`STATEMENT_REFUSALS` (`bad_window_sig`, `wrong_prime`, `wrong_block`, `bad_window`,
+`window_start_regressed`) as the block having no statement. On a coinbase that paid the identity that
+is a failed audit and distrust; the audit record carries `refusedStatement`. The audit loop no longer
+logs and moves on. A block that paid the identity nothing and has no usable statement still has no
+verdict: the provider cannot tell the Prime's unpaid block from another pool's block. It counts against
+the Prime in the only way open to the provider: it covers nothing.
+
+**Shipped defaults (`WorkConfig::shipped`, which `xbt-work-provider` starts from).** The decisions:
+
+| setting | before | now | override |
+|---|---|---|---|
+| caps on unaudited credit | 100 / 1,000 calls | the same | `--cap-invoice*`, `--cap-total*` |
+| skipped credit forgiven | 100 calls | none; the flag is ignored with a notice | — |
+| cap on owed carry | off | the value of 1,000 calls (150,000 sats at the default price) | `--max-carry-sats S`, `off` |
+| carry growth rule | off | off: at an honest Prime a share below `min-payout` grows as carry for several blocks; set it when the provider attests every tip | `--carry-growth-blocks N` |
+| work book | memory only without `--state` | `DIR/work.json` in the data dir, under the ledger's process lock | `--state FILE`, `--state off` |
+| audit loop | off without `--audit-depth` | 6 deep whenever `--window-url` is given | `--audit-depth K`, `off` |
+| no `--window-url` | silent | starts, and says that no audit runs and credit stops for good at the total cap | — |
+
+The two tests that needed `--features tools` run in the default sweep: `window_statement` moved to
+`provider.rs` (`tools::window` re-exports it) and the caps (`Cap`, `Caps::SHIPPED`) moved from the
+binary into the library. `p3_statement_height_must_be_the_blocks` now has the literal
+`height = window_start + 1` case.
+
+**Other paths to the same state, each checked.** Credit is granted in one place, `ReceiptBook::credit`,
+within `room`; these reach it or the payments:
+
+| path | covered by |
+|---|---|
+| a receipt from the relay, the Prime or a payer's header (`accept`, `refresh`, `check_and_debit`), a replay | `credit` within `room`; `caps_hold_unpaid_credit_until_a_coinbase_pays_for_it` |
+| `audit`, the admin audit endpoint, the audit loop | all go through `audit` / `audit_chain`; the admin controls (`underpayHeight`, `withoutDeferrals`) record nothing |
+| re-auditing a block | `pay` replaces: `payments_cover_the_oldest_credit_and_a_reorg_takes_them_back` |
+| a reorg (`orphaned`) | `uncover`: `p6_a_reorg_rolls_back_released_credit` |
+| settling deep audits (`record` → `settle`) | forgets only paid credit; same book test |
+| new caps at an epoch (`set_caps`) | `release_held` within the new caps |
+| a restart | `credits`, `cover`, `coverSettled` are in the state file (version 3): `unpaid_credit_and_payments_survive_a_restart` |
+| state from AGP-065 or AGP-043 | covered spans count as paid and settled; open and skipped credit loads as unpaid, none forgiven: `earlier_receipts_survive_a_restart_and_agp043_state_migrates` |
+| XBT-053's Python reference | has none of P1–P4 or of this rule: see below |
+| B1, B2 | hold no pay-with-work audit code |
+
+**Stated limits.**
+
+- An unpaid block with no statement leaves no verdict and no fraud proof. A payer's real work that a
+  Prime never pays for costs the provider up to the total cap. Naming the pool's blocks independently
+  needs the share-log commitment (`docs/xbt-work-share-log-commitment.md`, not implemented).
+- The provider now carries the pool's luck. An honest window pays in 8 blocks on average; when the pool
+  finds fewer, credit stays unaudited longer and new credit can be held at the caps until later
+  coinbases catch up. Paying for work at the list price (10% haircut) gives about 11% more cover than
+  the work mined, which absorbs part of it. Operators who trust their Prime can raise the caps.
+- Every coinbase output to the identity counts as payment, whatever it was for. Use an identity that
+  receives nothing but this Prime's pay-with-work payouts.
+- A locked coinbase payout still counts as paid (M1).
+- Exact pricing rounds up to one work unit, so a passing block that paid 1 sat pays for 1 unit
+  (0.09 sat of work on mainnet). On regtest a call costs one unit and each paying block pays for one.
+- A statement for a stale block served during a reorg, on a block that pays the identity, distrusts
+  the Prime like a missing one does. The shipped audit depth of 6 keeps the loop away from the tip.
+- State migrated from AGP-065 cannot reopen a block audited before the upgrade if it is reorged after.
+- Fraud proofs still convict only for a checker who knows the Prime's terms; T2/T4 for the xbt-work
+  rail are not part of this task.
+
+**Cost.** `cargo run --release -p xbt-work --example audit_cost` on x86_64, this branch against `main`
+(`50ab5f5`), 1,000 receipted increases over 100 invoices: credit room per paid call 0.02 µs (main
+1.8 µs), `audit_block` 71 µs (71 µs), `check_fraud_proof` 2.9 ms (2.9 ms). The AGP-065 pass lines are
+for armv7; armv7 was not rerun. The room is now one walk over the unpaid credit instead of over every
+span.
+
+**XBT-053.** The Python reference (`~/xbt-rnd/XBT-053`, `receipts.py`) implements the v1 draft audit:
+no bounds, no chain block, no missing-statement rule, no caps. The audit rules of AGP-065 and the cover
+rule above are specified by this crate, which is the reference for them until the spec (§10.2, §10.3,
+§13.1) carries them; the spec diff is in the task result for the XBT-053 owner. `audit_block` and
+`check_fraud_proof` are unchanged, so the vectors are too (`work_conformance.sh`).
+
+**For embedders.**
+
+| change | before | now |
+|---|---|---|
+| `CreditCaps` | `per_invoice`, `total`, `skipped` | `per_invoice`, `total` |
+| `ReceiptBook` | `spans`, `settled_skipped`, `audited(h, ws, passed)`, `skipped_work()` | `credits`, `cover`, `cover_settled`, `pay(h, work)`, `paid_work()`; `uncover` and `settle` keep their signatures |
+| `book::{Span, Coverage}` | | removed |
+| `WorkProvider` | | adds `paid_work(&ChainBlock)`; `audit_chain` returns a failed outcome for a refused statement on a paid block instead of `Err` |
+| `provider` | | adds `window_statement`, `Cap`, `Caps`, `WorkConfig::shipped`, `STATEMENT_REFUSALS`, `SHIPPED_*` |
+| audit record, report | `skippedWork`, `forgivenSkippedWork` | `paidForWork` (per audited block; in `credit`, the paid-for work not yet settled against credit), `refusedStatement`; `coveredWork` is the credit the block newly covered |
+| provider state file | version 2 | version 3 (`credits`, `cover`, `coverSettled`); versions 1 and 2 load |
+| `xbt-work-provider` | see the defaults table | |
+| `Amount::Fixed` providers | | set `invoice_price_sats`, or payments are valued at the work's §6.1 value |
 
 ## Lightning rail hardening (AGP-066, review L1–L5)
 
@@ -2201,6 +2655,163 @@ Pi-class figure, x86_64 native beside it; pass line declared before measuring):
 The L5 cache check adds one `getblockhash` RPC to the signer's own node per usable channel on each
 `ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
 listing with one record. The L1 parse runs once, at configuration.
+
+## Lightning rail pays BOLT 12 offers (AGP-082)
+
+`ln_pay` takes a BOLT 12 offer (`lno1...`) as well as a BOLT 11 invoice. The seller publishes one
+offer; each payment is an invoice the seller signs for it, which the wallet keeps. Nothing else is new:
+no bridge service, no channel-script change, no new 402 entry, and the wallet still only pays. Code:
+`crates/xbt-signer/src/bolt12.rs` (the reader) and `src/ln_offer.rs` (the payment); tests in
+`src/bolt12.rs` and `tests/ln_rail.rs` (`agp082_*`).
+
+**What is checked, and where.** The signer reads the offer and the invoice itself, as it does a BOLT 11
+invoice. It never asks the node to decode one, which would need `invoices:read`; the mainnet macaroon
+stays at `info:read offchain:read offchain:write onchain:read`. In order:
+
+1. **The offer** (`bolt12::check_offer`): feature bit 512, a chain this node is on, not expired, an
+   amount (its own, or `amount_sats` from the caller when it names none), the caller's `description` if
+   given, `max_sats`. Offers priced in a currency, sold by quantity, or carrying experimental-range
+   fields are refused (`ln_offer`).
+2. **The node and its channels**, as for BOLT 11: chain identity, macaroon, exposure cap, watchtowers,
+   funding proofs. One rule is stricter, see "Channels" below.
+3. **The policy**, on `ln-offer:<offer id>` and the amount plus the fee limit. Both are known before
+   any invoice exists, so a denied or over-threshold payment asks the issuer for nothing. The human's
+   approval is for that offer and that amount, once.
+4. **The invoice.** The node fetches it (`POST /v2/offers/fetchinvoice`, `offchain:read`). The signer
+   decodes the `lni1...`, verifies the BIP-340 signature over its Merkle root, and checks
+   (`bolt12::check_invoice`): bit 512; the chain; that it repeats this offer's fields byte for byte;
+   that the offer's issuer signed it (`offer_issuer_id`, or for an offer with none the last blinded
+   node of one of its paths); the amount asked; at least `ln.min_expiry_s` left; each payment path's
+   `cltv_expiry_delta` within `ln.max_cltv_blocks`. Then the node's own summary of the invoice
+   (`InvoiceInfo`) must agree with the decode field by field (`ln_decode_mismatch`).
+5. **The signer of the offer.** The key that signed an offer's first invoice is recorded in
+   `.run/ln_offers.json`. A later invoice for that offer signed by another key is refused
+   (`ln_offer_signer`), valid signature or not. An offer with several blinded paths may legitimately
+   be answered by a different blinded key each time; that is refused too, until the owner removes the
+   offer's entry from the file.
+
+The offer id is the SHA-256 of the offer's TLV bytes. That is Core Lightning's definition and what
+Lightning Fork reports as `offer_id`, so the allowlist entry can be read off either node.
+
+**The chain.** BOLT 12 reads an offer that names no chain as Bitcoin mainnet. XBT mainnet shares
+Bitcoin's genesis hash, so on mainnet a chain-less offer names this chain and SHA-256 Bitcoin alike,
+and most offers are chain-less. Bit 512 is what tells them apart: a chain-less offer with bit 512 is
+payable on mainnet, and without it is refused. Off mainnet a chain-less offer names another chain and
+is refused. The chain an offer must name is block 0 of the signer's own node. Lightning Fork's code at
+`v0.21.3-beta-blake2b.17` reads it the same way (its `docs/bolt12-offers.md` still says a chain-less
+offer "is reported as not for this chain"; the code and its tests say otherwise). The test
+`lightning_forks_own_offers_and_invoices` pins the fork's verdicts, so a drift on either side fails.
+
+**One invoice per attempt.** The fetched invoice is written to `ln_offers.json` before it is paid, and
+it is the invoice that is paid (`POST /v2/offers/pay` with `invoice`), never the offer. Paying the
+offer again would fetch a second invoice, and a retry that settled beside the first would pay twice.
+A later `ln_pay` of the same offer for the same amount pays the stored invoice while it is unpaid and
+not expiring; a new one is fetched only after that one settled. Invoices asked of one offer are
+limited by `ln.max_sends_per_hour`, paid or not.
+
+**Channels.** `PayOffer` takes neither a set of outgoing channels nor a CLTV limit, so the wallet
+cannot confine an offer's payment to the channels it has proven, as it does for BOLT 11
+(`outgoing_chan_ids`). Instead it refuses the payment (`ln_offer_unsafe_channel`) unless **every**
+channel of the node passes the guards and the funding proof, inactive ones included. A node with a
+taproot, non-unified, zero-conf or pre-split channel pays BOLT 11 invoices and no offers. The node's
+own `max-cltv-expiry` bounds the route's time lock; the wallet bounds the invoice's blinded paths.
+The fee limit sent is never 0, which the node reads as its default limit: it is at least 1 sat.
+
+**Not payer identity.** A BOLT 12 invoice names the key the request was signed with
+(`invreq_payer_id`). Lightning Fork draws a fresh key for every request, and `PayOffer` has no field
+for a caller's key, so two payments of one offer carry two payer ids. Each is recorded with its
+payment (`payer_id` in `ln_payments.json`, the signature log and the reply) and names that payment
+only. A stable payer id needs a change in the fork.
+
+**The audit's two Lightning findings** (the AGP-077 closure audit, list 1, item 11), fixed here because they are in
+the same file. Each has a test that failed before the fix (commit `c458b72` holds the tests alone):
+
+* **Redirects.** The REST client followed up to five redirects and kept the macaroon header, so a
+  node (or anything answering on its port) could send the macaroon to a host the loopback and
+  pinned-certificate checks refuse. Redirects are off, and a 3xx answer is an error, never "no such
+  payment". Test: `agp082_the_rest_client_follows_no_redirect_so_the_macaroon_goes_to_no_other_host`.
+* **The settle booking.** A settled payment was booked at the value and fee the node reported, with
+  no floor and no look at the preimage: a `SUCCEEDED` record with zero amounts took a 403 sat booking
+  to 0. The booking is now at least the invoice amount, and `SUCCEEDED` counts only with the 32-byte
+  preimage of the payment hash. Without it the whole worst-case booking stays, no proof of payment is
+  logged, and the rail halts until the human resumes it (the `ln_resume` approval of AGP-066). Tests:
+  `agp082_a_settled_payment_is_booked_at_no_less_than_the_invoice_amount`,
+  `agp082_a_settled_payment_without_the_preimage_of_its_hash_keeps_its_whole_booking_and_halts_the_rail`.
+
+**How the reader is tested.** No dependency was added; the reader and its checks are about 650 lines
+beside `bolt11.rs`. Every length and count from the wire is bounded before use (a string of at most 16,384
+characters, 64 records, 16 paths; a field's length is checked against the bytes left).
+
+* The specification's vectors (`tests/data/bolt12`, CC-BY 4.0): 12 string-format cases, 53 offers
+  (valid and malformed), 4 Merkle roots and the signed `invoice_request`.
+* Lightning Fork's own codec at `.17` as the reference implementation
+  (`tests/data/bolt12/lightning-fork-17.json`, generator `scripts/ln_rail/agp082vec.go`): 9 offers and
+  8 invoices it wrote, with its reader's verdict on regtest and on mainnet. This reader holds the same
+  fields, the same offer ids, verifies the fork's signatures, and reaches the same verdict on each.
+  No node ran for this; it is the fork's `bolt12` package alone.
+* A property test, `truncated_overlong_and_mutated_input_is_refused`: every truncation, every
+  single-bit flip of a signed invoice, every field's length replaced by six overlong encodings, counts
+  that promise more than is there, and 20,000 random mutations and random inputs. Nothing panics and
+  nothing but the signed invoice is accepted.
+
+**On a running node (AGP-083).** `scripts/ln_rail_regtest.sh` now pins Lightning Fork `cebc10fe`
+(`v0.21.3-beta-blake2b.17`) and adds a third lab node, `lf3`, whose one channel is opened from a coin
+confirmed above the split. 86/86 on 2026-10-10 (`docs/agp083_ln_rail_regtest.json`): S1-S18, the
+BOLT 11 scenarios, unchanged on `.17`, and S19-S24 for offers `lf2` mints:
+
+* `lf1`, which holds a taproot channel and a pre-split one, pays no offer (`ln_offer_unsafe_channel`,
+  before any invoice is asked for) and still pays a BOLT 11 invoice.
+* An offer the allowlist does not name is denied before any invoice is asked for.
+* `lf3` pays a 15,000-sat offer it cannot yet send: the payment fails on the node
+  (`FAILURE_REASON_INSUFFICIENT_BALANCE`) with nothing charged, twice. After `lf3` has the funds and
+  the signer has restarted, the same `ln_pay` pays the stored `lni1`. `lf2` issued one invoice for
+  all of it, and the preimage is in the reply, the payment book and the signature log.
+* The same offer again: a second invoice, the same signing key, another payer id.
+* An offer with no amount and two blinded paths, paid with `amount_sats`, twice. It keeps its issuer
+  id beside the paths, and its invoices are signed by that key, not by a blinded one.
+
+The reader agreed with the node on every offer and invoice: offer id, payment hash, signing key,
+payer id, amount, and the node's own summary field by field. Two things about the fork that the
+fake node did not show, neither in the reader:
+
+* **A direct peer still costs a fee.** `lf2`'s invoices are paid over blinded paths that start at
+  its peer `lf1`, so `lf3` pays `lf3 -> lf2 -> lf1 -> lf2`: 2,246 to 3,261 msat on 15,000 sats, and
+  `lf2` needs funds towards `lf1`. The fee stays inside the limit the policy booked. The channels the
+  payee's side uses are the payee's choice; the guards cover this node's channels only.
+* **The first invoice request for an offer with blinded paths can time out.** `lf3`, not a peer of
+  the path's first node, sent its request by `lf2`; `lf1` dropped it ("onion message cycle: next hop
+  is the sending peer") and `ln_pay` answered `ln_fetch_invoice` after `ln.timeout_s`. It worked a
+  minute later, once the node had connected to `lf1` (`docs/agp083_ln_rail_regtest_run1.json`). The
+  lab now connects `lf3` to `lf1` first. Nothing is booked for a fetch that times out, but it counts
+  against `ln.max_sends_per_hour` for that offer.
+
+CPU (`crates/xbt-signer/examples/bolt12_cost.rs`; armv7 musl under `qemu-arm-static` as the Pi-class
+figure, x86_64 native beside it; pass line declared before measuring). One iteration decodes and
+checks an offer of 1,024 TLV bytes (1,643 characters, two blinded paths) and its invoice (2,420
+characters), signature included:
+
+| step | pass line (armv7) | armv7 median | armv7 slowest of 1,000 | x86_64 median |
+|---|---|---|---|---|
+| decode and check a 1 KB offer and its invoice | ≤ 20 ms | 0.93 to 1.00 ms | 4.06 ms | 0.085 ms |
+
+**For embedders (cmp and anyone linking `xbt-signer`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `ln_pay` `invoice` | a BOLT 11 invoice | or a BOLT 12 offer (`lno1...`); an `lni1`/`lnr1` string is refused (`ln_invoice`) |
+| `ln_pay` `amount_sats` | | optional: the amount to pay an offer that names none; 0 or absent otherwise |
+| policy destination | `ln:<payee node id>` | or `ln-offer:<offer id>` for an offer |
+| `ln_pay` reply for an offer | | adds `offer_id`, `payer_id`, `invoice_reused` |
+| `ln_pay` rules | | adds `ln_offer`, `ln_offer_mismatch`, `ln_offer_signer`, `ln_offer_store`, `ln_offer_unsafe_channel`, `ln_fetch_invoice`, `ln_preimage` |
+| a settled payment | booked at the node's reported value + fee | booked at no less than the invoice amount; without the preimage of its hash: verdict `pending`, rule `ln_preimage`, status `SUCCEEDED_UNPROVEN`, the rail halted |
+| `B2_LN_REST` redirects | followed, macaroon header kept | never followed; a 3xx is an `ln_backend` error |
+| node RPCs | | `POST /v2/offers/fetchinvoice`, `POST /v2/offers/pay`: needs `offersrpc` on the node, and onion messages on |
+| `LnBackend` | | adds `fetch_invoice` and `pay_offer` (default: an error, so existing backends compile) |
+| audit log | | `ln_preimage_mismatch` |
+| `.run/` | | `ln_offers.json`; `ln_payments.json` records of offers gain `offer_id`, `offer`, `payer_id`, `node_id`; a record may hold `preimage_ok: false` |
+| `ln_status` | | unchanged in shape |
+
+New dependency: none (`cargo tree -d` is unchanged).
 
 ## Embedders on xbt402 v1.3 (AGP-074)
 

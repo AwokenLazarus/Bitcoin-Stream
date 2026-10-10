@@ -206,3 +206,27 @@ fn the_peer_header_is_the_socket_peer_never_the_clients() {
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     assert!(text.ends_with("\r\n\r\n127.0.0.1"), "only the socket's peer address reaches the service: {text}");
 }
+
+/// AGP-080 X1: an allowlisted origin that answers 302 does not send the payer anywhere. The
+/// redirect comes back as the answer, and the host it names is never asked.
+#[test]
+fn x1_a_redirect_is_not_followed() {
+    let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+    elsewhere.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/stolen", elsewhere.local_addr().unwrap());
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = origin.local_addr().unwrap().to_string();
+    let t2 = target.clone();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = origin.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        s.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {t2}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    });
+    let r = xbt402::http::UreqTransport::default().request("GET", &format!("http://{addr}/paid"), b"", &[("PAYMENT-SIGNATURE".into(), "x".into())]).unwrap();
+    server.join().unwrap();
+    assert_eq!(r.status, 302, "the redirect is the answer");
+    assert_eq!(r.header("Location"), Some(target.as_str()));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(elsewhere.accept().is_err(), "the host the redirect names was asked");
+}

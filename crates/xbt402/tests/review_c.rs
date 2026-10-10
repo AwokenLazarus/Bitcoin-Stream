@@ -333,3 +333,126 @@ fn c5_another_process_holding_the_lock_is_refused() {
     Ledger::open(&path).unwrap();
     let _ = std::fs::remove_dir_all(d);
 }
+
+// --- AGP-076: the expiry a payer opens with ----------------------------------------------------------
+// The provider checks `left >= min_expiry_blocks` at its tip when the funded open arrives
+// (funding::check_funding), so the blocks the funding waited for come off the payer's slack. The
+// payer's floor is the offer's minExpiryBlocks + minConf + closeMarginBlocks (funding::open_expiry_floor).
+
+/// The provider, with `late` blocks mined before each funded open reaches it: a funding that
+/// waited that long for its confirmations.
+struct Late(Arc<Provider>, Arc<MemChain>, u32);
+
+impl Transport for Late {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        let (_, path) = split_url(url);
+        let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if path == OPEN_PATH && req.get("preflight") != Some(&Value::Bool(true)) {
+            *self.1.tip.lock().unwrap() += self.2;
+        }
+        Ok(self.0.serve(method, &path, headers, body, url, None))
+    }
+}
+
+fn open_late(late: u32) -> (Result<HttpResponse>, Option<u32>, Arc<MemChain>, Arc<Provider>) {
+    let chain = MemChain::new();
+    let prov = provider(&chain, secret("provider payTo"), Ledger::in_memory());
+    let mut c = client(&chain, Box::new(Late(prov.clone(), chain.clone(), late)), &Arc::new(AtomicUsize::new(0)));
+    let r = c.request("GET", &format!("{O}/v1/q"), b"");
+    let expiry = c.channels.get(O).map(|ch| ch.payer.params.expiry);
+    (r, expiry, chain, prov)
+}
+
+#[test]
+fn agp076_the_client_opens_at_the_offers_floor() {
+    let (r, expiry, _, prov) = open_late(0);
+    assert_eq!(r.unwrap().status, 200);
+    let (pol, margin) = (&prov.cfg.policy, prov.cfg.close_margin);
+    assert_eq!((pol.min_expiry_blocks, pol.min_conf, margin), (1_008, 1, 144));
+    assert_eq!(expiry, Some(1_000 + 1_008 + 1 + 144));
+}
+
+/// minConf + closeMarginBlocks pass before the funded open: the provider sees exactly
+/// minExpiryBlocks left. At minExpiryBlocks + 36 (or + 6) it answers `bad_expiry`.
+#[test]
+fn agp076_a_funding_that_confirms_a_close_margin_late_still_opens() {
+    let (r, expiry, chain, _) = open_late(1 + 144);
+    assert_eq!(r.unwrap().status, 200);
+    assert_eq!(expiry.unwrap() - chain.block_count().unwrap(), 1_008);
+}
+
+#[test]
+fn agp076_one_block_later_the_provider_refuses() {
+    let (r, _, _, prov) = open_late(1 + 144 + 1);
+    assert_eq!(r.unwrap_err().code, "bad_expiry");
+    assert!(prov.channel_ids().is_empty());
+}
+
+#[test]
+fn agp076_an_offer_without_close_margin_is_refused_before_funding() {
+    let chain = MemChain::new();
+    let funded = Arc::new(AtomicUsize::new(0));
+    let prov = provider(&chain, secret("provider payTo"), Ledger::in_memory());
+    let t = Edit(prov.clone(), Box::new(|_, _, mut r| {
+        if r.status == 402 {
+            let mut pr = json_body(&r);
+            for acc in pr["accepts"].as_array_mut().unwrap() {
+                acc["extra"].as_object_mut().unwrap().remove("closeMarginBlocks");
+            }
+            for (k, v) in r.headers.iter_mut() {
+                if k.eq_ignore_ascii_case("PAYMENT-REQUIRED") {
+                    *v = xbt402::wire::b64json(&pr);
+                }
+            }
+            r.body = pr.to_string().into_bytes();
+        }
+        r
+    }));
+    let mut c = client(&chain, Box::new(t), &funded);
+    let e = c.request("GET", &format!("{O}/v1/q"), b"").unwrap_err();
+    assert_eq!((e.code.as_str(), e.msg.as_str()), ("bad_offer", "extra.closeMarginBlocks missing"));
+    assert_eq!(funded.load(Ordering::SeqCst), 0);
+    assert!(prov.channel_ids().is_empty());
+}
+
+/// AGP-080 X1: every URL the client asks for, with the seller's `openUrl` rewritten on the way back.
+struct Pointing {
+    prov: Arc<Provider>,
+    open_url: String,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl Transport for Pointing {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        self.asked.lock().unwrap().push(url.to_string());
+        if !url.starts_with(&format!("{O}/")) {
+            return Err(ChannelError::new("transport_error", "another host"));
+        }
+        let (_, path) = split_url(url);
+        let mut r = self.prov.serve(method, &path, headers, body, url, None);
+        if let Some(h) = r.headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = xbt402::wire::unb64json(&h.1).unwrap();
+            pr["accepts"][0]["extra"]["openUrl"] = self.open_url.clone().into();
+            h.1 = xbt402::wire::b64json(&pr);
+        }
+        Ok(r)
+    }
+}
+
+/// The seller names `openUrl`. Appended to the origin, `@evil.example/open` is another host: the
+/// library client refuses it before any request and before funding (as the signer's session does).
+#[test]
+fn x1_a_seller_url_off_the_origin_is_refused() {
+    for bad in ["@evil.example/open", "//evil.example/open", ".evil.example/open", "https://evil.example/open", "/open\\@evil.example"] {
+        let chain = MemChain::new();
+        let funded = Arc::new(AtomicUsize::new(0));
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let prov = provider(&chain, secret("provider payTo"), Ledger::in_memory());
+        let mut c = client(&chain, Box::new(Pointing { prov, open_url: bad.into(), asked: asked.clone() }), &funded);
+        let e = c.request("GET", &format!("{O}/v1/q"), b"").unwrap_err();
+        assert_eq!(e.code, "seller_url", "{bad}: {e}");
+        let off: Vec<String> = asked.lock().unwrap().iter().filter(|u| !u.starts_with(&format!("{O}/"))).cloned().collect();
+        assert_eq!(off, Vec::<String>::new(), "{bad}: a request left the seller's origin");
+        assert_eq!(funded.load(Ordering::SeqCst), 0, "{bad}: nothing was funded");
+    }
+}

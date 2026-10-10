@@ -5,13 +5,13 @@
 //!
 //! xbt-work-provider --port P --rpc-port R --cookie PATH --identity ADDR --prime-pubkey HEX
 //!                   --prime-id N --receipt-url URL [--relay-url URL] [--window-url URL]
-//!                   [--state FILE] [--price SAT] [--haircut-bps N] [--work-units N] [--admin]
+//!                   [--state FILE | off] [--price SAT] [--haircut-bps N] [--work-units N] [--admin]
 //!                   [--pull-secs N]   (relay pull interval, default 3; 0: only before an audit)
 //!                   [--nta]           (§13.8: refuse an identity that is not key-path P2TR)
-//!                   [--audit-depth K [--audit-from H]]   (audit every block K deep on its own)
+//!                   [--audit-depth K | off [--audit-from H]]   (audit every block K deep on its own)
 //!                   [--cap-invoice W | --cap-invoice-sats S | --cap-invoice-calls N | off]
-//!                   [--cap-total ... ] [--cap-skipped ...]   (the same four forms each)
-//!                   [--max-carry-sats S] [--carry-growth-blocks N]
+//!                   [--cap-total ... ]   (the same four forms)
+//!                   [--max-carry-sats S | off] [--carry-growth-blocks N] [--max-unpaid-blocks N]
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
 //!                   [--max-unfunded-per-client N] [--trust-forwarded]
@@ -27,21 +27,38 @@
 //! at each epoch's price (without the haircut), or in calls at the `--price` (sats); `off` removes
 //! a cap. Owed carry above `--max-carry-sats`, or growing over `--carry-growth-blocks` audited
 //! blocks, stops new credit. AGP-065 (review P5): with no cap flag the provider caps unaudited
-//! credit at 100 calls per invoice and 1000 calls in total, and forgives at most 100 calls of
-//! skipped credit (credit the Prime's window moved past before any audit counted it).
+//! credit at 100 calls per invoice and 1000 calls in total.
+//!
+//! AGP-079, the shipped defaults (`WorkConfig::shipped`; no flag needed for any of them):
+//! * Credit stops being unaudited only as far as the audited coinbases paid for it, at this
+//!   provider's price (`WorkProvider::paid_work`). `--cap-skipped` is gone: nothing is forgiven.
+//! * Owed carry is capped at the value of 1000 calls (`--max-carry-sats S`, or `off`).
+//!   `--carry-growth-blocks` stays off: a share below the Prime's `min-payout` grows as carry for
+//!   several blocks at an honest Prime, so only a provider that attests every tip should set it.
+//! * The work book is kept in `DIR/work.json` (`--state FILE` moves it, `--state off` keeps it in
+//!   memory only: every balance is then lost on restart).
+//! * With `--window-url` the audit loop runs 6 blocks deep (`--audit-depth K`, or `off`). Without a
+//!   window URL nothing can be audited or paid for: credit stops for good at the total cap, and the
+//!   provider says so when it starts.
 //!
 //! AGP-065 (review P1): the Prime's pool terms are pinned here, never taken from a statement:
 //! `--prime-window` (primed `window`, default 8), `--prime-window-min-work` (primed
 //! `window-min-work`, default 0; regtest runs need the Prime's floor), `--window-tolerance-bps`
 //! (default 500), `--prime-fee-bps` (default 0, the fee the provider prices with) and
 //! `--prime-min-payout` (default 546). Every flag also reads an env variable: `XBT_WORK_CAP_INVOICE`,
-//! `XBT_WORK_CAP_INVOICE_SATS`, `XBT_WORK_CAP_INVOICE_CALLS`, the same for `_TOTAL` and `_SKIPPED`,
-//! `XBT_WORK_MAX_CARRY_SATS`, `XBT_WORK_CARRY_GROWTH_BLOCKS`, `XBT_WORK_AUDIT_DEPTH`, `XBT_WORK_NTA=1`,
+//! `XBT_WORK_CAP_INVOICE_SATS`, `XBT_WORK_CAP_INVOICE_CALLS`, the same for `_TOTAL`,
+//! `XBT_WORK_MAX_CARRY_SATS`, `XBT_WORK_CARRY_GROWTH_BLOCKS`, `XBT_WORK_MAX_UNPAID_BLOCKS`, `XBT_WORK_AUDIT_DEPTH`, `XBT_WORK_NTA=1`,
 //! `XBT_WORK_PRIME_WINDOW`, `XBT_WORK_PRIME_WINDOW_MIN_WORK`, `XBT_WORK_WINDOW_TOLERANCE_BPS`,
 //! `XBT_WORK_PRIME_FEE_BPS`, `XBT_WORK_PRIME_MIN_PAYOUT`, `XBT_WORK_MAX_UNFUNDED_PER_CLIENT`.
 //!
-//! The audit loop audits every block (review P4): a block with no statement that paid the identity
-//! fails; a Prime or node it cannot reach stops the pass, which resumes at that block. Before each
+//! The audit loop audits every block (review P4): a block that paid the identity with no statement,
+//! or with one the audit refuses, fails and distrusts the Prime; a Prime or node it cannot reach
+//! stops the pass, which resumes at that block. A block that paid the identity nothing and has no
+//! statement has no verdict (it may be any pool's), but while credit is unpaid it is counted
+//! (AGP-084): the report's `unpaidBlocks` is the run of them since a coinbase last paid for credit.
+//! `--max-unpaid-blocks N` stops new credit once the run reaches N, until a coinbase pays; it is off
+//! unless set, because N depends on how often the Prime's pool finds a block. A statement the Prime
+//! signed for such a block and the audit refuses is a failed audit, as on a paid block. Before each
 //! pass it compares the audited blocks with the node and undoes the audit of any reorged one.
 //!
 //! Admin (only with --admin, only from a loopback peer): `POST /admin/xbt-work/audit` with
@@ -51,7 +68,7 @@
 //! the identity nothing are audited too when the Prime published a statement for them (a block that
 //! carried the provider's share). `{"withoutDeferrals": H}` adds the control: block H audited as if its
 //! deferral lines were missing (not recorded). `GET /admin/xbt-work/report`: the audit log, the carry
-//! ledger, the credit exposure (unaudited, held, skipped, caps, frozen), the pinned Prime terms, and
+//! ledger, the credit exposure (unaudited, held, paid for, caps, frozen), the pinned Prime terms, and
 //! the audited payouts split into liquid and locked by the node's coinbase maturity.
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,76 +80,30 @@ use xbt402::ledger::Ledger;
 use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig, PEER_HEADER};
 use xbt402::rpc::Rpc;
 use xbt_work::audit::{audit_block, check_fraud_proof};
-use xbt_work::book::CreditCaps;
 use xbt_work::chain::ChainBlock;
-use xbt_work::pricing::{work_units_for_price, Pricing};
-use xbt_work::provider::{Amount, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH};
+use xbt_work::pricing::Pricing;
+use xbt_work::provider::{Amount, Cap, Caps, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH, SHIPPED_AUDIT_DEPTH, SHIPPED_HAIRCUT_BPS};
 use xbt_work::tools::{arg, block_count, block_hash, chain_block, flag, maturity, network, opt, prime_terms, rpc, tip_bits, window};
 
 fn num<T: std::str::FromStr>(flag: &str, var: &str) -> Option<T> {
     opt(flag, var).map(|v| v.parse().unwrap_or_else(|_| panic!("{flag} / {var}: not a number: {v}")))
 }
 
-/// A cap in work units, in sats (converted at the epoch's price, no haircut) or in calls at the
-/// call price; `Off`: no cap.
-#[derive(Clone, Copy, Debug)]
-enum Cap {
-    Work(u64),
-    Sats(u64),
-    Calls(u64),
-    Off,
+/// `--flag N` or `--flag off` (or the env variable): Some(None) for `off`, None when not given.
+fn num_or_off<T: std::str::FromStr>(flag: &str, var: &str) -> Option<Option<T>> {
+    opt(flag, var).map(|v| if v == "off" { None } else { Some(v.parse().unwrap_or_else(|_| panic!("{flag} / {var}: not a number or off: {v}"))) })
 }
 
-impl Cap {
-    /// `--cap-<name>[-sats|-calls]` (or the env variables), else `default`.
-    fn from_args(name: &str, default: Cap) -> Cap {
-        let var = format!("XBT_WORK_CAP_{}", name.to_uppercase());
-        for (suffix, mk) in [("", Cap::Work as fn(u64) -> Cap), ("-sats", Cap::Sats), ("-calls", Cap::Calls)] {
-            let (f, v) = (format!("--cap-{name}{suffix}"), format!("{var}{}", suffix.replace('-', "_").to_uppercase()));
-            if let Some(s) = opt(&f, &v) {
-                return if s == "off" { Cap::Off } else { mk(s.parse().unwrap_or_else(|_| panic!("{f} / {v}: not a number or off: {s}"))) };
-            }
+/// `--cap-<name>[-sats|-calls]` (or the env variables), else `default`.
+fn cap_from_args(name: &str, default: Cap) -> Cap {
+    let var = format!("XBT_WORK_CAP_{}", name.to_uppercase());
+    for (suffix, mk) in [("", Cap::Work as fn(u64) -> Cap), ("-sats", Cap::Sats), ("-calls", Cap::Calls)] {
+        let (f, v) = (format!("--cap-{name}{suffix}"), format!("{var}{}", suffix.replace('-', "_").to_uppercase()));
+        if let Some(s) = opt(&f, &v) {
+            return if s == "off" { Cap::Off } else { mk(s.parse().unwrap_or_else(|_| panic!("{f} / {v}: not a number or off: {s}"))) };
         }
-        default
     }
-
-    /// The cap in work units at this epoch (None: off). A price that cannot be converted caps at 0
-    /// (holds everything) rather than lifting the cap.
-    fn units(self, bits: u32, block_value_sats: u64, price_sats: u64) -> Option<u64> {
-        let r = match self {
-            Cap::Work(w) => Ok(w),
-            Cap::Sats(s) => work_units_for_price(s, bits, block_value_sats, 0, 0),
-            Cap::Calls(n) => work_units_for_price(price_sats, bits, block_value_sats, 0, 0).map(|w| w.saturating_mul(n)),
-            Cap::Off => return None,
-        };
-        Some(r.unwrap_or_else(|e| {
-            eprintln!("caps: {self:?} at bits {bits:08x}: {e}; capped at 0 until the next epoch");
-            0
-        }))
-    }
-
-    /// Whether the cap moves with the epoch.
-    fn priced(self) -> bool {
-        matches!(self, Cap::Sats(_) | Cap::Calls(_))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Caps {
-    invoice: Cap,
-    total: Cap,
-    /// The skipped credit forgiven; `off` forgives all of it.
-    skipped: Cap,
-}
-
-impl Caps {
-    /// review P5: what the provider runs with when the operator sets no cap.
-    const DEFAULT: Caps = Caps { invoice: Cap::Calls(100), total: Cap::Calls(1000), skipped: Cap::Calls(100) };
-
-    fn at(&self, bits: u32, v: u64, price: u64) -> CreditCaps {
-        CreditCaps { per_invoice: self.invoice.units(bits, v, price), total: self.total.units(bits, v, price),
-                     skipped: self.skipped.units(bits, v, price).unwrap_or(u64::MAX) }
-    }
+    default
 }
 
 struct Service {
@@ -225,8 +196,8 @@ impl Service {
 
     /// Audit every block in [from, to] (the auto-audit loop, review P4): the verdicts, and the next
     /// height to audit. A node or Prime it cannot reach stops the pass there (retried next time);
-    /// a statement it refuses (another block, a window start that went backwards) leaves the
-    /// block's credit held and moves on.
+    /// a statement it refuses (another block, a window start that went backwards) is the block
+    /// having no statement: a failed audit when the coinbase paid the identity.
     fn audit_range(&self, t: &UreqTransport, from: u32, to: u32) -> (Vec<(u32, bool)>, u32) {
         let Some(wurl) = self.window_url.as_deref() else { return (vec![], from) };
         let mut out = vec![];
@@ -252,7 +223,10 @@ impl Service {
             match self.work.audit_chain(&block, found) {
                 Ok(Some(o)) => out.push((h, o.ok)),
                 Ok(None) => {}
-                Err(e) => eprintln!("audit: height {h}: statement refused: {e}; its credit stays held"),
+                Err(e) => {
+                    eprintln!("audit: height {h}: {e}; retrying");
+                    return (out, h);
+                }
             }
         }
         (out, to.saturating_add(1))
@@ -320,48 +294,64 @@ fn main() {
     let node = rpc(&arg("--rpc-port").expect("--rpc-port"), &arg("--cookie").expect("--cookie")).expect("cookie");
     let net = network(&node).expect("network");
     let price: u64 = arg("--price").map(|p| p.parse().expect("price")).unwrap_or(150);
-    let mut wcfg = WorkConfig::new(&net, &arg("--identity").expect("--identity"), arg("--prime-id").expect("--prime-id").parse().expect("prime id"),
-                                   &arg("--prime-pubkey").expect("--prime-pubkey"), &arg("--receipt-url").expect("--receipt-url"));
-    wcfg.relay_url = arg("--relay-url");
-    wcfg.state_path = arg("--state").map(Into::into);
-    wcfg.invoice_price_sats = price;
-    wcfg.nta = flag("--nta") || std::env::var("XBT_WORK_NTA").is_ok_and(|v| v == "1");
     let subsidy = node.call("getblockstats", json!([block_count(&node).expect("height"), ["subsidy"]])).ok()
         .and_then(|s| s["subsidy"].as_u64()).unwrap_or(5_000_000_000);
-    // review P5: safe caps unless the operator sets them (in calls, so they hold on any chain)
-    let d = Caps::DEFAULT;
-    let caps = Caps { invoice: Cap::from_args("invoice", d.invoice), total: Cap::from_args("total", d.total), skipped: Cap::from_args("skipped", d.skipped) };
-    wcfg.caps = caps.at(tip_bits(&node).expect("bits"), subsidy, price);
-    wcfg.max_owed_carry_sats = num("--max-carry-sats", "XBT_WORK_MAX_CARRY_SATS");
-    wcfg.carry_growth_blocks = num("--carry-growth-blocks", "XBT_WORK_CARRY_GROWTH_BLOCKS");
+    let bits = tip_bits(&node).expect("bits");
+    let mut wcfg = WorkConfig::new(&net, &arg("--identity").expect("--identity"), arg("--prime-id").expect("--prime-id").parse().expect("prime id"),
+                                   &arg("--prime-pubkey").expect("--prime-pubkey"), &arg("--receipt-url").expect("--receipt-url"));
     wcfg.terms = prime_terms().unwrap_or_else(|e| {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     });
+    // AGP-079: the shipped defaults (pricing, caps on unaudited credit and on owed carry), then the flags
+    let mut wcfg = wcfg.shipped(bits, subsidy, price);
+    wcfg.relay_url = arg("--relay-url");
+    wcfg.nta = flag("--nta") || std::env::var("XBT_WORK_NTA").is_ok_and(|v| v == "1");
+    let caps = Caps { invoice: cap_from_args("invoice", Caps::SHIPPED.invoice), total: cap_from_args("total", Caps::SHIPPED.total) };
+    wcfg.caps = caps.at(bits, subsidy, price);
+    if ["--cap-skipped", "--cap-skipped-sats", "--cap-skipped-calls"].iter().any(|f| arg(f).is_some())
+        || ["XBT_WORK_CAP_SKIPPED", "XBT_WORK_CAP_SKIPPED_SATS", "XBT_WORK_CAP_SKIPPED_CALLS"].iter().any(|v| std::env::var(v).is_ok())
+    {
+        eprintln!("caps: --cap-skipped is no longer used (AGP-079): no credit is forgiven, it is covered by what the coinbases paid");
+    }
+    if let Some(m) = num_or_off("--max-carry-sats", "XBT_WORK_MAX_CARRY_SATS") {
+        wcfg.max_owed_carry_sats = m;
+    }
+    wcfg.carry_growth_blocks = num("--carry-growth-blocks", "XBT_WORK_CARRY_GROWTH_BLOCKS");
+    wcfg.max_unpaid_blocks = num("--max-unpaid-blocks", "XBT_WORK_MAX_UNPAID_BLOCKS");
     wcfg.max_unfunded_per_client = match num::<usize>("--max-unfunded-per-client", "XBT_WORK_MAX_UNFUNDED_PER_CLIENT") {
         Some(0) => None,
         Some(n) => Some(n),
         None => wcfg.max_unfunded_per_client,
     };
     wcfg.trust_forwarded = flag("--trust-forwarded");
-    eprintln!("caps: {:?} -> {:?} work units at this epoch; Prime terms {:?}", (caps.invoice, caps.total, caps.skipped), wcfg.caps, wcfg.terms);
+    eprintln!("caps: {:?} -> {:?} work units at this epoch, owed carry at most {:?} sats; Prime terms {:?}",
+              (caps.invoice, caps.total), wcfg.caps, wcfg.max_owed_carry_sats, wcfg.terms);
     wcfg.amount = match arg("--work-units") {
         Some(n) => Amount::Fixed(n.parse().expect("work units")),
-        None => Amount::Priced(Pricing { price_sats: price, bits: tip_bits(&node).expect("bits"), block_value_sats: subsidy, fee_bps: wcfg.terms.fee_bps,
-                                         haircut_bps: arg("--haircut-bps").map(|h| h.parse().expect("haircut")).unwrap_or(1000) }),
+        None => Amount::Priced(Pricing { price_sats: price, bits, block_value_sats: subsidy, fee_bps: wcfg.terms.fee_bps,
+                                         haircut_bps: arg("--haircut-bps").map(|h| h.parse().expect("haircut")).unwrap_or(SHIPPED_HAIRCUT_BPS) }),
     };
-    let work = Arc::new(WorkProvider::new(wcfg).unwrap_or_else(|e| {
-        eprintln!("xbt-work-provider: {e}");
-        std::process::exit(2);
-    }));
     let data = std::path::PathBuf::from(opt("--data-dir", "XBT_WORK_DATA_DIR").unwrap_or_else(|| "xbt-work-provider-data".into()));
     let die = |e: xbt402::ChannelError| -> ! {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     };
-    // the ledger first: its lock keeps a second process off this data dir, key file included
+    // the ledger first: its lock keeps a second process off this data dir, key file and work book included
     let ledger = Ledger::open(&data.join("channels.jsonl")).unwrap_or_else(|e| die(e));
     let sk = load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| die(e));
+    wcfg.state_path = match arg("--state") {
+        Some(s) if s == "off" => {
+            eprintln!("state: --state off: the work book is in memory only, every balance is lost on restart");
+            None
+        }
+        Some(s) => Some(s.into()),
+        None => Some(data.join("work.json")),
+    };
+    let work = Arc::new(WorkProvider::new(wcfg).unwrap_or_else(|e| {
+        eprintln!("xbt-work-provider: {e}");
+        std::process::exit(2);
+    }));
     let chain: Arc<dyn ChainBackend> = Arc::new(node.clone());
     let prov = Arc::new(Provider::new(chain, sk, ProviderConfig::new(&net), ledger,
                                       Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
@@ -394,9 +384,9 @@ fn main() {
                     .and_then(|s| s["subsidy"].as_u64()).unwrap_or(subsidy);
                 if w2.set_epoch(b, v) {
                     eprintln!("epoch: bits {b:08x}, block value {v} sats: new 402s quote {} work units", w2.amount(price).unwrap_or(0));
-                    if caps.invoice.priced() || caps.total.priced() || caps.skipped.priced() {
+                    if caps.invoice.priced() || caps.total.priced() {
                         let c = caps.at(b, v, price);
-                        eprintln!("caps: per invoice {:?}, total {:?}, skipped {:?} work units at this epoch", c.per_invoice, c.total, c.skipped);
+                        eprintln!("caps: per invoice {:?}, total {:?} work units at this epoch", c.per_invoice, c.total);
                         if let Err(e) = w2.set_caps(c) {
                             eprintln!("caps: {e}");
                         }
@@ -407,8 +397,20 @@ fn main() {
         }
     });
     let svc = Arc::new(Service { prov: prov.clone(), work: work.clone(), rpc: node, window_url: arg("--window-url"), admin: flag("--admin") });
-    // audit every pool block `depth` deep on its own (§10.3: RECOMMENDED k = 6); a pass releases held credit
-    if let Some(depth) = num::<u32>("--audit-depth", "XBT_WORK_AUDIT_DEPTH") {
+    // audit every pool block `depth` deep on its own (§10.3: RECOMMENDED k = 6), unless told not to;
+    // what a passing block's coinbase paid for covers credit, and held credit follows
+    let depth = match (num_or_off::<u32>("--audit-depth", "XBT_WORK_AUDIT_DEPTH"), svc.window_url.is_some()) {
+        (Some(d), _) => d,
+        (None, true) => Some(SHIPPED_AUDIT_DEPTH),
+        (None, false) => None,
+    };
+    match (depth, svc.window_url.is_some()) {
+        (Some(d), true) => eprintln!("audit: every block {d} deep, on its own"),
+        (Some(_), false) => eprintln!("audit: --audit-depth without --window-url: NO AUDIT RUNS; credit stops for good at the total cap"),
+        (None, true) => eprintln!("audit: off (--audit-depth off): only POST /admin/xbt-work/audit audits; credit stops at the total cap until it does"),
+        (None, false) => eprintln!("audit: no --window-url: NO AUDIT RUNS; credit stops for good at the total cap"),
+    }
+    if let Some(depth) = depth.filter(|_| svc.window_url.is_some()) {
         let s2 = svc.clone();
         let mut next = num::<u32>("--audit-from", "XBT_WORK_AUDIT_FROM")
             .unwrap_or_else(|| block_count(&s2.rpc).unwrap_or(0).saturating_sub(depth + 100).max(1));
@@ -442,22 +444,5 @@ fn main() {
              prov.pay_to(), work.cfg.identity, work.amount(price).unwrap_or(0));
     for h in hs {
         let _ = h.join();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// review P5: with no cap flag the binary caps unaudited credit, on mainnet and on regtest.
-    #[test]
-    fn p5_the_binary_ships_non_zero_caps() {
-        for (bits, v) in [(0x1702_3a6e_u32, 312_500_000u64), (0x207f_ffff, 5_000_000_000)] {
-            let c = Caps::DEFAULT.at(bits, v, 150);
-            let (inv, tot) = (c.per_invoice.expect("per-invoice cap"), c.total.expect("total cap"));
-            assert!(inv > 0 && tot >= inv && c.skipped > 0 && c.skipped < u64::MAX, "{bits:08x}: {c:?}");
-        }
-        assert_eq!(Cap::Off.units(0x207f_ffff, 1, 1), None);
-        assert_eq!(Cap::Sats(150).units(0, 1, 1), Some(0), "an unconvertible cap holds everything");
     }
 }

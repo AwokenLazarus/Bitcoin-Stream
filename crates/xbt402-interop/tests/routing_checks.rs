@@ -129,12 +129,17 @@ struct W {
 
 impl W {
     fn new(n: usize, kw: PKw) -> Self {
+        Self::keyed(n, kw, &|_| adaptor::random_secret())
+    }
+
+    /// Provider `i` holds `secret(i)` (a test that restarts one needs its key).
+    fn keyed(n: usize, kw: PKw, secret: &dyn Fn(usize) -> SecretKey) -> Self {
         let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
         let h = hub(&chain, &net, &dir);
         let mut provs = vec![];
         for i in 0..n {
             let origin = format!("http://p{i}.test");
-            provs.push((origin.clone(), provider(&chain, &net, &dir, &origin, adaptor::random_secret(), &kw)));
+            provs.push((origin.clone(), provider(&chain, &net, &dir, &origin, secret(i), &kw)));
             h.connect(&origin, None, None).unwrap();
         }
         chain.confirm_all();
@@ -207,6 +212,13 @@ type Tamper = dyn Fn(&RoutePayer, &mut Value, &mut Value) -> Mode;
 
 /// The client's POST /x402/route built exactly as RoutePayer::lock does, edited by `tamper`.
 fn route_request(net: &Arc<MemNet>, pay: &RoutePayer, sh: &Arc<Shard>, tamper: Option<&Tamper>) -> (u16, Value) {
+    let (hdr, body) = route_built(pay, sh, tamper);
+    let r = NetTransport(net.clone()).request("POST", &format!("{HUB}{HUB_ROUTE_PATH}"), body.as_bytes(), &[("PAYMENT-SIGNATURE".into(), hdr)]).unwrap();
+    (r.status, xbt402::json::parse_slice(&r.body).unwrap_or(Value::Null))
+}
+
+/// That request's (PAYMENT-SIGNATURE, body), not sent.
+fn route_built(pay: &RoutePayer, sh: &Arc<Shard>, tamper: Option<&Tamper>) -> (String, String) {
     let inv = sh.snapshot().invoice;
     let d = sh.due_sat().max(1) as u64;
     let q = pay.quote().unwrap();
@@ -234,9 +246,38 @@ fn route_request(net: &Arc<MemNet>, pay: &RoutePayer, sh: &Arc<Shard>, tamper: O
         pl["auth"] = "00".repeat(32).into();
     }
     let hdr = b64json(&json!({"x402Version": 2, "accepted": accepted, "payload": pl}));
-    let r = NetTransport(net.clone()).request("POST", &format!("{HUB}{HUB_ROUTE_PATH}"), body.as_bytes(), &[("PAYMENT-SIGNATURE".into(), hdr)]).unwrap();
     pay.signer().void_lock(&chan).unwrap();
-    (r.status, xbt402::json::parse_slice(&r.body).unwrap_or(Value::Null))
+    (hdr, body)
+}
+
+fn error_of(r: &HttpResponse) -> String {
+    xbt402::json::parse_slice(&r.body).ok().and_then(|b| b.get("error").and_then(Value::as_str).map(str::to_string)).unwrap_or_default()
+}
+
+fn seq_of(hdr: &str) -> u64 {
+    xbt402::wire::unb64json(hdr).unwrap()["payload"]["seq"].as_u64().unwrap()
+}
+
+#[test]
+fn t4b_a_seq_spent_on_a_refused_route_survives_a_hub_restart() {
+    // an authentic /route the hub refuses (here for its amount) has spent its seq: kept only in
+    // memory, the seq came back after a restart and the refused header authenticated again
+    let w = world(1, PKw::default());
+    let chan = w.pay.chan().unwrap();
+    let big: &Tamper = &|_, _, rt| {
+        rt["amount"] = 1_000_000.into();
+        Mode::Normal
+    };
+    let (hdr, body) = route_built(&w.pay, w.sh(), Some(big));
+    let send = |h: &RouteHub| h.serve("POST", HUB_ROUTE_PATH, &[("PAYMENT-SIGNATURE".into(), hdr.clone())], body.as_bytes(), &format!("{HUB}{HUB_ROUTE_PATH}"), None);
+    assert_eq!(error_of(&send(&w.hub)), "bad_amount");
+    let seq = seq_of(&hdr);
+    assert_eq!(w.st1().seq, seq);
+    assert_eq!(error_of(&send(&w.hub)), "bad_auth", "control: the seq is spent in the running hub");
+    crash_copy(&w.dir.0.join("hub"), &w.dir.0.join("hub-restarted")).unwrap();
+    let hub2 = hub_with(&w.chain, &w.net, &w.dir.0.join("hub-restarted"), sk(0x4B4B), hub_cfg());
+    assert_eq!(hub2.ch1_state(&chan).unwrap().seq, seq, "the refused route's seq was only in memory");
+    assert_eq!(error_of(&send(&hub2)), "bad_auth", "the refused header still authenticates after a restart");
 }
 
 fn world(n: usize, kw: PKw) -> W {
@@ -413,6 +454,14 @@ fn hub_6_route_ok_or_the_unguarded_cap() {
 
 /// A ch2 lock sent to the provider as the hub would, with edits.
 fn hub_lock(w: &W, route_over: Value, pl_over: Value) -> (u16, Value) {
+    let (hdr, body) = hub_lock_built(w, route_over, pl_over);
+    let o = w.origin();
+    let r = NetTransport(w.net.clone()).request("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes(), &[("PAYMENT-SIGNATURE".into(), hdr)]).unwrap();
+    (r.status, xbt402::json::parse_slice(&r.body).unwrap())
+}
+
+/// That lock's (PAYMENT-SIGNATURE, body), not sent.
+fn hub_lock_built(w: &W, route_over: Value, pl_over: Value) -> (String, String) {
     let oc = w.oc();
     let p2 = &oc.params;
     let inv = w.sh().snapshot().invoice;
@@ -440,9 +489,39 @@ fn hub_lock(w: &W, route_over: Value, pl_over: Value) -> (u16, Value) {
     let body = dumps(&json!({"route": route}));
     let key = channel_auth_key(&secret, &p2.payee_pub).unwrap();
     pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest_v2("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes())).into();
-    let r = NetTransport(w.net.clone()).request("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes(),
-                                                  &[("PAYMENT-SIGNATURE".into(), b64json(&json!({"x402Version": 2, "accepted": {}, "payload": pl})))]).unwrap();
-    (r.status, xbt402::json::parse_slice(&r.body).unwrap())
+    (b64json(&json!({"x402Version": 2, "accepted": {}, "payload": pl})), body)
+}
+
+#[test]
+fn t4b_a_seq_spent_on_a_refused_lock_survives_a_provider_restart() {
+    // the same on the provider's /lock, for a refusal before the lock is looked at (ch2 inside its
+    // close margin) and for one after (the hub repriced it)
+    for closing in [true, false] {
+        let w = W::keyed(1, PKw::default(), &|_| sk(0x5151));
+        let chan = w.oc().params.channel_id();
+        let (hdr, body) = match closing {
+            true => hub_lock_built(&w, json!({}), json!({})),
+            false => hub_lock_built(&w, json!({"amount": 4}), json!({})),
+        };
+        if closing {
+            w.chain.set_height(w.oc().params.expiry - 36);
+        }
+        let o = w.origin().to_string();
+        let send = |p: &Provider| p.serve("POST", ROUTE_LOCK_PATH, &[("PAYMENT-SIGNATURE".into(), hdr.clone())], body.as_bytes(), &format!("{o}{ROUTE_LOCK_PATH}"), None);
+        assert_eq!(error_of(&send(w.prov())), if closing { "channel_closing" } else { "bad_auth" });
+        let seq = seq_of(&hdr);
+        assert_eq!(w.prov().channel_state(&chan).unwrap().seq, seq);
+        // the provider again, from a copy of its files as a crash would leave them
+        let again = TempDir(w.dir.0.join("restarted"));
+        std::fs::create_dir_all(&again.0).unwrap();
+        for f in std::fs::read_dir(&w.dir.0).unwrap().map(|f| f.unwrap().path()).filter(|f| f.is_file()) {
+            std::fs::copy(&f, again.0.join(f.file_name().unwrap())).unwrap();
+        }
+        let prov2 = provider(&w.chain, &MemNet::new(), &again, &o, sk(0x5151), &PKw::default());
+        assert_eq!(prov2.channel_state(&chan).unwrap().seq, seq, "the refused lock's seq was only in memory (closing: {closing})");
+        let r = send(&prov2);
+        assert_eq!((r.status, error_of(&r)), (401, "bad_auth".to_string()), "the refused header still authenticates after a restart");
+    }
 }
 
 #[test]
@@ -820,6 +899,42 @@ fn hub_config_liquidity_cap_and_fee_strategies() {
     custom.set_fee_strategy(Box::new(|_| (5, 7)));
     let q = custom.fee_quote().unwrap();
     assert_eq!((q.fee_base_msat, q.fee_ppm), (5, 7));
+}
+
+#[test]
+fn hub_bounds_max_lock_sat_however_its_config_was_built() {
+    // AGP-064's bound (a lock is at most half of a ch2) was made only by HubConfig::from_json: a
+    // config built as a struct went around it
+    let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
+    let new = |max_lock_sat: u64| {
+        let cfg = HubConfig { max_lock_sat, ..hub_cfg() };
+        RouteHub::new(chain.clone(), chain.clone(), Box::new(ChainWallet(chain.clone())), Box::new(NetTransport(net.clone())), sk(0x4B4B), NET,
+                      Some(&dir.0.join(format!("hub-{max_lock_sat}"))), cfg).map(|_| ()).map_err(|e| e.code)
+    };
+    for over in [0, 50_001, 90_000] {
+        assert_eq!(new(over), Err("bad_config".to_string()), "max_lock_sat {over} of ch2_capacity 100000");
+        assert!(!dir.0.join(format!("hub-{over}")).exists(), "refused before anything is written");
+    }
+    assert_eq!(new(50_000), Ok(()));
+    assert_eq!(HubConfig { max_lock_sat: 90_000, ..hub_cfg() }.validate().unwrap_err().code, "bad_config");
+}
+
+#[test]
+fn hub_bounds_max_lock_sat_against_the_capacity_a_ch2_is_opened_with() {
+    // AGP-084: the bound was made against the configured ch2_capacity only, and connect() takes
+    // another capacity (max_lock_sat is 20,000 here: a ch2 of less than 40,000 breaks AGP-064's rule)
+    let w = world(1, PKw::default());
+    let small = "http://dev-small.test";
+    provider(&w.chain, &w.net, &w.dir, small, sk(0xA0A1), &PKw::default());
+    let committed = w.hub.committed_sat();
+    let e = w.hub.connect(small, Some(39_999), None).unwrap_err();
+    assert_eq!(e.code, "bad_config", "{e}");
+    // the next ch2 of a provider it already pays, funded ahead
+    let e = w.hub.connect_next(&w.sh().origin, Some(39_999), None).unwrap_err();
+    assert_eq!(e.code, "bad_config", "{e}");
+    assert_eq!(w.hub.committed_sat(), committed, "refused before anything is funded");
+    assert_eq!(w.hub.connect(small, Some(40_000), None).unwrap().params.capacity, 40_000);
+    assert_eq!(w.hub.connect_next(&w.sh().origin, Some(40_000), None).unwrap().params.capacity, 40_000);
 }
 
 #[test]

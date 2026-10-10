@@ -28,6 +28,26 @@ stock lnd on a SHA-256 regtest). Run by scripts/ln_rail_regtest.sh, which brings
       isn't initiated"; the wallet holds nothing in flight and is not halted
   S17 the macaroon report is an allowlist: uri:/lnrpc.Lightning/SendCoins is excess, not least privilege
   S18 B2_LN_REST http://[::ffff:10.0.0.5]:8080 is refused (plain http only on loopback)
+  AGP-083 (BOLT 12 offers, AGP-082, on the real node; lf2 mints the offers):
+  S19 lf1 holds a taproot and a pre-split channel: an offer is refused ln_offer_unsafe_channel before
+      any invoice is asked for, and the same node still pays a BOLT 11 invoice
+  S20 lf3 opens one anchors channel from a coin confirmed above the split: ln_status ready, every
+      channel proven; the wallet on lf3 has the rail's four-permission macaroon
+  S21 an offer the policy does not list: denied before any invoice is asked for
+  S22 a priced offer larger than lf3 can send: the invoice is fetched and written down, the payment
+      FAILS on the node, nothing is charged; again, and after the signer restarts and lf3 has the
+      funds, the stored lni1 is paid: lf2 issued one invoice for all of it; the preimage is booked
+  S23 the same offer paid again: a second invoice, the same signing key, another payer id
+  S24 an offer with no amount and blinded paths, paid with amount_sats, twice; the ledger is exact
+
+  What run 1 of AGP-083 showed about the fork, which S20 now sets the lab up for:
+  - lf2's BOLT 12 invoices are paid over blinded paths that start at its peer lf1, so lf3 -> lf2 pays
+    lf3 -> lf2 -> lf1 -> lf2: it costs a routing fee (2,246 to 3,261 msat on 15,000 sats) though lf2 is lf3's
+    direct peer, and it needs lf2 to hold funds towards lf1. lf1 pays lf2 300,000 sats first.
+  - an offer minted --with_paths is reached through lf1 too. lf3, not lf1's peer, sent its invoice
+    request by lf2, and lf1 dropped it ("onion message cycle: next hop is the sending peer"): the fetch
+    timed out after 60 s (ln_fetch_invoice) and worked a minute later, once lf3 had connected to lf1.
+    lf3 connects to lf1 first.
 
 Environment: LAB (the lab checkout), OUT (report dir), BIN (the release binaries), RUN (scratch dir).
 """
@@ -143,7 +163,7 @@ class Mcp:
 
 
 def start_signer(root, sock, extra_env, log):
-    env = dict(os.environ, **extra_env, B2_SIGNER_SOCK=sock, B2_RPCHOST="127.0.0.1", B2_RPCPORT="34781",
+    env = dict(os.environ, **extra_env, B2_SIGNER_SOCK=sock, B2_RPCHOST="127.0.0.1", B2_RPCPORT="17481",
                B2_RPCCOOKIE=f"{RUN}/rpc.cookie", B2_WALLET="agent", B2_HOT_KEYFILE=f"{RUN}/keys/{os.path.basename(root)}.key",
                B2_WATCH_INTERVAL="5")
     p = subprocess.Popen([f"{BIN}/xbt-signer", "--root", root], env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT)
@@ -168,14 +188,14 @@ def bake(svc, dst, *caveats):
     fetch(svc, "/tmp/rail.macaroon", dst)
 
 
-def open_channel(*args):
+def open_channel(*args, svc="lf1"):
     """lncli openchannel, retried: right after a connect or a new block the peer can answer
     "funding failed due to internal error" (the lab's own scenarios retry too)."""
     tip = int(b2b("getblockcount"))
-    wait("lf1/lf2 at the tip", 60, lambda: synced("lf1", tip) and synced("lf2", tip))
+    wait(f"{svc}/lf2 at the tip", 60, lambda: synced(svc, tip) and synced("lf2", tip))
     for i in range(6):
         try:
-            return ln("lf1", "openchannel", *args)
+            return ln(svc, "openchannel", *args)
         except RuntimeError as e:
             if i == 5:
                 raise
@@ -273,7 +293,7 @@ def main():
     with open(f"{root}/policy.json", "w") as f:
         json.dump(policy(human_pub, [f"ln:{lf2_pub}", f"ln:{sha_pub}"]), f, indent=2)
     sock = f"{RUN}/signer.sock"
-    ln_env = {"B2_LN_REST": "https://127.0.0.1:34791", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon", "B2_LN_TLS_CERT": f"{RUN}/lf1.tls.cert"}
+    ln_env = {"B2_LN_REST": "https://127.0.0.1:17491", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon", "B2_LN_TLS_CERT": f"{RUN}/lf1.tls.cert"}
     procs = [start_signer(root, sock, ln_env, f"{RUN}/signer.log")]
     menv = {k: v for k, v in os.environ.items() if not k.startswith("B2_LN")}
     mcp = Mcp(dict(menv, B2_SIGNER_SOCK=sock, XBT_MCP_LN="1"))
@@ -281,6 +301,7 @@ def main():
         run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs)
         run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env)
         run_066(mcp, human_pub, lf2_pub, procs, ln_env)
+        run_083(mcp, human_pub, lf2_pub, procs)
     finally:
         mcp.close()
         for p in procs:
@@ -379,7 +400,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
         json.dump(policy(human.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex(),
                          [f"ln:{lf2_pub}", f"ln:{sha_pub}"]), f)
     sock2 = f"{RUN}/signer-wrong.sock"
-    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34793", "B2_LN_MACAROON": f"{RUN}/sha.macaroon",
+    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:17493", "B2_LN_MACAROON": f"{RUN}/sha.macaroon",
                                              "B2_LN_TLS_CERT": f"{RUN}/sha.tls.cert"}, f"{RUN}/signer-wrong.log"))
     inv7 = ln("lf2", "addinvoice", "--amt=500")
     st7 = rpc_sock(sock2, "ln_status")
@@ -392,7 +413,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     procs[-1].terminate()
     procs[-1].wait(10)
     os.remove(sock2) if os.path.exists(sock2) else None
-    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34791", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon",
+    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:17491", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon",
                                              "B2_LN_TLS_CERT": f"{RUN}/sha.tls.cert"}, f"{RUN}/signer-wrong.log"))
     r = rpc_sock(sock2, "ln_pay", {"invoice": inv7["payment_request"], "max_sats": 1000})
     REPORT["scenarios"]["S7_wrong_cert"] = r
@@ -656,7 +677,7 @@ def lf1_rest(path):
     body, or only its first line for a 200 (TrackPaymentV2 streams one JSON object per line)."""
     ctx = ssl.create_default_context(cafile=f"{RUN}/lf1.tls.cert")
     ctx.check_hostname = False
-    c = http.client.HTTPSConnection("127.0.0.1", 34791, context=ctx, timeout=30)
+    c = http.client.HTTPSConnection("127.0.0.1", 17491, context=ctx, timeout=30)
     with open(f"{RUN}/lf1.macaroon", "rb") as f:
         mac = f.read().hex()
     c.request("GET", path, headers={"Grpc-Metadata-macaroon": mac})
@@ -706,6 +727,223 @@ def run_066(mcp, human_pub, lf2_pub, procs, ln_env):
     REPORT["scenarios"]["S18_ipv6_mapped_http"] = st_v6
     check("S18 http://[::ffff:10.0.0.5]:8080 is refused: plain http only on loopback, the macaroon is not sent",
           st_v6.get("ready") is not True and "must be https" in json.dumps(st_v6), st_v6)
+
+
+# --- AGP-083: BOLT 12 offers on the real node --------------------------------------------------------------
+
+def hexid(v):
+    """A bytes field as lncli prints it (hex) or as the REST API does (base64), as hex."""
+    v = v or ""
+    if len(v) in (64, 66) and all(c in "0123456789abcdefABCDEF" for c in v):
+        return v.lower()
+    return base64.b64decode(v).hex()
+
+
+def mint(*args):
+    """lf2 mints an offer: its lno1 string and its id."""
+    o = ln("lf2", "offer", "create", *args)
+    o = o.get("offer", o)
+    return o["bolt12"], hexid(o["offer_id"])
+
+
+def issued(oid):
+    """How many invoices lf2 has issued for its offer, by its own count and by its list of them."""
+    count = [int(o.get("invoices_issued") or 0) for o in ln("lf2", "offer", "list").get("offers", []) if hexid(o.get("offer_id")) == oid]
+    rows = [i for i in ln("lf2", "offer", "invoices").get("invoices", []) if hexid(i.get("offer_id")) == oid]
+    return (count[0] if count else -1), rows
+
+
+def offer_record(root, oid):
+    with open(f"{root}/.run/ln_offers.json") as f:
+        return json.load(f)["offers"].get(oid, {})
+
+
+def run_083(mcp, human_pub, lf2_pub, procs):
+    # S19: lf1 (a taproot channel, a pre-split one, and the proven one) pays no offer
+    lno_a, oid_a = mint("--description", "tea", "--amount_msat", "2000000")
+    r = mcp.tool("ln_pay", {"invoice": lno_a, "max_sats": 3000})
+    n_a, rows_a = issued(oid_a)
+    REPORT["scenarios"]["S19_unsafe_channel"] = {"offer": lno_a, "offer_id": oid_a, "pay": r, "lf2_invoices_issued": n_a,
+                                                 "lf1_version": ln("lf1", "getinfo").get("version")}
+    refused = [c for c in r.get("channels", []) if c.get("usable") is not True]
+    check("S19 lf1 runs Lightning Fork .17", "blake2b.17" in str(ln("lf1", "getinfo").get("version")), ln("lf1", "getinfo").get("version"))
+    check("S19 an offer through lf1: refused ln_offer_unsafe_channel, naming the taproot and the pre-split channel",
+          r.get("rule") == "ln_offer_unsafe_channel" and r.get("dest") == f"ln-offer:{oid_a}" and len(refused) == 2
+          and any("taproot" in str(c.get("refused")) for c in refused) and any("below the split" in str(c.get("refused")) for c in refused), r)
+    check("S19 before any invoice: lf2 issued none for the offer", n_a == 0 and rows_a == [], {"issued": n_a, "rows": rows_a})
+    links_up()
+    inv = ln("lf2", "addinvoice", "--amt=400")
+    r = pay_retry(lambda i, m: mcp.tool("ln_pay", {"invoice": i, "max_sats": m}), inv["payment_request"], 500)
+    REPORT["scenarios"]["S19_bolt11_still_pays"] = r
+    check("S19 the same node still pays a BOLT 11 invoice (confined to its proven channel)", r.get("status") == "SUCCEEDED", r)
+
+    # S20: lf3, whose only channel is funded by a coin confirmed above the split
+    wait("lf3 synced", 120, lambda: synced("lf3", int(b2b("getblockcount"))))
+    lf3_pub = ln("lf3", "getinfo")["identity_pubkey"]
+    # lf2's invoices are paid through its peer lf1 (see the top of this file): lf2 needs funds towards lf1 on
+    # their announced channels, and lf3 must reach lf1 with an invoice request
+    for c in ln("lf1", "listchannels")["channels"]:
+        if not c["private"] and int(c["local_balance"]) > 400_000:
+            fund = ln("lf2", "addinvoice", "--amt=300000")
+            ln("lf1", "payinvoice", "--force", "--json", f"--outgoing_chan_id={c.get('scid', c['chan_id'])}", fund["payment_request"])
+    lf1_pub = ln("lf1", "getinfo")["identity_pubkey"]
+    ln("lf3", "connect", f"{lf1_pub}@lf1:9735")
+    b2b("-rpcwallet=lab", "sendtoaddress", ln("lf3", "newaddress", "p2wkh")["address"], "0.05")
+    h_coin = mine(1)
+    tip = mine(1)
+    wait("lf3 sees its coin", 60, lambda: synced("lf3", tip) and len(ln("lf3", "listunspent", "--min_confs=1")["utxos"]) == 1)
+    ln("lf3", "connect", f"{lf2_pub}@lf2:9735")
+    # lf3 keeps 20,000 of the 1,000,000: less than its reserve and the 15,000-sat offer of S22 together
+    ch3 = open_channel(f"--node_key={lf2_pub}", "--local_amt=1000000", "--push_amt=980000", svc="lf3")
+    mine(6)
+    wait("lf3's channel active", 90, lambda: len(ln("lf3", "listchannels", "--active_only")["channels"]) == 1)
+    wait("lf2 sees lf3's channel active", 90,
+         lambda: any(c["remote_pubkey"] == lf3_pub for c in ln("lf2", "listchannels", "--active_only")["channels"]))
+    lno_b, oid_b = mint("--description", "a report", "--amount_msat", "15000000")
+    lno_c, oid_c = mint("--description", "tips", "--with_paths")
+    lno_x, oid_x = mint("--description", "not on the list", "--amount_msat", "1000000")
+    bake("lf3", f"{RUN}/lf3.macaroon")
+    fetch("lf3", "/root/.lnd/tls.cert", f"{RUN}/lf3.tls.cert")
+    env3 = {"B2_LN_REST": "https://127.0.0.1:17495", "B2_LN_MACAROON": f"{RUN}/lf3.macaroon", "B2_LN_TLS_CERT": f"{RUN}/lf3.tls.cert"}
+    # the default 30,000-sat day is what two pays of the 15,000-sat offer cost
+    allow = {"allowlist": [f"ln-offer:{oid_b}", f"ln-offer:{oid_c}"], "daily_budget_sats": 60_000}
+    root3 = f"{RUN}/wallet-offer"
+    s3, p3 = start_policy_signer("wallet-offer", human_pub, lf2_pub, env3, top=allow)
+    procs.append(p3)
+    st = rpc_sock(s3, "ln_status")
+    chans = st.get("channels", [])
+    ins = (chans[0].get("funding", {}).get("evidence", {}).get("inputs", []) if chans else [])
+    REPORT["scenarios"]["S20_lf3"] = {"pubkey": lf3_pub, "version": ln("lf3", "getinfo").get("version"), "coin_height": h_coin, "open": ch3,
+                                      "channels": chans, "macaroon": st.get("macaroon"), "chain_check": st.get("chain_check"),
+                                      "offers": {"priced": [oid_b, lno_b], "any_amount_blinded": [oid_c, lno_c], "unlisted": [oid_x, lno_x]}}
+    check("S20 lf3: ready, its one channel usable, funded 0x21 by a coin confirmed at or above the split",
+          st.get("ready") is True and len(chans) == 1 and chans[0].get("usable") is True and chans[0]["funding"].get("proven") is True
+          and ins and all(i["sighash"] == ["0x21"] and i["height"] >= SPLIT for i in ins), {"ready": st.get("ready"), "channels": chans})
+    check("S20 the wallet on lf3 holds the rail's four permissions and no more (no invoices:read)",
+          st.get("macaroon", {}).get("ops") == ["info:read", "offchain:read", "offchain:write", "onchain:read"], st.get("macaroon"))
+
+    # S21: the policy decides on ln-offer:<offer id> before any invoice exists
+    r = rpc_sock(s3, "ln_pay", {"invoice": lno_x, "max_sats": 2000})
+    n_x, _ = issued(oid_x)
+    REPORT["scenarios"]["S21_not_allowlisted"] = {"pay": r, "lf2_invoices_issued": n_x}
+    check("S21 an offer the allowlist does not name: denied, and lf2 was asked for no invoice",
+          r.get("verdict") == "deny" and r.get("rule") == "allowlist" and n_x == 0, {"pay": r, "issued": n_x})
+
+    # S22: the pay fails on the node; the retry pays the stored lni1, and lf2 issues one invoice for all of it
+    pay_b = {"invoice": lno_b, "max_sats": 16_000, "description": "a report"}
+    r1 = rpc_sock(s3, "ln_pay", pay_b, timeout=180)
+    h_b = r1.get("payment_hash", "")
+    rec1 = offer_record(root3, oid_b)
+    n1, rows1 = issued(oid_b)
+    lf3_p1 = payments("lf3").get(h_b, {})
+    REPORT["scenarios"]["S22_failed"] = {"pay": r1, "offer_record": rec1, "lf2_invoices_issued": n1, "lf2_invoices": rows1,
+                                         "lf3_payment": {k: lf3_p1.get(k) for k in ("status", "failure_reason", "value_msat", "payment_request")}}
+    check("S22 the offer is larger than lf3 can send: the payment FAILED on the node, nothing charged",
+          r1.get("rule") == "ln_payment_failed" and r1.get("charged_sats") == 0 and r1.get("invoice_reused") is False
+          and lf3_p1.get("status") == "FAILED", {"pay": r1, "lf3": lf3_p1.get("status")})
+    lni = rec1.get("last_invoice", {}).get("invoice", "")
+    check("S22 the fetched lni1 was written down before it was paid, with its hash and the key that signed it",
+          lni.startswith("lni1") and rec1["last_invoice"].get("payment_hash") == h_b and len(rec1.get("node_id", "")) == 66, rec1)
+    check("S22 lf2 issued one invoice for the offer, OPEN, with that hash", n1 == 1 and len(rows1) == 1 and hexid(rows1[0]["payment_hash"]) == h_b
+          and rows1[0].get("state") == "OPEN", {"issued": n1, "rows": rows1})
+    check("S22 nothing in the ledger", ledger_payments(f"{root3}/.run") == [], ledger_payments(f"{root3}/.run"))
+    r2 = rpc_sock(s3, "ln_pay", pay_b, timeout=180)
+    n2, _ = issued(oid_b)
+    REPORT["scenarios"]["S22_failed_again"] = {"pay": r2, "lf2_invoices_issued": n2}
+    check("S22 again while it cannot be sent: the same invoice is tried (invoice_reused), fails, and lf2 still issued one",
+          r2.get("rule") == "ln_payment_failed" and r2.get("payment_hash") == h_b and r2.get("invoice_reused") is True and n2 == 1,
+          {"pay": r2, "issued": n2})
+    # lf3 is given the funds (lf2 pays it a BOLT 11 invoice), and the signer restarts: the lni1 is on disk
+    top_up = ln("lf3", "addinvoice", "--amt=200000")
+    ln("lf2", "payinvoice", "--force", "--json", top_up["payment_request"])
+    wait("lf3 holds the top-up", 60, lambda: int(ln("lf3", "listchannels")["channels"][0]["local_balance"]) > 200_000)
+    stop(p3)
+    s3, p3 = start_policy_signer("wallet-offer", human_pub, lf2_pub, env3, top=allow)
+    procs.append(p3)
+    r3 = rpc_sock(s3, "ln_pay", pay_b, timeout=180)
+    for _ in range(5):
+        if r3.get("rule") != "ln_payment_failed":
+            break
+        time.sleep(3)
+        r3 = rpc_sock(s3, "ln_pay", pay_b, timeout=180)
+    n3, rows3 = issued(oid_b)
+    st = rpc_sock(s3, "ln_status")
+    booked = [x for x in st.get("recent", []) if x.get("payment_hash") == h_b or x.get("hash") == h_b]
+    sigs = rpc_sock(s3, "signatures", {"limit": 1000})
+    sig_b = [x for x in sigs["signatures"] if x["kind"] == "ln_payment" and x["sig_sha256"] == h_b]
+    REPORT["scenarios"]["S22_retried"] = {"pay": r3, "lf2_invoices_issued": n3, "lf2_invoices": rows3, "booked": booked, "signature_log": sig_b,
+                                          "lf3_payment_status": payments("lf3").get(h_b, {}).get("status")}
+    pre = r3.get("preimage", "")
+    check("S22 retried after a restart, with funds: SUCCEEDED, paying the stored invoice (same hash, invoice_reused)",
+          r3.get("verdict") == "allow" and r3.get("status") == "SUCCEEDED" and r3.get("payment_hash") == h_b and r3.get("invoice_reused") is True
+          and r3.get("dest") == f"ln-offer:{oid_b}", r3)
+    check("S22 the preimage is booked: sha256(preimage) is the payment hash, in the reply, the payment book and the signature log",
+          hashlib.sha256(bytes.fromhex(pre or "00")).hexdigest() == h_b and len(sig_b) == 1 and sig_b[0].get("offer_id", oid_b) == oid_b
+          and any(x.get("state") == "settled" for x in booked), {"preimage": pre, "sig": sig_b, "booked": booked})
+    check("S22 lf2 issued ONE invoice across two failures, a restart and the retry, and it is SETTLED for at least 15,000 sats",
+          n3 == 1 and len(rows3) == 1 and rows3[0].get("state") == "SETTLED"
+          and 15_000_000 <= int(rows3[0].get("amount_paid_msat") or 0) <= 15_085_000, {"issued": n3, "rows": rows3})
+    # the invoice's blinded paths start at lf2's peer lf1, so the payment is routed and pays a fee
+    fee3 = int(r3.get("fee_msat") or 0)
+    check("S22 charged the 15,000 and the routing fee the node reports, within the 85-sat limit; the rest of the booking is released",
+          r3.get("charged_sats") == -(-(15_000_000 + fee3) // 1000) and 15_000 <= r3.get("charged_sats", 0) <= 15_085,
+          {"charged": r3.get("charged_sats"), "fee_msat": fee3})
+
+    # S23: the same offer again: a second invoice, the same signer, another payer id
+    r4 = rpc_sock(s3, "ln_pay", pay_b, timeout=180)
+    n4, rows4 = issued(oid_b)
+    rec4 = offer_record(root3, oid_b)
+    REPORT["scenarios"]["S23_second_pay"] = {"pay": r4, "lf2_invoices_issued": n4, "lf2_invoices": rows4, "offer_record": rec4}
+    check("S23 the same offer paid again: a new invoice (another hash), SUCCEEDED, lf2 issued two and both are SETTLED",
+          r4.get("status") == "SUCCEEDED" and r4.get("payment_hash") not in ("", h_b) and r4.get("invoice_reused") is False and n4 == 2
+          and sorted(x.get("state") for x in rows4) == ["SETTLED", "SETTLED"], {"pay": r4, "issued": n4})
+    check("S23 signed by the key recorded with the first invoice (lf2's node id: the offer has no blinded path)",
+          rec4.get("node_id") == rec1.get("node_id") == lf2_pub, {"recorded": rec4.get("node_id"), "lf2": lf2_pub})
+    payer_ids = {r3.get("payer_id"), r4.get("payer_id")}
+    check("S23 two pays of one offer carry two payer ids (lf2 lists the same two): no payer identity here",
+          len(payer_ids) == 2 and None not in payer_ids and payer_ids == {hexid(x.get("payer_id")) for x in rows4},
+          {"ours": [str(x) for x in payer_ids], "lf2": [hexid(x.get("payer_id")) for x in rows4]})
+
+    # S24: an offer that names no amount and is reached through a blinded path
+    pay_c = {"invoice": lno_c, "max_sats": 1300, "amount_sats": 1234, "description": "tips"}
+    def pay_any():
+        tries = [rpc_sock(s3, "ln_pay", pay_c, timeout=180)]
+        while tries[-1].get("rule") in ("ln_payment_failed", "ln_fetch_invoice") and len(tries) < 4:
+            time.sleep(3)
+            tries.append(rpc_sock(s3, "ln_pay", pay_c, timeout=180))
+        return tries[-1], tries[:-1]
+    r5, before5 = pay_any()
+    rec5 = offer_record(root3, oid_c)
+    r6, before6 = pay_any()
+    n6, rows6 = issued(oid_c)
+    dec = ln("lf3", "offer", "decode", lno_c)
+    REPORT["scenarios"]["S24_blinded_any_amount"] = {"first": r5, "second": r6, "offer_record": rec5, "lf2_invoices_issued": n6, "lf2_invoices": rows6,
+                                                     "lf3_decode": dec, "tries_before": before5 + before6}
+    check("S24 the offer carries blinded paths and names no amount (lf3's own decode)",
+          int(dec.get("offer", {}).get("num_paths") or 0) >= 1 and int(dec.get("offer", {}).get("amount_msat") or 0) == 0, dec.get("offer"))
+    check("S24 paid for the 1,234 sats asked with amount_sats: SUCCEEDED, the preimage proves it",
+          r5.get("status") == "SUCCEEDED" and 1234 <= r5.get("charged_sats", 0) <= 1251 and r5.get("value_msat") == 1_234_000
+          and r5.get("dest") == f"ln-offer:{oid_c}"
+          and hashlib.sha256(bytes.fromhex(r5.get("preimage") or "00")).hexdigest() == r5.get("payment_hash"), r5)
+    check("S24 the offer keeps its issuer id beside the paths, and both invoices are signed by it (lf2's node id), not by a blinded key",
+          hexid(dec.get("offer", {}).get("issuer_id")) == lf2_pub == rec5.get("node_id") and r6.get("status") == "SUCCEEDED"
+          and offer_record(root3, oid_c).get("node_id") == lf2_pub and r6.get("payment_hash") != r5.get("payment_hash"),
+          {"recorded": rec5.get("node_id"), "lf2": lf2_pub, "second": r6})
+    paid6 = [int(x.get("amount_paid_msat") or 0) for x in rows6 if x.get("state") == "SETTLED"]
+    check("S24 lf2 holds two SETTLED invoices for it, each paid at least 1,234,000 msat, and no invoice was asked for in vain",
+          n6 == 2 and len(paid6) == 2 and all(1_234_000 <= a <= 1_251_000 for a in paid6) and before5 + before6 == [],
+          {"issued": n6, "rows": rows6, "tries_before": before5 + before6})
+    led = ledger_payments(f"{root3}/.run")
+    by_dest = {d: sum(x["amount_sats"] for x in led if x["dest"] == d) for d in {x["dest"] for x in led}}
+    REPORT["scenarios"]["S24_ledger"] = by_dest
+    want = {f"ln-offer:{oid_b}": r3.get("charged_sats", 0) + r4.get("charged_sats", 0),
+            f"ln-offer:{oid_c}": r5.get("charged_sats", 0) + r6.get("charged_sats", 0)}
+    check("S24 the offer wallet's ledger is exact: what the four settled payments were charged, nothing for the failures",
+          by_dest == want and 30_000 <= want[f"ln-offer:{oid_b}"] <= 30_170 and 2468 <= want[f"ln-offer:{oid_c}"] <= 2502,
+          {"ledger": by_dest, "charged": want})
+    st = rpc_sock(s3, "ln_status")
+    check("S24 final ln_status on lf3: ready, nothing in flight, not halted",
+          st.get("ready") is True and st.get("in_flight") == 0 and st.get("halted") is None, {k: st.get(k) for k in ("ready", "in_flight", "halted")})
 
 
 if __name__ == "__main__":

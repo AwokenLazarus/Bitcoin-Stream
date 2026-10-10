@@ -7,6 +7,20 @@
 //! Prime key, and presents it with a fresh `n` and the request-bound `auth`. Each PAYMENT-RESPONSE
 //! is checked: the invoice, the request digest, the charge within the quote, and `spentWork`
 //! growing by exactly `charged`.
+//!
+//! Limits of this rail against someone between payer and provider (AGP-081, the closure audit of
+//! review T2 and T4), where it is below the channel rail:
+//!
+//! * The request binding is taken over the bare target (as the published XBT-053 vectors are): it
+//!   holds the method, path, query and body, and no scheme, host or port. A header captured on its
+//!   way to one origin authenticates, once, at any other origin that holds this invoice's key.
+//! * The PAYMENT-RESPONSE is not signed and covers neither the answer's status nor its body. The
+//!   client requires one on every call paid with work (xbt402's `Client`), and it must name this
+//!   invoice and request and move `spentWork` by `charged`, but whoever can alter the answer can
+//!   alter it too. What was paid for is checked by the provider's balance, not by this receipt.
+//!
+//! Run this rail over TLS to the provider. Raising it to the channel rail's level is a change to
+//! the xbt-work spec (a signed receipt with status and bodyHash, an origin in the binding).
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -163,7 +177,8 @@ impl WorkPayer {
                 return Ok(s.clone());
             }
         }
-        let url = format!("{origin}{}", acc.pointer("/extra/invoiceUrl").and_then(Value::as_str).unwrap_or(INVOICE_PATH));
+        // the seller names this URL: it stays on the seller's origin (AGP-080 X1)
+        let url = xbt402::wire::seller_url(origin, acc.pointer("/extra/invoiceUrl").and_then(Value::as_str).unwrap_or(INVOICE_PATH)).map_err(WorkError::from)?;
         let r = t.request("POST", &url, b"", &[])?;
         if r.status != 200 {
             return fail(if r.status == 429 { "too_many_invoices" } else { "provider_error" }, format!("invoice: HTTP {}", r.status));
@@ -351,11 +366,11 @@ impl SchemePayer for WorkPayer {
             }
         }
         // §13.1: the provider holds receipted work beyond its caps on unaudited credit (or while the
-        // Prime owes it carry) until its next passing audit. Paying again now cannot succeed.
+        // Prime owes it carry) until audited coinbases have paid for it. Paying again now cannot succeed.
         if let Some(code) = pr.get("error").and_then(Value::as_str).filter(|c| matches!(*c, "credit_cap" | "carry_cap" | "carry_growing")) {
             let held = pr.pointer("/work/heldWork").and_then(|v| py_u64(Some(v))).unwrap_or(0);
-            return Err(ChannelError::new(code, format!("the provider holds {held} receipted work units uncredited until its next audited pool \
-                                                        block ({code}); retry later")));
+            return Err(ChannelError::new(code, format!("the provider holds {held} receipted work units uncredited until audited pool \
+                                                        blocks have paid for its open credit ({code}); retry later")));
         }
         let best = self.refresh(t, origin).map_err(xerr)?;
         let s = self.session(origin).expect("session");

@@ -30,9 +30,19 @@
 //! * **Mempool facts cannot be proven.** A spend seen only in a mempool never makes an output count
 //!   as spent, so a lying server cannot talk the wallet out of a refund.
 //!
+//! * **What one server can cost is bounded.** A line is held, before it is parsed, to the bytes and
+//!   JSON values the requests waiting on that connection allow ([`conn::answer_cap`], at most
+//!   [`conn::MAX_LINE`]); a server that sends more is dropped. Its part of a sync round ends at
+//!   [`Config::sync_deadline`], or at the first answer with fewer headers than asked. A history or
+//!   unspent list holds at most [`conn::MAX_HISTORY`] entries, and the transaction cache at most
+//!   [`backend::TX_CACHE_BYTES`].
+//!
 //! What a malicious server can still do: hide a transaction until another server or a block shows
 //! it, withhold new blocks (the tip lags: `status()["tip_age_s"]`), delay or drop us, lie about fees
-//! (unverifiable, reported as such), and learn which scripts we watch.
+//! (unverifiable, reported as such), and learn which scripts we watch. It can list up to
+//! [`conn::MAX_HISTORY`] invented transactions for a script and have each fetched once; an invented
+//! transaction that pays the script cannot be told from an unconfirmed payment. A script with a
+//! longer history, or a transaction above [`conn::MAX_TX_BYTES`], is not answered by this backend.
 pub mod backend;
 pub mod conn;
 pub mod error;

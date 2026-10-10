@@ -1,5 +1,6 @@
 //! external review (AGP-065): the pay-with-work audit independent of the Prime. P1-P4 were written
-//! against the AGP-043 API first and failed there; they keep their names.
+//! against the AGP-043 API first and failed there; they keep their names. AGP-079: a pass covers
+//! what the coinbase paid for, so the tests that release credit now pay for it.
 use std::sync::Arc;
 
 use serde_json::json;
@@ -7,7 +8,7 @@ use xbt_work::audit::{check_fraud_proof, AuditBounds, PrimeTerms, WindowStatemen
 use xbt_work::book::CreditCaps;
 use xbt_work::chain::{ChainBlock, LongMaturity, Maturity};
 use xbt_work::payer::check_gateway_config;
-use xbt_work::provider::{Statement, WorkConfig, WorkProvider};
+use xbt_work::provider::{window_statement, Amount, Caps, Statement, WorkConfig, WorkProvider};
 use xbt_work::receipt::{PrimeKey, WorkReceipt};
 
 const NET: &str = "bip122:00000000000000000000000000000001";
@@ -16,8 +17,10 @@ const V: u64 = 5_000_000_000;
 /// The Prime's regtest floor: the window holds 8000 work units, so the bound is 8400.
 const TERMS: PrimeTerms = PrimeTerms { window: 8, window_min_work: 8000, window_tolerance_bps: 500, fee_bps: 0, max_min_payout: 546 };
 
+/// A call costs one work unit and 5,000,000 sats: what a unit earns over the eight blocks of an
+/// 8000-unit window that each pay `V / 8000` for it.
 fn config(k: &PrimeKey) -> WorkConfig {
-    WorkConfig { terms: TERMS, ..WorkConfig::new(NET, PROV, 70, &k.pubkey_hex(), "http://prime.test/receipt") }
+    WorkConfig { terms: TERMS, invoice_price_sats: 5_000_000, ..WorkConfig::new(NET, PROV, 70, &k.pubkey_hex(), "http://prime.test/receipt") }
 }
 
 fn world() -> (PrimeKey, WorkProvider, String) {
@@ -74,7 +77,8 @@ fn p1_an_honest_statement_is_not_bounded() {
     let expected = V * 1000 / 8350;
     let o = wp.audit(&k.sign_window(&s).unwrap(), &[], &block(110, expected)).unwrap();
     assert!(o.ok && !o.bounded && o.window_work == 8350, "{o:?}");
-    assert_eq!(wp.exposure().0, 0, "a pass that counted the span covers it");
+    // AGP-079: the pass covers what the coinbase paid for (598.8M sats: 119 units), not the whole span
+    assert_eq!(wp.exposure().0, 1000 - 119);
 }
 
 /// P1: window starts must not go backwards between audited blocks. The refused statement records
@@ -110,12 +114,11 @@ fn p2_a_pass_releases_only_covered_credit() {
     let o = wp.audit(&k.sign_window(&stmt(110, 102, 8000, 546, 0)).unwrap(), &[], &block(110, 0)).unwrap();
     assert_eq!(o.proven_work, 0);
     assert_eq!(wp.exposure().0, 1000, "credit outside the audited bound was released");
-    assert_eq!(wp.book().skipped_work(), 1000);
+    assert_eq!(wp.book().paid_work(), 0);
 }
 
 /// P4: a Prime that answers anything but 200 or 404 for a statement must not make the block
 /// look like one it never stated.
-#[cfg(feature = "tools")]
 #[test]
 fn p4_a_statement_error_is_not_a_missing_statement() {
     use xbt402::client::Transport;
@@ -126,8 +129,8 @@ fn p4_a_statement_error_is_not_a_missing_statement() {
             Ok(HttpResponse::new(self.0, vec![], b"".to_vec()))
         }
     }
-    assert!(xbt_work::tools::window(&Down(500), "http://prime.test/window", 110).is_err(), "a 500 read as no statement");
-    assert!(xbt_work::tools::window(&Down(404), "http://prime.test/window", 110).unwrap().is_none());
+    assert!(window_statement(&Down(500), "http://prime.test/window", 110).is_err(), "a 500 read as no statement");
+    assert!(window_statement(&Down(404), "http://prime.test/window", 110).unwrap().is_none());
 }
 
 /// P4: a missing statement is audited too: a coinbase that paid the identity with no statement
@@ -159,6 +162,11 @@ fn p3_statement_height_must_be_the_blocks() {
     let mut s = stmt(110, 100, 8000, 546, 0);
     s.block_hash = hash(111);
     assert_eq!(wp.audit(&k.sign_window(&s).unwrap(), &[], &block(110, V / 8)).unwrap_err().code, "wrong_block");
+    // height = window_start + 1: the right block and an empty bound. It passes with nothing proven
+    // and releases nothing.
+    let o = wp.audit(&k.sign_window(&stmt(110, 109, 8000, 546, 0)).unwrap(), &[], &block(110, 0)).unwrap();
+    assert!(o.ok && o.proven_work == 0, "{o:?}");
+    assert_eq!(wp.exposure().0, 1000, "a statement with height = window_start + 1 released credit");
 }
 
 /// P6: a reorg undoes what the orphaned block's audit released.
@@ -166,7 +174,8 @@ fn p3_statement_height_must_be_the_blocks() {
 fn p6_a_reorg_rolls_back_released_credit() {
     let (k, wp, inv) = world();
     credit(&k, &wp, &inv, 4, 1000, 101, 103);
-    let o = wp.audit(&k.sign_window(&stmt(110, 100, 8000, 546, 0)).unwrap(), &[], &block(110, V / 8)).unwrap();
+    // the coinbase pays the whole price of the credit at once (its share and the carry before it)
+    let o = wp.audit(&k.sign_window(&stmt(110, 100, 8000, 546, 0)).unwrap(), &[], &block(110, V)).unwrap();
     assert!(o.ok);
     assert_eq!(wp.exposure().0, 0);
     assert_eq!(wp.audited_blocks(), vec![(110, hash(110))]);
@@ -231,19 +240,38 @@ fn p6_concurrent_writes_keep_the_newest_state() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// P2/P6: skipped credit beyond the forgiven allowance counts against the total cap for good.
+/// P2/P6: credit the Prime's window moved past before any coinbase paid for it counts against the
+/// total cap for good; none of it is forgiven (AGP-079).
 #[test]
-fn p2_skipped_credit_fills_the_total_cap() {
+fn p2_credit_the_window_moved_past_fills_the_total_cap() {
     let k = PrimeKey::from_seed(70, &[9u8; 32]);
-    let caps = CreditCaps { per_invoice: Some(1000), total: Some(1500), skipped: 200 };
+    let caps = CreditCaps { per_invoice: Some(1000), total: Some(1500) };
     let wp = WorkProvider::new(WorkConfig { caps, ..config(&k) }).unwrap();
     let inv = wp.issue_invoice().unwrap()["invoice"].as_str().unwrap().to_string();
     assert_eq!(credit(&k, &wp, &inv, 4, 1000, 101, 103), 1000);
-    wp.audit(&k.sign_window(&stmt(110, 103, 8000, 546, 0)).unwrap(), &[], &block(110, 0)).unwrap();
-    // 1000 skipped, 200 forgiven: 800 count; a second invoice gets 700 of its 1000
-    assert_eq!(wp.exposure().0, 800);
+    assert!(wp.audit(&k.sign_window(&stmt(110, 103, 8000, 546, 0)).unwrap(), &[], &block(110, 0)).unwrap().ok);
+    // all 1000 still count; a second invoice gets 500 of its 1000
+    assert_eq!(wp.exposure().0, 1000);
     let inv2 = wp.issue_invoice().unwrap()["invoice"].as_str().unwrap().to_string();
-    assert_eq!(credit(&k, &wp, &inv2, 4, 1000, 104, 106), 700);
+    assert_eq!(credit(&k, &wp, &inv2, 4, 1000, 104, 106), 500);
+}
+
+/// review P5: with no flag the binary caps unaudited credit and owed carry, on mainnet and on
+/// regtest, and prices work exactly (`WorkConfig::shipped` is what `xbt-work-provider` starts from).
+#[test]
+fn p5_the_binary_ships_non_zero_caps() {
+    let k = PrimeKey::from_seed(70, &[9u8; 32]);
+    for (bits, v) in [(0x1702_3a6e_u32, 312_500_000u64), (0x207f_ffff, 5_000_000_000)] {
+        let c = Caps::SHIPPED.at(bits, v, 150);
+        let (inv, tot) = (c.per_invoice.expect("per-invoice cap"), c.total.expect("total cap"));
+        assert!(inv > 0 && tot >= inv, "{bits:08x}: {c:?}");
+        let cfg = config(&k).shipped(bits, v, 150);
+        assert_eq!((cfg.caps, cfg.max_owed_carry_sats), (c, Some(150_000)));
+        assert!(matches!(cfg.amount, Amount::Priced(_)));
+    }
+    assert_eq!(xbt_work::provider::Cap::Off.units(0x207f_ffff, 1, 1).unwrap(), None);
+    let unconvertible = Caps { invoice: xbt_work::provider::Cap::Sats(150), total: xbt_work::provider::Cap::Off };
+    assert_eq!(unconvertible.at(0, 1, 1), CreditCaps { per_invoice: Some(0), total: None }, "an unconvertible cap holds everything");
 }
 
 /// DATUM: the payer refuses a gateway that would not pass the username to the Prime.

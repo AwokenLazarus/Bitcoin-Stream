@@ -1,8 +1,14 @@
-# Bitcoin Stream
+# Lightning Stream
 
 Pay for a service piece by piece, as it arrives, over XBT (Bitcoin on BLAKE2b proof of work).
 Lock coins once in a payment channel. For each piece delivered, the buyer signs a slightly larger
 running total. The seller settles once, for the last total. Stop at any moment and nothing more is owed.
+
+Lightning Stream sits beside Lightning. A Stream channel is a direct, one-way channel between one
+buyer and one seller, for the high-frequency path; it is not a Lightning channel and Lightning nodes
+do not route it. Lightning is how a wallet reaches everyone else: the agent wallet here pays XBT
+Lightning invoices (BOLT 11) and offers (BOLT 12) under the same owner policy, and a bridge between
+the two is designed but not built.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 

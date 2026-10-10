@@ -193,7 +193,7 @@ pub struct HubConfig {
     /// `{"min_expiry_blocks", "max_expiry_blocks", ...}`: ch1's funding policy (FundingPolicy fields).
     pub policy: Value,
     /// Bounds on a provider's /terms before the hub funds a ch2 (AGP-037); refused `bad_terms`.
-    /// minExpiryBlocks + 6 must fit, and the expiry is clamped to it (0: 2 × `ch2_expiry_blocks`).
+    /// minExpiryBlocks + minConf + closeMarginBlocks must fit, and the expiry is clamped to it (0: 2 × `ch2_expiry_blocks`).
     pub ch2_max_expiry_blocks: u32,
     pub ch2_max_close_fee_sat: u64,
     /// `ch2_close_fee_multiple` × closeFeeSat ≤ capacity.
@@ -340,13 +340,20 @@ impl HubConfig {
                 *slot = v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| bad(format!("{k} must be a number")))?;
             }
         }
-        c.funding_policy()?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// The bounds a config must keep however it was built: [`HubConfig::from_json`] and
+    /// [`RouteHub::new`] both check them (AGP-078: a struct literal went around the first).
+    pub fn validate(&self) -> Result<()> {
+        self.funding_policy()?;
         // AGP-064: a written-off lock holds the client's base and blocks its ch2 until that ch2
         // resolves, so a lock is a small share of a ch2: at most half (the default is a fifth)
-        if c.max_lock_sat == 0 || c.max_lock_sat.saturating_mul(2) > c.ch2_capacity {
-            return Err(bad(format!("max_lock_sat {} must be at most half of ch2_capacity {}", c.max_lock_sat, c.ch2_capacity)));
+        if self.max_lock_sat == 0 || self.max_lock_sat.saturating_mul(2) > self.ch2_capacity {
+            return fail("bad_config", format!("max_lock_sat {} must be at most half of ch2_capacity {}", self.max_lock_sat, self.ch2_capacity));
         }
-        Ok(c)
+        Ok(())
     }
 
     /// ch1's funding policy: `close_margin` plus the `policy` overrides.
@@ -742,6 +749,17 @@ enum Loc<'a> {
     Archived(usize),
 }
 
+/// A `/x402/route` as parsed: the payment payload, the body's `route`, and from it the lock's
+/// amount `d`, its fee `f`, its id and the provider's origin.
+struct RouteReq {
+    pl: Value,
+    rt: Value,
+    d: i128,
+    f: i128,
+    lock_id: String,
+    provider: String,
+}
+
 /// A provider's busy flag: the route request in flight, or the watcher, owns its ch2.
 struct Busy<'a> {
     set: &'a Mutex<HashSet<String>>,
@@ -845,6 +863,7 @@ impl RouteHub {
     pub fn new_with_wrap_key(chain: Arc<dyn ChainBackend>, scan: Arc<dyn SpendScan>, wallet: Box<dyn Wallet>, http: Box<dyn Transport>,
                              pay_to_secret: SecretKey, network: &str, datadir: Option<&Path>, cfg: HubConfig, wrap: Option<WrapKey>)
                              -> Result<Self> {
+        cfg.validate()?;
         if let Some(d) = datadir {
             std::fs::create_dir_all(d).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
         }
@@ -1055,6 +1074,10 @@ impl RouteHub {
         if body.len() > self.body_limit(path, max_body) {
             return HttpResponse::new(400, vec![], b"bad request framing or body over MAX_BODY".to_vec());
         }
+        if crate::wire::no_fragment(path).is_err() {
+            // as the provider does (AGP-081, review T2)
+            return HttpResponse::new(400, vec![], b"request target with a # fragment".to_vec());
+        }
         if path.split('?').next() == Some(HUB_ROUTE_PATH) {
             let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
             if let (true, Some(h)) = (method == "POST", hdr) {
@@ -1067,7 +1090,8 @@ impl RouteHub {
             }
             return self.inbound.required_response(&doc);
         }
-        if method == "POST" && path.split('?').next() == Some(CLOSE_PATH) {
+        // a rollover spends ch1's funding as a close does (AGP-078): the same sweep before either
+        if method == "POST" && [CLOSE_PATH, ROLLOVER_PATH].iter().any(|p| path.split('?').next() == Some(p)) {
             if let Some(ch1) = crate::json::parse_slice(body).ok().and_then(|v| v.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok())) {
                 self.sweep_orphan_lock(&ch1);
             }
@@ -1081,7 +1105,8 @@ impl RouteHub {
     /// before it writes the lock until its forward ends. AGP-073: if a ch2 of that provider has the
     /// lock written off, its pre-signature may be out, so it is held in ch1's base as the void would
     /// have held it; otherwise nothing can complete it and it is dropped (AGP-064), so it does not
-    /// keep ch1 from closing. Run by the watcher for every ch1 with a lock, and before a ch1 close.
+    /// keep ch1 from closing. Run by the watcher for every ch1 with a lock, and before a ch1 close
+    /// or rollover.
     fn sweep_orphan_lock(&self, ch1: &str) -> Option<Value> {
         let rl = self.ch1_state(ch1).and_then(|s| s.extra.get("route_lock").filter(|x| truthy(Some(x))).cloned())?;
         let origin = py_str(rl.get("provider"));
@@ -1136,7 +1161,7 @@ impl RouteHub {
     /// `bind`: the request's URL as [`request_digest_v2`] binds it.
     fn route(&self, method: &str, bind: &str, hdr: &str, body: &[u8]) -> HttpResponse {
         let t0 = Instant::now();
-        let parsed = (|| -> Option<(Value, Value, i128, i128, String, String)> {
+        let parsed = (|| -> Option<RouteReq> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
             let rt = crate::json::parse_slice(body).ok()?.get("route")?.clone();
             if !pl.is_object() || !rt.is_object() {
@@ -1144,33 +1169,63 @@ impl RouteHub {
             }
             let (d, f) = (py_int(rt.get("amount"))?, py_int(rt.get("fee"))?);
             let lock_id = py_str(Some(rt.get("lockId")?));
-            let provider = canon_origin(&py_str(Some(rt.get("provider")?)));
-            Some((pl, rt, d, f, lock_id, provider))
+            // no `#`: the lock sent on is bound to `provider + /x402/xbt-channel/lock` (AGP-081, T2)
+            let provider = Some(canon_origin(&py_str(Some(rt.get("provider")?)))).filter(|p| crate::wire::no_fragment(p).is_ok())?;
+            Some(RouteReq { pl, rt, d, f, lock_id, provider })
         })();
-        let Some((pl, rt, d, f, lock_id, provider)) = parsed else { return e400("bad_payload", "") };
+        let Some(req) = parsed else { return e400("bad_payload", "") };
+        let pl = &req.pl;
         let mut l = self.inbound.ledger_lock();
         // 1 auth -------------------------------------------------------------------------------------
         let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
         let Some(cid) = cid else { return e400("unknown_channel", "") };
         let mut st1 = l.channels[&cid].clone();
-        if !self.inbound.authentic(&st1, &pl, method, bind, body) {
+        if !self.inbound.authentic(&st1, pl, method, bind, body) {
             return err(401, "bad_auth", "", json!({}));
         }
         st1.seq = py_u64(pl.get("seq")).unwrap_or(st1.seq);
         l.channels.insert(cid.clone(), st1.clone());
-        if let Some(done) = st1.extra.get("route_done").and_then(|d| d.get(&lock_id)) {
+        let (oc, lock1, busy) = match self.admit(&mut l, &mut st1, &req) {
+            Ok(a) => a,
+            Err(refusal) => {
+                // AGP-078 (review T4): the seq this request spent is durable before its refusal
+                // leaves. Kept only in memory it came back after a restart, and the refused header
+                // authenticated again
+                if let Err(e) = self.inbound.save_state(&mut l, &st1) {
+                    return err(500, &e.code, &e.to_string(), json!({}));
+                }
+                return refusal;
+            }
+        };
+        let n = l.channels.values().filter(|c| truthy(c.extra.get("route_lock"))).count();
+        lk(&self.stats).ch1_locks_at_forward.push(n);
+        drop(l);
+        let r = self.forward(&cid, &oc, &lock1, &req.rt, t0);
+        drop(busy);
+        r
+    }
+
+    /// Checks 2 to 7 of a `/x402/route` whose auth passed, and the ch1 write-ahead of its lock (the
+    /// ledger lock is the caller's). `Ok`: the ch2 the lock goes over, the lock as written on ch1,
+    /// and that provider's busy flag. `Err`: the answer to send instead (a refusal, or a completed
+    /// lock's answer again); nothing was written.
+    fn admit(&self, l: &mut Ledger, st1: &mut ChannelState, req: &RouteReq) -> std::result::Result<(OutChannel, Value, Busy<'_>), HttpResponse> {
+        let RouteReq { pl, rt, d, f, lock_id, provider } = req;
+        let (d, f) = (*d, *f);
+        if let Some(done) = st1.extra.get("route_done").and_then(|d| d.get(lock_id)) {
             // the client lost our answer: the same one again
-            return ok_json(done);
+            return Err(ok_json(done));
         }
         let height = match self.inbound.height() {
             Ok(h) => h,
-            Err(e) => return err(500, "node_error", &e.to_string(), json!({})),
+            Err(e) => return Err(err(500, "node_error", &e.to_string(), json!({}))),
         };
-        if !st1.closed_txid.is_empty() || height as i64 >= st1.params.expiry as i64 - self.cfg.close_margin as i64 {
-            return e400("channel_closing", "");
+        // AGP-084: a ch1 close or rollover the node errored on can still confirm: no lock above it
+        if crate::provider::closing(st1) || height as i64 >= st1.params.expiry as i64 - self.cfg.close_margin as i64 {
+            return Err(e400("channel_closing", ""));
         }
         if st1.suspended {
-            return e400("unconfirmed", "");
+            return Err(e400("unconfirmed", ""));
         }
         // 2 point ------------------------------------------------------------------------------------
         let pts = (|| -> Option<_> {
@@ -1179,10 +1234,10 @@ impl RouteHub {
             let t1 = if truthy(pl.get("point")) { Some(adaptor::dec_hex(pl.get("point")?.as_str()?).ok()?) } else { None };
             Some((tp, r, t1))
         })();
-        let Some((tp, r, t1)) = pts else { return e400("bad_point", "points must be compressed secp256k1 points") };
+        let Some((tp, r, t1)) = pts else { return Err(e400("bad_point", "points must be compressed secp256k1 points")) };
         if let Some(t1) = &t1 {
             if r.is_zero() || adaptor::add(Some(&tp), adaptor::mul(&r, None).as_ref()) != Some(*t1) {
-                return e400("bad_point", "T1 != T + r*G");
+                return Err(e400("bad_point", "T1 != T + r*G"));
             }
         }
         // 3 amount -----------------------------------------------------------------------------------
@@ -1192,46 +1247,46 @@ impl RouteHub {
         let fee_paid = py_u64(ex1.get("fee_paid")).unwrap_or(0);
         let cum = py_int(pl.get("cum")).unwrap_or(-1);
         if d < 1 || f < 0 || d > self.cfg.max_lock_sat as i128 {
-            return e400("bad_amount", &format!("lock amount must be in [1, {}]", self.cfg.max_lock_sat));
+            return Err(e400("bad_amount", &format!("lock amount must be in [1, {}]", self.cfg.max_lock_sat)));
         }
         let (d, f) = (d as u64, u64::try_from(f).unwrap_or(u64::MAX / 4));
         let need1 = next_cum(routed1, d.saturating_add(f), st1.params.min_amount());
         let floor1 = need1 <= st1.best_cum;
         // our view of ch1, so a client that gave up a lock we later completed, held or released can resync
         let view = |expect: u64| {
-            let mut v = ch1_view(&st1);
+            let mut v = ch1_view(st1);
             v["expectCum"] = expect.into();
             v
         };
         if floor1 {
             if cum != st1.best_cum as i128 || truthy(pl.get("adaptor")) {
-                return err(400, "bad_amount", &format!("the dust floor covers this lock: cum {}, no adaptor", st1.best_cum), view(st1.best_cum));
+                return Err(err(400, "bad_amount", &format!("the dust floor covers this lock: cum {}, no adaptor", st1.best_cum), view(st1.best_cum)));
             }
         } else if cum != need1 as i128 || cum > st1.params.max_amount() as i128 || t1.is_none() {
-            return err(400, "bad_amount", &format!("lock pays {cum}, expected {need1}"), view(need1));
+            return Err(err(400, "bad_amount", &format!("lock pays {cum}, expected {need1}"), view(need1)));
         }
         // 4 pre-verify -------------------------------------------------------------------------------
         let mut pre1: Option<PreSig> = None;
         if !floor1 {
-            let Ok(p) = PreSig::from_json(pl.get("adaptor").unwrap_or(&Value::Null)) else { return e400("bad_adaptor", "malformed adaptor") };
+            let Ok(p) = PreSig::from_json(pl.get("adaptor").unwrap_or(&Value::Null)) else { return Err(e400("bad_adaptor", "malformed adaptor")) };
             let z1 = match st1.params.state_tx(need1).and_then(|tx| st1.params.sighash(&tx)) {
                 Ok(z) => z,
-                Err(_) => return e400("bad_adaptor", "no such state"),
+                Err(_) => return Err(e400("bad_adaptor", "no such state")),
             };
             if !adaptor::preverify(&st1.params.payer_pub, &z1, t1.as_ref().expect("checked in 3"), &p) {
-                return e400("bad_adaptor", "pre-signature does not verify under T1");
+                return Err(e400("bad_adaptor", "pre-signature does not verify under T1"));
             }
             pre1 = Some(p);
         }
         // 5 fee quote --------------------------------------------------------------------------------
-        let Ok(q) = FeeQuote::from_json(rt.get("feeQuote").unwrap_or(&Value::Null)) else { return e400("route_fee", "no fee quote") };
+        let Ok(q) = FeeQuote::from_json(rt.get("feeQuote").unwrap_or(&Value::Null)) else { return Err(e400("route_fee", "no fee quote")) };
         // any live quote this hub signed is honoured, including one the fee strategy has since moved
         if q.hub != self.pay_to || q.network != self.network || !q.verify() || !q.live(now_f()) {
-            return e400("route_fee", "not a live fee quote of this hub");
+            return Err(e400("route_fee", "not a live fee quote of this hub"));
         }
         let (f_due, units) = fee_due(&q, d, fee_units, fee_paid);
         if f < f_due {
-            return err(400, "route_fee", &format!("fee {f} < {f_due} due under quote {}", q.seq), json!({"feeDue": f_due}));
+            return Err(err(400, "route_fee", &format!("fee {f} < {f_due} due under quote {}", q.seq), json!({"feeDue": f_due})));
         }
         // 6 expiry rule ------------------------------------------------------------------------------
         // the provider is the origin the client named: its own ch2, in that process's ledger (AGP-056)
@@ -1247,45 +1302,45 @@ impl RouteHub {
         // under the busy flag below
         let spare = nxt.as_ref().is_some_and(|n| n.state == "open");
         if !oc.as_ref().is_some_and(|o| o.state == "open" || opening(o)) && !spare {
-            return e400("route_blocked", &self.no_channel(&provider, oc.as_ref()));
+            return Err(e400("route_blocked", &self.no_channel(provider, oc.as_ref())));
         }
         if let Some(o) = oc.as_ref().filter(|o| !o.blocked.is_empty() && !(spare && o.blocked == ROLLOVER_GONE)) {
-            return e400("route_blocked", &o.blocked);
+            return Err(e400("route_blocked", &o.blocked));
         }
-        let Some(oc) = oc.or(nxt) else { return e400("route_blocked", &self.no_channel(&provider, None)) };
-        let Ok(inv) = Invoice::from_json(rt.get("invoice").unwrap_or(&Value::Null)) else { return e400("bad_invoice", "") };
+        let Some(oc) = oc.or(nxt) else { return Err(e400("route_blocked", &self.no_channel(provider, None))) };
+        let Ok(inv) = Invoice::from_json(rt.get("invoice").unwrap_or(&Value::Null)) else { return Err(e400("bad_invoice", "")) };
         let rt_point = py_str(rt.get("point"));
-        if inv.pay_to != oc.pay_to || !inv.verify() || inv.point.to_lowercase() != rt_point.to_lowercase() || inv.lock_id != lock_id
+        if inv.pay_to != oc.pay_to || !inv.verify() || inv.point.to_lowercase() != rt_point.to_lowercase() || inv.lock_id != *lock_id
             || inv.valid_until_f() < now_f() + 0.5 || !inv.accepts_hub(&self.pay_to)
         {
-            return e400("bad_invoice", "invoice not signed by the provider for this point, or expiring");
+            return Err(e400("bad_invoice", "invoice not signed by the provider for this point, or expiring"));
         }
         if !spare && !route_ok(height, st1.params.expiry, oc.params.expiry, self.cfg.close_margin, self.cfg.delta) && d > self.cfg.max_unguarded_lock_sat {
-            return e400("route_expiry", &format!("ch2 outlives ch1 and {d} > maxUnguardedLockSat"));
+            return Err(e400("route_expiry", &format!("ch2 outlives ch1 and {d} > maxUnguardedLockSat")));
         }
         // 7 one lock per channel ---------------------------------------------------------------------
         if truthy(ex1.get("route_lock")) {
-            return e400("lock_outstanding", "a lock on this ch1 is pending");
+            return Err(e400("lock_outstanding", "a lock on this ch1 is pending"));
         }
         let Some(busy) = self.acquire(&key, Duration::from_millis(500)) else {
-            return e400("lock_outstanding", "a lock on this provider's ch2 is pending");
+            return Err(e400("lock_outstanding", "a lock on this provider's ch2 is pending"));
         };
         // re-read under the busy flag: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
         // the checks that depend on the channel are made again on the one the lock will use
         let mut oc = lk(&self.out).chans.get(&key).cloned();
-        let mut why = self.ch2_refusal(oc.as_ref(), &st1, d, height);
+        let mut why = self.ch2_refusal(oc.as_ref(), st1, d, height);
         if why.is_some() || !oc.as_ref().is_some_and(|o| !exhausted(o, d)) {
             // AGP-057: the next ch2, funded ahead, takes over with this lock (make-before-break refill)
-            match self.switch_for(&key, oc.as_ref(), &st1, d, height, why.as_ref().map(|w| w.1.as_str())) {
+            match self.switch_for(&key, oc.as_ref(), st1, d, height, why.as_ref().map(|w| w.1.as_str())) {
                 Ok(Some(alt)) => (oc, why) = (Some(alt), None),
                 Ok(None) => {}
-                Err(e) => return err(500, &e.code, &e.to_string(), json!({})),
+                Err(e) => return Err(err(500, &e.code, &e.to_string(), json!({}))),
             }
         }
         if let Some((code, why)) = why {
-            return e400(code, &why);
+            return Err(e400(code, &why));
         }
-        let Some(oc) = oc else { return e400("lock_outstanding", "a lock on this provider's ch2 is pending") };
+        let Some(oc) = oc else { return Err(e400("lock_outstanding", "a lock on this provider's ch2 is pending")) };
         // write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
         // cum passed check 3: the best state (floor) or need1
         let lock1 = json!({"lockId": lock_id, "cum": cum as u64, "floor": floor1,
@@ -1294,15 +1349,12 @@ impl RouteHub {
                            "session": rt.get("session").cloned().unwrap_or(Value::Null),
                            "after": {"routed": routed1 + d + f, "units": int_value(units), "paid": fee_paid + f}});
         st1.extra.insert("route_lock".into(), lock1.clone());
-        if let Err(e) = self.inbound.save_state(&mut l, &st1) {
-            return err(500, &e.code, &e.to_string(), json!({}));
+        if let Err(e) = self.inbound.save_state(l, st1) {
+            // not written: the caller's save of the spent seq must not write it either
+            st1.extra.insert("route_lock".into(), Value::Null);
+            return Err(err(500, &e.code, &e.to_string(), json!({})));
         }
-        let n = l.channels.values().filter(|c| truthy(c.extra.get("route_lock"))).count();
-        lk(&self.stats).ch1_locks_at_forward.push(n);
-        drop(l);
-        let r = self.forward(&cid, &oc, &lock1, &rt, t0);
-        drop(busy);
-        r
+        Ok((oc, lock1, busy))
     }
 
     /// (code, detail) if the ch2 (as read under its busy flag) cannot take a lock of `d` now: another
@@ -1774,7 +1826,8 @@ impl RouteHub {
 
     /// Bound a provider's /terms before the hub funds anything (AGP-037): (capacity, blocks) or
     /// `bad_terms`. A provider must not be able to set a ch2 the hub can never use or get back: an
-    /// expiry decades away, a close fee that eats the capacity, a minConf never reached.
+    /// expiry decades away, a close fee that eats the capacity, a minConf never reached. `bad_config`
+    /// when `max_lock_sat` is more than half of the capacity it would be funded with (AGP-084).
     pub fn ch2_terms(&self, terms: &Value, capacity: Option<u64>, expiry_blocks: Option<u32>) -> Result<(u64, u32)> {
         let c = &self.cfg;
         let bad = |w: &str| ChannelError::new("bad_terms", format!("malformed /terms: {w}"));
@@ -1784,23 +1837,30 @@ impl RouteHub {
         let num = |k: &str| py_u64(ex.get(k)).ok_or_else(|| bad(k));
         let close_fee = num("closeFeeSat")?;
         let min_cap = num("minCapacity")?;
-        let lo = num("minExpiryBlocks")?.saturating_add(6);
-        let hi = num("maxExpiryBlocks")?.saturating_sub(1);
         let min_conf = if ex.get("minConf").is_some() { num("minConf")? } else { 1 };
+        // the payer's rule (funding::open_expiry_floor): the ch2 funding gets minConf plus the
+        // provider's own close margin to confirm before the provider's expiry check refuses it
+        let lo = crate::funding::open_expiry_floor(num("minExpiryBlocks")?, min_conf, num("closeMarginBlocks")?);
+        let hi = num("maxExpiryBlocks")?.saturating_sub(1);
         let mult = if ex.get("settleMultiple").is_some() { num("settleMultiple")? } else { 20 };
         let max_blocks = if c.ch2_max_expiry_blocks > 0 { c.ch2_max_expiry_blocks as u64 } else { 2 * c.ch2_expiry_blocks as u64 };
         let max_min_cap = if c.ch2_max_min_capacity > 0 { c.ch2_max_min_capacity } else { c.ch2_capacity };
         let cap = capacity.unwrap_or(c.ch2_capacity).max(min_cap);
+        // AGP-084: AGP-064's bound (a lock is at most half of a ch2) against the capacity this ch2
+        // is funded with, which the caller may have chosen below the configured one
+        if c.max_lock_sat.saturating_mul(2) > cap {
+            return fail("bad_config", format!("max_lock_sat {} must be at most half of this ch2's capacity {cap}", c.max_lock_sat));
+        }
         let why = if close_fee > c.ch2_max_close_fee_sat {
             format!("closeFeeSat {close_fee} > ch2_max_close_fee_sat {}", c.ch2_max_close_fee_sat)
         } else if close_fee.saturating_mul(c.ch2_close_fee_multiple) > cap {
             format!("{} x closeFeeSat {close_fee} > capacity {cap}", c.ch2_close_fee_multiple)
         } else if min_cap > max_min_cap {
             format!("minCapacity {min_cap} > ch2_max_min_capacity {max_min_cap}")
-        } else if lo > max_blocks || lo > hi {
-            format!("minExpiryBlocks + 6 = {lo} > max expiry {}", max_blocks.min(hi))
         } else if min_conf > c.ch2_max_min_conf {
             format!("minConf {min_conf} > ch2_max_min_conf {}", c.ch2_max_min_conf)
+        } else if lo > max_blocks || lo > hi {
+            format!("minExpiryBlocks + minConf + closeMarginBlocks = {lo} > max expiry {}", max_blocks.min(hi))
         } else if !(1..=c.ch2_max_settle_multiple).contains(&mult) {
             format!("settleMultiple {mult} outside [1, {}]", c.ch2_max_settle_multiple)
         } else {
@@ -1984,7 +2044,7 @@ impl RouteHub {
         }
         let body = json!({"x402Version": 2, "network": self.network, "preflight": true, "channel": c, "hub": {"payTo": self.pay_to}});
         let open_url = terms.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH);
-        let (st, doc) = self.post_json(&format!("{origin}{open_url}"), &body)?;
+        let (st, doc) = self.post_json(&crate::wire::seller_url(origin, open_url)?, &body)?;
         if st != 200 {
             let code = doc.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
             if code == "bad_request" {
@@ -2176,7 +2236,7 @@ impl RouteHub {
         let body = json!({"x402Version": 2, "network": self.network, "channel": c,
                           "hub": {"payTo": self.pay_to, "sig": hex::encode(ecdsa::sign(&self.secret, &hub_channel_message(&p.channel_id())))}});
         let open_url = oc.terms.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH);
-        let (st, doc) = self.post_json(&format!("{}{open_url}", oc.origin), &body)?;
+        let (st, doc) = self.post_json(&crate::wire::seller_url(&oc.origin, open_url)?, &body)?;
         if st != 200 {
             // said, not only returned (AGP-057): a refused open is why a ch2 stays `funded`
             let why: String = doc.to_string().chars().take(160).filter(|c| (' '..='~').contains(c)).collect();
@@ -2366,7 +2426,7 @@ impl RouteHub {
         }
         let req = json!({"chan": p.channel_id(), "sig": hex::encode(ecdsa::sign(&oc.secret_key()?, &close_message(&p.channel_id())))});
         let close_url = oc.terms.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH);
-        let (st, doc) = self.post_json(&format!("{}{close_url}", oc.origin), &req)
+        let (st, doc) = self.post_json(&crate::wire::seller_url(&oc.origin, close_url)?, &req)
             .map_err(|e| ChannelError::new("provider_error", format!("close: {e}")))?;
         if st != 200 {
             return fail("provider_error", doc.to_string().chars().take(200).collect::<String>());

@@ -83,8 +83,8 @@ fn runbook_g1_to_g7_and_both_rollbacks() {
     assert!(fo[0].0.starts_with("0020") && fo[0].0.len() == 68 && fo[0].1 == 10_000, "{fo:?}");
     assert_eq!(fo[1], (hot_spk.clone(), 1_400));
     assert_eq!(*ftx.inputs[0].witness[0].last().unwrap(), 0x21);
-    // minExpiry 1,008 plus the provider's close margin of 36 (AGP-074)
-    assert_eq!(r["opened"]["expiry"].as_i64().unwrap(), (open_block - 1) as i64 + 1_044);
+    // the offer's minExpiryBlocks 1,008 + minConf 1 + closeMarginBlocks 144 (AGP-076)
+    assert_eq!(r["opened"]["expiry"].as_i64().unwrap(), (open_block - 1) as i64 + 1_153);
     let mut receipts = vec![receipt(&r)];
 
     // G4: nine more calls; nothing broadcast

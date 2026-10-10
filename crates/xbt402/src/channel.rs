@@ -429,6 +429,14 @@ pub struct Payer {
     pub signed: u64,
 }
 
+impl Drop for Payer {
+    fn drop(&mut self) {
+        if let Some(s) = &mut self.secret {
+            s.non_secure_erase(); // AGP-080 K1: a payer key is wiped with the payer that held it
+        }
+    }
+}
+
 impl std::fmt::Debug for Payer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Payer").field("params", &self.params).field("signed", &self.signed)

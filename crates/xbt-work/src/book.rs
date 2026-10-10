@@ -5,18 +5,20 @@
 //!
 //! §13.1 caps (AGP-043): with [`CreditCaps`] set, a receipt's increase is credited only as far as the
 //! caps on *unaudited* credit allow, per invoice and in total. The rest is **held**: receipted by the
-//! Prime, kept in the book, but not spendable. Each credited increase stays unaudited until a coinbase
-//! audit that passes at a height above it ([`ReceiptBook::audited`]), which then credits held work
+//! Prime, kept in the book, but not spendable, and credited once the caps have room again
 //! ([`ReceiptBook::release_held`]). The audit intervals record every receipted increase whether it is
 //! credited or held: the Prime signed for all of it, so the audit bound never depends on the caps.
 //! Without caps nothing is held and the book behaves exactly as the reference.
 //!
-//! AGP-065 (review P2): a pass releases only the credit its bound counted. Each receipted increase is
-//! a [`Span`]; an audit at `H` with window start `ws` covers a span only when `ws < lo` and `hi < H`
-//! (the spans `L_H` sums). A span with `lo ≤ ws` is **skipped**: the window moved past it, so no
-//! audit will ever count it. Skipped credit is forgiven up to [`CreditCaps::skipped`] in total and
-//! counts against `total` beyond that, for good. A reorg puts the spans an orphaned audit resolved
-//! back to open ([`ReceiptBook::uncover`]).
+//! AGP-079 (closure audit, P1): credit leaves the caps only as far as coinbases paid for it. The
+//! provider's audit turns what a pool block's coinbase paid the identity (read from its own node)
+//! into work units at its own price and records it here ([`ReceiptBook::pay`]). Credit is kept in
+//! the order it was granted ([`ReceiptBook::credits`]) and the paid-for work covers the oldest
+//! first; what is left is the unaudited credit the caps count. No number a Prime signs (a window
+//! start, a deferral line, `min_payout`, whether a block has a statement at all) moves it. A reorg
+//! takes the block's payment out again ([`ReceiptBook::uncover`]). This replaces the AGP-065 spans
+//! (`Open`, `Covered`, `Skipped`), under which one passing audit released everything its bound
+//! counted, whatever the coinbase paid.
 use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
@@ -64,63 +66,11 @@ pub struct CreditCaps {
     pub per_invoice: Option<u64>,
     /// Unaudited credit across all invoices.
     pub total: Option<u64>,
-    /// Credit no audit can cover any more (skipped) that is forgiven, in total; skipped credit
-    /// beyond it counts as unaudited (against `total`) for good. `u64::MAX`: all of it is
-    /// forgiven, as AGP-043 did.
-    pub skipped: u64,
 }
 
 impl CreditCaps {
     pub fn is_none(&self) -> bool {
         self.per_invoice.is_none() && self.total.is_none()
-    }
-}
-
-/// Where a receipted increase stands with the audits; the height is the audited block that put it
-/// there (a reorg of that block reopens it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coverage {
-    Open,
-    Covered(u32),
-    Skipped(u32),
-}
-
-/// One receipted increase of one invoice: `work` units in heights `[lo, hi]`, `credited` of them
-/// turned into credit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Span {
-    pub invoice: String,
-    pub lo: u32,
-    pub hi: u32,
-    pub work: u64,
-    pub credited: u64,
-    pub coverage: Coverage,
-}
-
-/// One invoice's open credit, all open credit and the skipped credit, from which the caps' room
-/// follows (kept current while [`ReceiptBook::credit`] walks the spans, so the walk is one pass).
-struct Tally {
-    open: u64,
-    open_all: u64,
-    skipped: u64,
-}
-
-impl Tally {
-    fn unaudited_all(&self, caps: &CreditCaps) -> u64 {
-        self.open_all.saturating_add(self.skipped.saturating_sub(caps.skipped))
-    }
-
-    fn total_room(&self, caps: &CreditCaps) -> u64 {
-        caps.total.map_or(u64::MAX, |c| c.saturating_sub(self.unaudited_all(caps)))
-    }
-
-    fn room(&self, caps: &CreditCaps) -> u64 {
-        caps.per_invoice.map_or(u64::MAX, |c| c.saturating_sub(self.open)).min(self.total_room(caps))
-    }
-
-    /// How much skipped work may still be credited.
-    fn skipped_room(&self, caps: &CreditCaps) -> u64 {
-        caps.skipped.saturating_sub(self.skipped).saturating_add(self.total_room(caps))
     }
 }
 
@@ -137,10 +87,16 @@ pub struct ReceiptBook {
     pub credited: HashMap<String, u64>,
     pub intervals: Vec<Interval>,
     pub fraud: Vec<Equivocation>,
-    /// The receipted increases not yet settled ([`ReceiptBook::settle`]), in receipt order.
-    pub spans: Vec<Span>,
-    /// Skipped credit of spans already settled.
-    pub settled_skipped: u64,
+    /// Credit not yet settled ([`ReceiptBook::settle`]), in the order it was granted: (invoice,
+    /// work). Paid-for work covers the oldest first.
+    pub credits: Vec<(String, u64)>,
+    /// Work the coinbase of each audited block paid for, (height, work), lowest height first.
+    pub cover: Vec<(u32, u64)>,
+    /// Paid-for work of settled blocks that no credit has used yet.
+    pub cover_settled: u64,
+    /// Payments of blocks at or below this height are settled and final: auditing such a block
+    /// again never counts its payment a second time.
+    pub settled_through: u32,
     /// The caps in force (configuration, not state).
     pub caps: CreditCaps,
     /// Set: no new credit at all (the carry rules of §10.3/§13.1), with the reason's short code.
@@ -150,27 +106,36 @@ pub struct ReceiptBook {
 impl ReceiptBook {
     pub fn new(identity: &str, prime_pubkey: VerifyingKey, prime_id: u32) -> Self {
         Self { identity: identity.into(), prime_pubkey, prime_id, last: IndexMap::new(), by_seq: HashMap::new(),
-               credited: HashMap::new(), intervals: vec![], fraud: vec![], spans: vec![], settled_skipped: 0,
+               credited: HashMap::new(), intervals: vec![], fraud: vec![], credits: vec![], cover: vec![], cover_settled: 0, settled_through: 0,
                caps: CreditCaps::default(), frozen: None }
     }
 
-    fn open_credit(&self, invoice: Option<&str>) -> u64 {
-        self.spans.iter().filter(|s| s.coverage == Coverage::Open && invoice.is_none_or(|v| v == s.invoice))
-            .fold(0u64, |a, s| a.saturating_add(s.credited))
+    /// Work the audited coinbases paid for.
+    pub fn paid_work(&self) -> u128 {
+        self.cover.iter().fold(u128::from(self.cover_settled), |a, (_, w)| a + u128::from(*w))
     }
 
-    /// Credit no audit can cover any more.
-    pub fn skipped_work(&self) -> u64 {
-        self.spans.iter().filter(|s| matches!(s.coverage, Coverage::Skipped(_))).fold(self.settled_skipped, |a, s| a.saturating_add(s.credited))
+    fn granted(&self) -> u128 {
+        self.credits.iter().fold(0u128, |a, (_, w)| a + u128::from(*w))
     }
 
-    /// Unaudited credit of `invoice` (None: across all invoices, with the skipped credit beyond
-    /// [`CreditCaps::skipped`]).
+    /// Credit no coinbase has paid for yet: of `invoice`, or across all invoices (None). Payments
+    /// cover the oldest credit first, so the unpaid credit is the newest.
     pub fn unaudited_work(&self, invoice: Option<&str>) -> u64 {
-        match invoice {
-            Some(_) => self.open_credit(invoice),
-            None => self.open_credit(None).saturating_add(self.skipped_work().saturating_sub(self.caps.skipped)),
+        let unpaid = u64::try_from(self.granted().saturating_sub(self.paid_work())).unwrap_or(u64::MAX);
+        let Some(invoice) = invoice else { return unpaid };
+        let (mut left, mut mine) = (unpaid, 0u64);
+        for (inv, w) in self.credits.iter().rev() {
+            if left == 0 {
+                break;
+            }
+            let part = (*w).min(left);
+            if inv == invoice {
+                mine = mine.saturating_add(part);
+            }
+            left -= part;
         }
+        mine
     }
 
     /// Work the best receipt of `invoice` carries beyond what was credited (held by the caps).
@@ -189,94 +154,86 @@ impl ReceiptBook {
         self.last.get(invoice).is_some_and(|s| s.receipt.cum_work > 0) || self.credited.get(invoice).copied().unwrap_or(0) > 0
     }
 
-    /// How much more `invoice` may be credited now.
+    /// How much more `invoice` may be credited now: paid-for work no credit has used, plus what
+    /// the caps leave.
     pub fn room(&self, invoice: &str) -> u64 {
         if self.frozen.is_some() {
             return 0;
         }
-        self.tally(invoice).room(&self.caps)
+        let surplus = u64::try_from(self.paid_work().saturating_sub(self.granted())).unwrap_or(u64::MAX);
+        let per_invoice = self.caps.per_invoice.map_or(u64::MAX, |c| c.saturating_sub(self.unaudited_work(Some(invoice))));
+        let total = self.caps.total.map_or(u64::MAX, |c| c.saturating_sub(self.unaudited_work(None)));
+        surplus.saturating_add(per_invoice.min(total))
     }
 
-    fn tally(&self, invoice: &str) -> Tally {
-        Tally { open: self.open_credit(Some(invoice)), open_all: self.open_credit(None), skipped: self.skipped_work() }
-    }
-
-    /// The coinbase at `height` was audited under a statement with window start `window_start`: the
-    /// open spans with `lo ≤ window_start` are skipped, and if it `passed`, the open spans its bound
-    /// counted (`window_start < lo`, `hi < height`) are covered. Returns the credit covered.
-    pub fn audited(&mut self, height: u32, window_start: u32, passed: bool) -> u64 {
-        let mut covered = 0u64;
-        for s in self.spans.iter_mut().filter(|s| s.coverage == Coverage::Open) {
-            if s.lo <= window_start {
-                s.coverage = Coverage::Skipped(height);
-            } else if passed && s.hi < height {
-                s.coverage = Coverage::Covered(height);
-                covered = covered.saturating_add(s.credited);
-            }
+    /// The coinbase at `height` passed its audit and paid for `work` units (0: it paid for none, or
+    /// failed). Replaces what was recorded for that height; a block at or below
+    /// [`ReceiptBook::settled_through`] is settled and changes nothing. Returns the credit it newly covers.
+    pub fn pay(&mut self, height: u32, work: u64) -> u64 {
+        if height <= self.settled_through {
+            return 0;
         }
-        covered
+        let before = self.unaudited_work(None);
+        self.cover.retain(|(h, _)| *h != height);
+        if work > 0 {
+            let at = self.cover.partition_point(|(h, _)| *h < height);
+            self.cover.insert(at, (height, work));
+        }
+        before.saturating_sub(self.unaudited_work(None))
     }
 
-    /// The audited block at `height` left the chain: the spans its audit resolved are open again.
+    /// The audited block at `height` left the chain: what its coinbase paid for no longer counts.
     /// Returns the credit that is unaudited again.
     pub fn uncover(&mut self, height: u32) -> u64 {
-        let mut back = 0u64;
-        for s in self.spans.iter_mut().filter(|s| matches!(s.coverage, Coverage::Covered(h) | Coverage::Skipped(h) if h == height)) {
-            s.coverage = Coverage::Open;
-            back = back.saturating_add(s.credited);
-        }
-        back
+        let before = self.unaudited_work(None);
+        self.cover.retain(|(h, _)| *h != height);
+        self.unaudited_work(None).saturating_sub(before)
     }
 
-    /// Forget what no reorg will reopen: fully credited spans an audit at or below `height`
-    /// resolved, the receipts (other than the best) and intervals at or below `window_start`, which
-    /// no later window counts. Call it with an audited block deeper than any expected reorg.
+    /// Forget what no reorg will reopen: the payments of blocks at or below `height` and the
+    /// oldest credit they cover, and the receipts (other than the best) and intervals at or below
+    /// `window_start`, which no later window counts. Call it with an audited block deeper than any
+    /// expected reorg. Unpaid credit is never forgotten.
     pub fn settle(&mut self, height: u32, window_start: u32) {
-        let mut skipped = 0u64;
-        self.spans.retain(|s| {
-            let done = s.credited == s.work && matches!(s.coverage, Coverage::Covered(h) | Coverage::Skipped(h) if h <= height);
-            if done && matches!(s.coverage, Coverage::Skipped(_)) {
-                skipped = skipped.saturating_add(s.credited);
+        self.settled_through = self.settled_through.max(height);
+        let mut deep = u128::from(self.cover_settled);
+        self.cover.retain(|(h, w)| {
+            let settled = *h <= height;
+            if settled {
+                deep += u128::from(*w);
             }
-            !done
+            !settled
         });
-        self.settled_skipped = self.settled_skipped.saturating_add(skipped);
+        let mut done = 0;
+        for (_, w) in self.credits.iter_mut() {
+            let part = u128::from(*w).min(deep);
+            deep -= part;
+            // part <= *w, a u64
+            *w -= part as u64;
+            if *w > 0 {
+                break;
+            }
+            done += 1;
+        }
+        self.credits.drain(..done);
+        self.cover_settled = u64::try_from(deep).unwrap_or(u64::MAX);
         let last = &self.last;
         self.by_seq.retain(|(inv, seq), s| s.receipt.first_height > window_start || last.get(inv).is_some_and(|l| l.receipt.seq == *seq));
         self.intervals.retain(|(lo, _, _)| *lo > window_start);
     }
 
-    /// Credit `invoice`'s held work as far as the caps allow; returns the work credited. Covered
-    /// spans are credited in full, open ones within [`ReceiptBook::room`], skipped ones within the
-    /// skipped allowance.
+    /// Credit `invoice`'s held work as far as [`ReceiptBook::room`] allows; returns the work credited.
     fn credit(&mut self, invoice: &str) -> u64 {
-        if self.frozen.is_some() {
+        let granted = self.held(invoice).min(self.room(invoice));
+        if granted == 0 {
             return 0;
         }
-        let mut t = self.tally(invoice);
-        let mut granted = 0u64;
-        for s in self.spans.iter_mut().filter(|s| s.invoice == invoice) {
-            let want = s.work.saturating_sub(s.credited);
-            let g = match s.coverage {
-                Coverage::Covered(_) => want,
-                Coverage::Open => want.min(t.room(&self.caps)),
-                Coverage::Skipped(_) => want.min(t.skipped_room(&self.caps)),
-            };
-            match s.coverage {
-                Coverage::Open => {
-                    t.open = t.open.saturating_add(g);
-                    t.open_all = t.open_all.saturating_add(g);
-                }
-                Coverage::Skipped(_) => t.skipped = t.skipped.saturating_add(g),
-                Coverage::Covered(_) => {}
-            }
-            s.credited += g;
-            granted = granted.saturating_add(g);
+        match self.credits.last_mut() {
+            Some((inv, w)) if inv == invoice => *w = w.saturating_add(granted),
+            _ => self.credits.push((invoice.to_string(), granted)),
         }
-        if granted > 0 {
-            let c = self.credited.entry(invoice.to_string()).or_insert(0);
-            *c = c.saturating_add(granted);
-        }
+        let c = self.credited.entry(invoice.to_string()).or_insert(0);
+        *c = c.saturating_add(granted);
         granted
     }
 
@@ -342,7 +299,6 @@ impl ReceiptBook {
         let added = r.cum_work.saturating_sub(prev.as_ref().map_or(0, |p| p.receipt.cum_work));
         if added > 0 {
             self.intervals.push((lo, r.last_height, added));
-            self.spans.push(Span { invoice: invoice.to_string(), lo, hi: r.last_height, work: added, credited: 0, coverage: Coverage::Open });
         }
         self.last.insert(invoice.to_string(), s.clone());
         Ok(self.credit(invoice))
@@ -376,15 +332,14 @@ impl ReceiptBook {
         let last: Vec<Value> = self.last.values().map(Signed::to_doc).collect();
         let iv: Vec<Value> = self.intervals.iter().map(|(lo, hi, w)| Value::from(vec![Value::from(*lo), Value::from(*hi), Value::from(*w)])).collect();
         let cr: serde_json::Map<String, Value> = self.last.keys().map(|k| (k.clone(), self.credited.get(k).copied().unwrap_or(0).into())).collect();
-        let sp: Vec<Value> = self.spans.iter().map(|s| {
-            let (state, h) = match s.coverage { Coverage::Open => ("open", 0), Coverage::Covered(h) => ("covered", h), Coverage::Skipped(h) => ("skipped", h) };
-            Value::from(vec![Value::from(s.invoice.clone()), s.lo.into(), s.hi.into(), s.work.into(), s.credited.into(), state.into(), h.into()])
-        }).collect();
+        let credits: Vec<Value> = self.credits.iter().map(|(inv, w)| Value::from(vec![Value::from(inv.clone()), Value::from(*w)])).collect();
+        let cover: Vec<Value> = self.cover.iter().map(|(h, w)| Value::from(vec![Value::from(*h), Value::from(*w)])).collect();
         let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).is_none_or(|l| l.receipt.seq != s.receipt.seq)).collect();
         held.sort_by(|a, b| (&a.receipt.invoice, a.receipt.seq).cmp(&(&b.receipt.invoice, b.receipt.seq)));
         obj([("last", last.into()), ("credited", Value::Object(cr)), ("intervals", iv.into()),
              ("fraud", self.fraud.iter().map(Equivocation::to_json).collect::<Vec<_>>().into()),
-             ("spans", sp.into()), ("settledSkipped", self.settled_skipped.into()),
+             ("credits", credits.into()), ("cover", cover.into()), ("coverSettled", self.cover_settled.into()),
+             ("settledThrough", self.settled_through.into()),
              ("receipts", held.into_iter().map(Signed::line_doc).collect::<Vec<_>>().into())])
     }
 
@@ -415,39 +370,43 @@ impl ReceiptBook {
             }
             self.by_seq.insert((s.receipt.invoice.clone(), s.receipt.seq), s);
         }
-        if let Some(spans) = v.get("spans") {
-            for s in spans.as_array().ok_or_else(|| bad("spans"))? {
-                let f = |j: usize| s.get(j).and_then(Value::as_u64).ok_or_else(|| bad("span"));
-                let h = n32(f(6)?, "span")?;
-                let coverage = match s.get(5).and_then(Value::as_str) {
-                    Some("open") => Coverage::Open,
-                    Some("covered") => Coverage::Covered(h),
-                    Some("skipped") => Coverage::Skipped(h),
-                    _ => return Err(bad("span")),
-                };
-                let invoice = s.get(0).and_then(Value::as_str).ok_or_else(|| bad("span"))?.to_string();
-                self.spans.push(Span { invoice, lo: n32(f(1)?, "span")?, hi: n32(f(2)?, "span")?, work: f(3)?, credited: f(4)?, coverage });
+        if let Some(credits) = v.get("credits") {
+            for c in credits.as_array().ok_or_else(|| bad("credits"))? {
+                let inv = c.get(0).and_then(Value::as_str).ok_or_else(|| bad("credit"))?;
+                self.credits.push((inv.to_string(), c.get(1).and_then(Value::as_u64).ok_or_else(|| bad("credit"))?));
             }
-            self.settled_skipped = v.get("settledSkipped").and_then(Value::as_u64).ok_or_else(|| bad("settledSkipped"))?;
+            for c in v.get("cover").and_then(Value::as_array).ok_or_else(|| bad("cover"))? {
+                let f = |j: usize| c.get(j).and_then(Value::as_u64).ok_or_else(|| bad("cover"));
+                self.cover.push((n32(f(0)?, "cover")?, f(1)?));
+            }
+            self.cover.sort_by_key(|(h, _)| *h);
+            self.cover_settled = v.get("coverSettled").and_then(Value::as_u64).ok_or_else(|| bad("coverSettled"))?;
+            self.settled_through = n32(v.get("settledThrough").and_then(Value::as_u64).ok_or_else(|| bad("settledThrough"))?, "settledThrough")?;
+        } else if let Some(spans) = v.get("spans") {
+            // AGP-065 state: what an audit covered counts as paid for and is settled; open and
+            // skipped credit (none of it forgiven any more) is unpaid, the settled skipped first
+            let settled = v.get("settledSkipped").and_then(Value::as_u64).ok_or_else(|| bad("settledSkipped"))?;
+            if settled > 0 {
+                self.credits.push((String::new(), settled));
+            }
+            for s in spans.as_array().ok_or_else(|| bad("spans"))? {
+                let invoice = s.get(0).and_then(Value::as_str).ok_or_else(|| bad("span"))?;
+                let credited = s.get(4).and_then(Value::as_u64).ok_or_else(|| bad("span"))?;
+                match s.get(5).and_then(Value::as_str) {
+                    Some("covered") => {}
+                    Some("open" | "skipped") if credited > 0 => self.credits.push((invoice.to_string(), credited)),
+                    Some("open" | "skipped") => {}
+                    _ => return Err(bad("span")),
+                }
+            }
         } else {
-            // AGP-043 state: per invoice, what no pass covered (`unaudited`) stays open over the
-            // best receipt's span, the rest of its credit counts as covered
-            let mut open: HashMap<String, u64> = HashMap::new();
+            // AGP-043 state: per invoice, what no pass covered (`unaudited`) is unpaid
             for u in v.get("unaudited").and_then(Value::as_array).into_iter().flatten() {
                 let inv = u.get(0).and_then(Value::as_str).ok_or_else(|| bad("unaudited"))?;
                 let w = u.get(2).and_then(Value::as_u64).ok_or_else(|| bad("unaudited"))?;
-                *open.entry(inv.to_string()).or_insert(0) += w;
-            }
-            for (inv, best) in &self.last {
-                let (lo, hi, cum) = (best.receipt.first_height, best.receipt.last_height, best.receipt.cum_work);
-                let credited = self.credited.get(inv).copied().unwrap_or(0).min(cum);
-                let unaudited = open.get(inv).copied().unwrap_or(0).min(credited);
-                let span = |work, credited, coverage| Span { invoice: inv.clone(), lo, hi, work, credited, coverage };
-                if credited > unaudited {
-                    self.spans.push(span(credited - unaudited, credited - unaudited, Coverage::Covered(0)));
-                }
-                if cum > credited - unaudited {
-                    self.spans.push(span(cum - (credited - unaudited), unaudited, Coverage::Open));
+                let w = w.min(self.credited.get(inv).copied().unwrap_or(0));
+                if w > 0 {
+                    self.credits.push((inv.to_string(), w));
                 }
             }
         }
@@ -504,10 +463,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_hold_unaudited_credit_until_an_audit_passes() {
+    fn caps_hold_unpaid_credit_until_a_coinbase_pays_for_it() {
         let k = PrimeKey::from_seed(70, &[1u8; 32]);
         let mut b = ReceiptBook::new(P, k.pubkey(), 70);
-        b.caps = CreditCaps { per_invoice: Some(20), total: Some(30), skipped: 0 };
+        b.caps = CreditCaps { per_invoice: Some(20), total: Some(30) };
         // invoice I: 12 fits, then 16 more of which only 8 fit under the per-invoice cap
         assert_eq!(b.accept(&k.sign(&r(3, 12, 101, 102)).unwrap(), I).unwrap(), 12);
         let s7 = k.sign(&r(7, 28, 101, 104)).unwrap();
@@ -521,15 +480,15 @@ mod tests {
         assert!(b.funded(J));
         // the audit intervals hold all the receipted work, credited or not
         assert_eq!(b.intervals, vec![(101, 102, 12), (102, 104, 16), (103, 104, 15)]);
-        // an audit at 104 covers only the credits whose shares are all below it
-        assert_eq!(b.audited(104, 100, true), 12);
-        assert_eq!(b.unaudited_work(None), 18);
-        // a later receipt of I: 12 more receipted; room for 12 under the invoice cap, 8 stay held
+        // the coinbase at 104 paid for 12 units: they cover the oldest credit, I's
+        assert_eq!(b.pay(104, 12), 12);
+        assert_eq!((b.unaudited_work(None), b.unaudited_work(Some(I)), b.unaudited_work(Some(J))), (18, 8, 10));
+        // a later receipt of I: 12 more receipted; room for 12 under both caps, 8 stay held
         assert_eq!(b.accept(&k.sign(&r(9, 40, 101, 106)).unwrap(), I).unwrap(), 12);
         assert_eq!(*b.intervals.last().unwrap(), (104, 106, 12));
         assert_eq!(b.held(I), 8);
-        // everything below 107 audited: held work flows again, as far as the caps allow
-        b.audited(107, 100, true);
+        // the coinbase at 107 pays for the rest: held work flows again, as far as the caps allow
+        assert_eq!(b.pay(107, 30), 30);
         assert_eq!(b.release_held(), vec![(I.to_string(), 8), (J.to_string(), 5)]);
         assert_eq!((b.held_total(), b.credited[I], b.credited[J]), (0, 40, 15));
         // frozen (the carry rules): no new credit at all
@@ -539,39 +498,130 @@ mod tests {
         // state round trip keeps held and unaudited work
         let mut c = ReceiptBook::new(P, k.pubkey(), 70);
         c.load(&b.to_json()).unwrap();
-        assert_eq!((c.spans.clone(), c.held(I), c.credited[I]), (b.spans.clone(), 4, 40));
+        assert_eq!((c.credits.clone(), c.cover.clone(), c.held(I), c.credited[I]), (b.credits.clone(), b.cover.clone(), 4, 40));
         assert_eq!(c.accept(&k.sign(&r(10, 44, 101, 107)).unwrap(), I).unwrap(), 4);
         assert_eq!(c.intervals, b.intervals);
     }
 
-    /// review P2: a pass releases only what its bound counted; the rest is skipped, forgiven up to the
-    /// allowance, and a reorg reopens what an orphaned audit resolved.
+    /// AGP-079: only what a coinbase paid for leaves the caps; a re-audit replaces a block's payment,
+    /// a reorg takes it back, more than was credited is room, and settling forgets no unpaid credit.
     #[test]
-    fn a_pass_covers_only_the_spans_its_bound_counts() {
+    fn payments_cover_the_oldest_credit_and_a_reorg_takes_them_back() {
         let k = PrimeKey::from_seed(70, &[1u8; 32]);
         let mut b = ReceiptBook::new(P, k.pubkey(), 70);
-        b.caps = CreditCaps { per_invoice: Some(100), total: Some(100), skipped: 10 };
+        b.caps = CreditCaps { per_invoice: Some(100), total: Some(100) };
         assert_eq!(b.accept(&k.sign(&r(1, 30, 101, 103)).unwrap(), I).unwrap(), 30);
         assert_eq!(b.accept(&k.sign(&r(2, 50, 101, 106)).unwrap(), I).unwrap(), 20);
-        // the window starts at 102: span (101, 103) is outside it, (103, 106) is not below 106
-        assert_eq!(b.audited(106, 102, true), 0);
-        assert_eq!(b.spans.iter().map(|s| s.coverage).collect::<Vec<_>>(), vec![Coverage::Skipped(106), Coverage::Open]);
-        // 30 skipped, 10 forgiven: 20 still count against the total, with the 20 open
-        assert_eq!((b.skipped_work(), b.unaudited_work(None), b.unaudited_work(Some(I))), (30, 40, 20));
-        assert_eq!(b.audited(107, 102, true), 20);
-        assert_eq!(b.unaudited_work(None), 20);
-        // the block at 107 is orphaned: its span is open again
-        assert_eq!(b.uncover(107), 20);
-        assert_eq!(b.unaudited_work(None), 40);
-        assert_eq!(b.audited(107, 102, true), 20);
-        // settled: forgotten, the skipped credit kept as a total; the best receipt stays
+        // a pass that paid nothing covers nothing
+        assert_eq!((b.pay(106, 0), b.unaudited_work(None)), (0, 50));
+        assert_eq!((b.pay(107, 20), b.unaudited_work(None)), (20, 30));
+        // the block at 107 is orphaned: its payment is gone
+        assert_eq!((b.uncover(107), b.unaudited_work(None)), (20, 50));
+        b.pay(107, 20);
+        // audited again with more paid: replaced, not added
+        assert_eq!((b.pay(107, 25), b.unaudited_work(None)), (5, 25));
+        // paid for more than was credited: the surplus is room beyond the caps
+        assert_eq!((b.pay(108, 40), b.unaudited_work(None), b.room(I)), (25, 0, 115));
+        // settling 107 forgets its payment and the 25 units of credit it covered, nothing unpaid
         b.settle(107, 103);
-        assert!(b.spans.is_empty());
-        assert_eq!((b.skipped_work(), b.unaudited_work(None), b.intervals.len()), (30, 20, 0));
+        assert_eq!((b.credits.clone(), b.cover.clone(), b.intervals.len()), (vec![(I.to_string(), 25)], vec![(108, 40)], 0));
+        b.uncover(108);
+        assert_eq!(b.unaudited_work(None), 25, "settled credit a reorg left unpaid is still counted");
+        b.pay(108, 40);
+        b.settle(108, 103);
+        assert_eq!((b.credits.len(), b.cover.len(), b.cover_settled, b.room(I)), (0, 0, 15, 115));
+        // a settled block audited again is not paid for twice
+        assert_eq!((b.pay(107, 25), b.pay(108, 40), b.cover.len(), b.room(I)), (0, 0, 0, 115));
         let mut c = ReceiptBook::new(P, k.pubkey(), 70);
         c.caps = b.caps;
         c.load(&b.to_json()).unwrap();
-        assert_eq!((c.skipped_work(), c.unaudited_work(None), c.best(I).map(|s| s.receipt.seq)), (30, 20, Some(2)));
+        assert_eq!((c.cover_settled, c.settled_through, c.unaudited_work(None), c.room(I), c.best(I).map(|s| s.receipt.seq)), (15, 108, 0, 115, Some(2)));
+    }
+
+    /// AGP-079, against a model over 1,200 random steps (receipts on three invoices, payments,
+    /// re-audits, reorgs, settling, a restart): unaudited credit is exactly the credit granted less
+    /// the work paid for, the invoices' shares add up to it, no grant takes it over a cap, and
+    /// settling or reloading changes none of it.
+    #[test]
+    fn unaudited_credit_is_credit_granted_less_work_paid_for() {
+        let k = PrimeKey::from_seed(70, &[1u8; 32]);
+        let invoices = [I, J, "vfer2e5e75t4tv7in42lakx6i6"];
+        let caps = CreditCaps { per_invoice: Some(400), total: Some(900) };
+        let mut b = ReceiptBook::new(P, k.pubkey(), 70);
+        b.caps = caps;
+        // xorshift64: a fixed seed, so a failure reproduces
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut seq, mut cum) = ([0u64; 3], [0u64; 3]);
+        let (mut granted, mut settled_paid, mut tip) = (0u128, 0u128, 100u32);
+        let mut paid: std::collections::BTreeMap<u32, u64> = Default::default();
+        for step in 0..1_200 {
+            let before = (b.unaudited_work(None), invoices.map(|i| b.unaudited_work(Some(i))));
+            match rnd(10) {
+                0..=4 => {
+                    let i = rnd(3) as usize;
+                    seq[i] += 1;
+                    cum[i] += 1 + rnd(120);
+                    let r = WorkReceipt { invoice: invoices[i].into(), ..r(seq[i], cum[i], 101, tip) };
+                    let g = b.accept(&k.sign(&r).unwrap(), invoices[i]).unwrap();
+                    granted += u128::from(g);
+                    if g > 0 {
+                        assert!(b.unaudited_work(None) <= caps.total.unwrap().max(before.0), "step {step}: a grant went over the total cap");
+                        assert!(b.unaudited_work(Some(invoices[i])) <= caps.per_invoice.unwrap().max(before.1[i]), "step {step}: over the invoice cap");
+                    }
+                }
+                5 | 6 => {
+                    // a new block, or one audited again (a settled one changes nothing)
+                    let h = if rnd(3) == 0 { tip.saturating_sub(rnd(30) as u32) } else { tip + 1 };
+                    tip = tip.max(h);
+                    let w = rnd(4) * rnd(150);
+                    let covered = b.pay(h, w);
+                    if h > b.settled_through {
+                        paid.remove(&h);
+                        if w > 0 {
+                            paid.insert(h, w);
+                        }
+                    }
+                    assert!(covered <= before.0, "step {step}");
+                    granted += b.release_held().iter().map(|(_, g)| u128::from(*g)).sum::<u128>();
+                }
+                7 => {
+                    let h = tip.saturating_sub(rnd(10) as u32);
+                    b.uncover(h);
+                    if h > b.settled_through {
+                        paid.remove(&h);
+                    }
+                }
+                8 => {
+                    let h = tip.saturating_sub(10 + rnd(20) as u32);
+                    let moved: Vec<u32> = paid.range(..=h).map(|(h, _)| *h).collect();
+                    for m in moved {
+                        settled_paid += u128::from(paid.remove(&m).unwrap());
+                    }
+                    // every receipt starts at 101: all but each invoice's best are forgotten
+                    b.settle(h, 101);
+                    assert_eq!((b.unaudited_work(None), invoices.map(|i| b.unaudited_work(Some(i)))), before, "step {step}: settling moved credit");
+                }
+                _ => {
+                    let mut c = ReceiptBook::new(P, k.pubkey(), 70);
+                    c.caps = caps;
+                    c.load(&b.to_json()).unwrap();
+                    assert_eq!((c.unaudited_work(None), invoices.map(|i| c.unaudited_work(Some(i))), invoices.map(|i| c.room(i))),
+                               (before.0, before.1, invoices.map(|i| b.room(i))), "step {step}: a restart moved credit");
+                    b = c;
+                }
+            }
+            let paid_for = settled_paid + paid.values().map(|w| u128::from(*w)).sum::<u128>();
+            assert_eq!(u128::from(b.unaudited_work(None)), granted.saturating_sub(paid_for), "step {step}");
+            assert_eq!(invoices.iter().map(|i| b.unaudited_work(Some(i))).sum::<u64>(), b.unaudited_work(None), "step {step}");
+            assert_eq!(b.credited.values().map(|c| u128::from(*c)).sum::<u128>(), granted, "step {step}");
+        }
+        assert!(granted > 5_000 && settled_paid > 0, "the walk granted {granted} and settled {settled_paid}");
     }
 
     #[test]
@@ -587,18 +637,27 @@ mod tests {
         assert_eq!(c.proof_receipts(100, 104).len(), 2);
         // AGP-043 state: credited 28 of which 8 unaudited
         let mut v = b.to_json();
-        v.as_object_mut().unwrap().remove("spans");
-        v["unaudited"] = serde_json::json!([[I, 104, 8]]);
+        for key in ["credits", "cover", "coverSettled"] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        let mut v43 = v.clone();
+        v43["unaudited"] = serde_json::json!([[I, 104, 8]]);
         let mut d = ReceiptBook::new(P, k.pubkey(), 70);
-        d.load(&v).unwrap();
+        d.load(&v43).unwrap();
         assert_eq!((d.unaudited_work(None), d.held(I)), (8, 0));
+        // AGP-065 state: covered spans are paid for; open and skipped credit is unpaid, none forgiven
+        v["spans"] = serde_json::json!([[I, 101, 102, 12, 12, "covered", 104], [I, 102, 104, 16, 16, "open", 0]]);
+        v["settledSkipped"] = 3.into();
+        let mut e = ReceiptBook::new(P, k.pubkey(), 70);
+        e.load(&v).unwrap();
+        assert_eq!((e.unaudited_work(None), e.unaudited_work(Some(I)), e.held(I)), (19, 16, 0));
     }
 
     #[test]
     fn no_caps_is_the_reference_behaviour() {
         let k = PrimeKey::from_seed(70, &[1u8; 32]);
         let (mut a, mut b) = (ReceiptBook::new(P, k.pubkey(), 70), ReceiptBook::new(P, k.pubkey(), 70));
-        b.caps = CreditCaps { per_invoice: Some(u64::MAX), total: None, skipped: 0 };
+        b.caps = CreditCaps { per_invoice: Some(u64::MAX), total: None };
         for (seq, cum, lo, hi) in [(1, 4, 101, 101), (1, 4, 101, 101), (4, 9, 101, 103), (2, 5, 101, 102), (6, 30, 101, 110)] {
             let s = k.sign(&r(seq, cum, lo, hi)).unwrap();
             assert_eq!(a.accept(&s, I).ok(), b.accept(&s, I).ok());

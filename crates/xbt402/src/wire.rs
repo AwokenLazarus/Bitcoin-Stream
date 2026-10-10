@@ -62,8 +62,8 @@ pub fn unb64json(s: &str) -> Result<Value> {
 }
 
 /// The v1 binding `sha256(method | target | body)` hex. Its fields run together and it binds no
-/// origin (review T2); xbt402 uses [`request_digest_v2`]. Only the xbt-work scheme still binds requests
-/// with it, because its published vectors (XBT-053) do.
+/// origin (review T2); xbt402 and, since AGP-074, the xbt-work scheme use [`request_digest_v2`]. Kept
+/// for the comparison in `examples/binding_bench.rs` and the collision test.
 pub fn request_digest_v1(method: &str, target: &str, body: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(method.as_bytes());
@@ -111,6 +111,17 @@ pub fn request_url(url: &str) -> RequestUrl {
     };
     let target = if tail.starts_with('/') { tail.to_string() } else { format!("/{tail}") };
     RequestUrl { scheme, host: host.to_ascii_lowercase(), port, target }
+}
+
+/// Refuse a URL or request target that holds a `#` (AGP-081, review T2). [`request_url`] drops a
+/// fragment, so a payment for `/a` would authenticate `/a#b` too, and a server routes on the target
+/// as it arrives. Payer and provider both call this before anything is signed, sent or served; the
+/// digest and its published vectors are unchanged.
+pub fn no_fragment(url: &str) -> Result<()> {
+    if url.contains('#') {
+        return fail("bad_request", "a URL with a # fragment is outside the request binding: not paid and not served");
+    }
+    Ok(())
 }
 
 /// `scheme://authority` of an absolute URL, or `""` for a bare target.
@@ -216,6 +227,28 @@ pub fn upstream_code(code: &str) -> String {
 pub fn safe_code(code: &str) -> bool {
     !code.is_empty() && code.len() <= 40 && code.bytes().all(|c| c == b'_' || c.is_ascii_lowercase())
         && code.bytes().any(|c| c.is_ascii_lowercase())
+}
+
+/// The URL a seller names for one of its own endpoints (`openUrl`, `chunkUrl`), held to `origin`
+/// (`scheme://host[:port]`, the allowlisted one). The seller chooses this string, so it is never
+/// just appended: `@evil.example/open` after the origin is another host. Accepted: a path that
+/// starts with exactly one `/`, or an absolute URL on `origin`; no backslash, whitespace or
+/// control character either way, and no `#` ([`no_fragment`]). Returns `origin` + path.
+pub fn seller_url(origin: &str, given: &str) -> Result<String> {
+    let refuse = |why: &str| Err(ChannelError::new("seller_url", format!("the seller's URL {why}; refused before any request")));
+    if given.chars().any(|c| c == '\\' || c == '#' || c.is_whitespace() || c.is_control()) {
+        return refuse("has a backslash, a #, a space or a control character");
+    }
+    let origin = origin.trim_end_matches('/');
+    let path = match given.strip_prefix(origin) {
+        Some(rest) if given.contains("://") => rest,
+        _ if given.contains("://") => return refuse("is on another origin"),
+        _ => given,
+    };
+    if !path.starts_with('/') || path.starts_with("//") {
+        return refuse("is not a path on its own origin");
+    }
+    Ok(format!("{origin}{path}"))
 }
 
 /// PAYMENT-RESPONSE as an x402 v2 SettlementResponse around a signed receipt.
@@ -435,6 +468,31 @@ pub struct CloseResponse {
 
 #[cfg(test)]
 mod tests {
+    /// AGP-080 X1: whatever a seller writes, the URL built from it starts with the origin and a
+    /// `/`, so its host is the origin's.
+    #[test]
+    fn x1_a_seller_url_is_held_to_its_origin() {
+        let o = "https://api.example:8443";
+        for good in ["/x402/xbt-channel/open", "/c/{i}?a=b", "https://api.example:8443/x402/open", "/"] {
+            let u = seller_url(o, good).unwrap();
+            assert!(u.starts_with("https://api.example:8443/"), "{good} -> {u}");
+        }
+        assert_eq!(seller_url("https://api.example:8443/", "/open").unwrap(), "https://api.example:8443/open");
+        for bad in ["@evil.example/open", "//evil.example/open", ".evil.example/open", ":9/open", "open", "", "https://evil.example/open",
+                    "https://api.example:8443@evil.example/open", "https://api.example:8443.evil.example/open", "https://api.example:84430/open",
+                    "http://api.example:8443/open", "/open\\@evil.example", "/a b", "/a\tb", "/a\nHost: evil", "\\\\evil.example/open",
+                    "javascript://api.example/open", "https://api.example:8443"] {
+            let r = seller_url(o, bad);
+            assert_eq!(r.as_ref().err().map(|e| e.code.as_str()), Some("seller_url"), "{bad:?} -> {r:?}");
+        }
+        // every prefix an attacker can put after the origin: the result never leaves it
+        for lead in ["@", ".", ":", "-", "%2f", "\\", "?", "#", "x"] {
+            if let Ok(u) = seller_url(o, &format!("{lead}evil.example/open")) {
+                assert!(u.starts_with("https://api.example:8443/"), "{lead}: {u}");
+            }
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

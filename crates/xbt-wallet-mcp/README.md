@@ -28,7 +28,7 @@ socket path.
 
 | tool | arguments | what it does |
 |---|---|---|
-| `ln_pay` | `invoice`, `max_sats`, `description=""` | pays an XBT Lightning (BOLT 11) invoice through the signer's LN node, under the same policy (`dest` is `ln:<payee node id>`). `max_sats` caps the amount plus the routing-fee limit. Refused: no feature bit 512, an LN node not verified on the XBT chain, expired or amountless invoices, no safe channel. Over the human threshold: `needs_human`; after the human's approval the same call pays |
+| `ln_pay` | `invoice`, `max_sats`, `description=""`, `amount_sats=0` | pays an XBT Lightning invoice (BOLT 11) or, AGP-082, an offer (BOLT 12, `lno1...`) through the signer's LN node, under the same policy (`dest` is `ln:<payee node id>`, or `ln-offer:<offer id>` for an offer). `max_sats` caps the amount plus the routing-fee limit; `amount_sats` is the amount to pay an offer that names none. Refused: no feature bit 512, an offer for another chain, an LN node not verified on the XBT chain, expired or amountless invoices, no safe channel (for an offer: any unsafe channel on the node). Over the human threshold: `needs_human`; after the human's approval the same call pays |
 | `ln_status` | | the LN node's chain check, its channels with the guard verdicts, coins below the split, exposure, recent payments |
 
 Without `XBT_MCP_LN` the list is B2's exact ten (the Python conformance check depends on it). The

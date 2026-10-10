@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use xbt_primitives::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use xbt_signer::bolt11::encode::{invoice, Spec};
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
-use xbt_signer::ln::{LnBackend, SendRequest};
+use xbt_signer::bolt12;
+use xbt_signer::ln::{LnBackend, OfferPayRequest, SendRequest};
 use xbt_signer::node::Node;
 use xbt_signer::signer::{Signer, SignerOptions};
 
@@ -141,6 +142,10 @@ impl Node for LnNode {
                 if let Some(h) = p[0].as_u64().and_then(|h| self.reorged.lock().unwrap().get(&h).cloned()) {
                     return Ok(json!(h));
                 }
+                // AGP-082: block 0 is the real one (an offer names its chain by it)
+                if p[0].as_u64() == Some(0) {
+                    return Ok(json!(genesis_display(&self.name)));
+                }
             }
             "getblockheader" => {
                 if let Some((h, _)) = self.alt_blocks.lock().unwrap().get(p[0].as_str().unwrap_or("")) {
@@ -204,6 +209,29 @@ struct LnState {
     /// AGP-049: the wtclient's towers (`None`: no wtclient), the macaroon presented.
     towers: Option<Vec<Value>>,
     macaroon: Option<Vec<u8>>,
+    /// AGP-082: what a settled payment's record says: zero amounts, a preimage that is not the hash's.
+    zero_amounts: bool,
+    wrong_preimage: bool,
+    /// AGP-082, BOLT 12: every FetchInvoice (the offer, the amount asked) and every PayOffer; what the
+    /// issuer's invoice gets wrong; what the node's summary of it says instead; the time invoices are dated.
+    fetches: Vec<(String, u64)>,
+    offer_paid: Vec<OfferPayRequest>,
+    tweak: Tweak,
+    info_lie: Option<(&'static str, Value)>,
+    now: u64,
+}
+
+/// What a fetched invoice gets wrong.
+#[derive(Clone, PartialEq)]
+enum Tweak {
+    None,
+    No512,
+    OtherChain,
+    /// Signed (validly) by this key, which is also its `invoice_node_id`.
+    Signer(u8),
+    AmountBump,
+    OtherOffer,
+    Garbage,
 }
 
 struct FakeLn {
@@ -217,7 +245,8 @@ impl FakeLn {
             network: "regtest".into(), feature_512: true, synced: true, wrong_chain: false,
             channels: vec![chan(&scid(6_100, 1), "ANCHORS", true), chan(&scid(6_101, 1), "SIMPLE_TAPROOT", false)],
             mode: Mode::Succeed, fee_msat: 1_500, sent: vec![], payments: vec![], preimages: vec![], decode_amount_bump: 0, utxos: vec![],
-            towers: None, macaroon: None }) })
+            towers: None, macaroon: None, zero_amounts: false, wrong_preimage: false,
+            fetches: vec![], offer_paid: vec![], tweak: Tweak::None, info_lie: None, now: T0 }) })
     }
 
     fn sent(&self) -> usize {
@@ -278,15 +307,16 @@ impl LnBackend for FakeLn {
         }
         s.sent.push(r.clone());
         let hash = d.payment_hash_hex();
-        let pre = s.preimages.iter().find(|(h, _)| *h == hash).map(|(_, p)| p.clone()).unwrap_or_default();
+        let pre = if s.wrong_preimage { vec![0xee; 32] } else { s.preimages.iter().find(|(h, _)| *h == hash).map(|(_, p)| p.clone()).unwrap_or_default() };
+        let value_msat = if s.zero_amounts { 0 } else { d.amount_msat.unwrap_or(0) };
         let status = match s.mode {
             Mode::Succeed => "SUCCEEDED",
             Mode::Fail => "FAILED",
             _ => "IN_FLIGHT",
         };
         let htlcs = if status == "IN_FLIGHT" { json!([{"status": "IN_FLIGHT", "route": {"total_time_lock": self.chain.height() + 40}}]) } else { json!([]) };
-        let p = json!({"payment_hash": hash, "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(), "htlcs": htlcs,
-                       "fee_msat": if status == "SUCCEEDED" { s.fee_msat.to_string() } else { "0".into() },
+        let p = json!({"payment_hash": hash, "status": status, "value_msat": value_msat.to_string(), "htlcs": htlcs,
+                       "fee_msat": if status == "SUCCEEDED" && !s.zero_amounts { s.fee_msat.to_string() } else { "0".into() },
                        "payment_preimage": if status == "SUCCEEDED" { hex::encode(&pre) } else { "00".repeat(32) },
                        "failure_reason": if status == "FAILED" { "FAILURE_REASON_NO_ROUTE" } else { "FAILURE_REASON_NONE" }});
         s.payments.push(p.clone());
@@ -299,6 +329,79 @@ impl LnBackend for FakeLn {
 
     fn utxos(&self) -> xbt402::Result<Vec<Value>> {
         Ok(self.st.lock().unwrap().utxos.clone())
+    }
+
+    /// As Lightning Fork's FetchInvoice: a fresh payer key and a fresh invoice for every request, signed
+    /// by the offer's issuer, and the node's own summary of it (bytes as base64).
+    fn fetch_invoice(&self, offer: &str, amount_msat: u64, _timeout_s: i64) -> xbt402::Result<Value> {
+        let o = bolt12::decode_offer(offer).map_err(|e| err(&e))?;
+        let mut s = self.st.lock().unwrap();
+        s.fetches.push((offer.to_string(), amount_msat));
+        let n = s.fetches.len() as u8;
+        if s.tweak == Tweak::Garbage {
+            return Ok(json!({"bolt12": "lni1qqqq", "invoice": {}, "offer_id": b64(&o.id)}));
+        }
+        let (pre, payer) = (vec![0xa0 + n; 32], SecretKey::from_slice(&[0x80 + n; 32]).unwrap());
+        let hash: [u8; 32] = Sha256::digest(&pre).into();
+        s.preimages.push((hex::encode(hash), pre));
+        let signer = match s.tweak {
+            Tweak::Signer(k) => SecretKey::from_slice(&[k; 32]).unwrap(),
+            _ => issuer_key(),
+        };
+        let other = bolt12::decode_offer(&xbt_offer(&chain_name(&self.chain), Some(1), &[512], "tea")).unwrap();
+        let amount = o.amount.unwrap_or(amount_msat) + if s.tweak == Tweak::AmountBump { 1 } else { 0 };
+        let chain = match (s.tweak == Tweak::OtherChain, chain_name(&self.chain).as_str()) {
+            (true, _) => Some([7u8; 32]),
+            // a payer leaves invreq_chain out for the chain whose genesis is Bitcoin's
+            (_, "main") => None,
+            (_, name) => Some(genesis_wire(name)),
+        };
+        let spec = bolt12::encode::InvoiceSpec {
+            offer_tlv: if s.tweak == Tweak::OtherOffer { &other.tlv } else { &o.tlv }, chain, payer_key: &payer, created_at: s.now - 5,
+            relative_expiry: Some(3600), payment_hash: hash, amount_msat: amount, features: if s.tweak == Tweak::No512 { &[17] } else { &[17, 512] },
+            key: &signer, node_id: None, cltv_expiry_delta: 40, extra: vec![] };
+        let lni = bolt12::encode::invoice(&spec);
+        let d = bolt12::decode_invoice(&lni).map_err(|e| err(&e))?;
+        let mut info = json!({"payment_hash": b64(&d.payment_hash), "amount_msat": d.amount_msat.to_string(), "node_id": b64(&d.node_id),
+                              "created_at": d.created_at.to_string(), "relative_expiry": d.relative_expiry, "num_paths": 1,
+                              "payer_id": b64(&d.payer_id), "signature_valid": true});
+        let mut offer_id = json!(b64(&d.offer_id));
+        match s.info_lie.clone() {
+            Some(("offer_id", v)) => offer_id = v,
+            Some((k, v)) => info[k] = v,
+            None => {}
+        }
+        Ok(json!({"bolt12": lni, "invoice": info, "offer_id": offer_id}))
+    }
+
+    /// As Lightning Fork's PayOffer with `invoice`: the settled payment, or an error that names the hash.
+    fn pay_offer(&self, r: &OfferPayRequest) -> xbt402::Result<Value> {
+        let d = bolt12::decode_invoice(&r.invoice).map_err(|e| err(&e))?;
+        let mut s = self.st.lock().unwrap();
+        if s.mode == Mode::NotSent {
+            return Err(err("connection reset"));
+        }
+        s.offer_paid.push(r.clone());
+        let hash = d.payment_hash_hex();
+        let pre = s.preimages.iter().find(|(h, _)| *h == hash).map(|(_, p)| p.clone()).unwrap_or_default();
+        match s.mode {
+            Mode::Succeed => {
+                let p = json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": d.amount_msat.to_string(), "htlcs": [],
+                               "fee_msat": s.fee_msat.to_string(), "payment_preimage": hex::encode(&pre)});
+                s.payments.push(p.clone());
+                Ok(p)
+            }
+            Mode::Fail => {
+                s.payments.push(json!({"payment_hash": hash, "status": "FAILED", "value_msat": d.amount_msat.to_string(), "htlcs": [], "fee_msat": "0",
+                                       "failure_reason": "FAILURE_REASON_NO_ROUTE"}));
+                Err(err(&format!("LN node HTTP 409: payment failed: no route; payment hash {hash}; retry with this invoice, not the offer: {}", r.invoice)))
+            }
+            _ => {
+                s.payments.push(json!({"payment_hash": hash, "status": "IN_FLIGHT", "value_msat": d.amount_msat.to_string(), "fee_msat": "0",
+                                       "htlcs": [{"status": "IN_FLIGHT", "route": {"total_time_lock": self.chain.height() + 40}}]}));
+                Err(err("LN node HTTP 504: context deadline exceeded"))
+            }
+        }
     }
 
     fn towers(&self) -> xbt402::Result<Vec<Value>> {
@@ -1403,4 +1506,585 @@ fn l5_a_0x21_push_the_script_never_checks_proves_nothing() {
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["verdict"], "allow", "{r}");
     assert_eq!(rig.ln.st.lock().unwrap().sent[0].outgoing_chan_ids, vec![scid(6_402, 1), scid(6_403, 1)]);
+}
+
+// --- AGP-082: the audit's two Lightning rail fixes (AGP-077, List 1 item 11) ---------------------------
+
+/// A loopback HTTP server that answers every request with `status` and these extra header lines, and
+/// records each request's head.
+fn http_stub(status: &'static str, extra: String, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let heads = Arc::new(Mutex::new(vec![]));
+    let seen = heads.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { break };
+            let mut head = vec![];
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+                head.push(b[0]);
+            }
+            let mut head = String::from_utf8_lossy(&head).to_string();
+            let len = head.to_lowercase().split("content-length: ").nth(1).and_then(|l| l.split("\r\n").next().and_then(|n| n.trim().parse().ok())).unwrap_or(0);
+            let mut body_in = vec![0u8; len];
+            let _ = s.read_exact(&mut body_in);
+            head.push_str(&String::from_utf8_lossy(&body_in));
+            seen.lock().unwrap().push(head);
+            let _ = s.write_all(format!("HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()).as_bytes());
+        }
+    });
+    (url, heads)
+}
+
+#[test]
+fn agp082_the_rest_client_follows_no_redirect_so_the_macaroon_goes_to_no_other_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let mac = macaroon_file(dir.path());
+    // the other host: whatever reaches it is recorded
+    let (other, got) = http_stub("200 OK", String::new(), "{\"identity_pubkey\": \"02aa\", \"payments\": []}");
+    for status in ["301 Moved Permanently", "302 Found", "303 See Other", "307 Temporary Redirect", "308 Permanent Redirect"] {
+        let (node, asked) = http_stub(status, format!("Location: {other}/v1/getinfo\r\n"), "{}");
+        let ln = LndRest::new(&node, &mac, None).unwrap();
+        let e = ln.get_info().expect_err(status);
+        assert!(e.msg.contains("redirect"), "{status}: {}", e.msg);
+        // a redirect is never "the node has no such payment" (that would release a booking)
+        assert!(ln.lookup(&"ab".repeat(32)).is_err(), "{status}");
+        assert!(ln.channels().is_err(), "{status}");
+        let req = SendRequest { invoice: "lnbcrt1".into(), fee_limit_sats: 1, timeout_s: 1, cltv_limit: 10, outgoing_chan_ids: vec!["1".into()] };
+        assert!(ln.send(&req).is_err(), "{status}");
+        assert_eq!(asked.lock().unwrap().len(), 4, "{status}: each call reached the node once");
+    }
+    let got = got.lock().unwrap();
+    assert!(got.is_empty(), "the redirect was followed, and the macaroon header went with it: {got:?}");
+}
+
+#[test]
+fn agp082_a_settled_payment_is_booked_at_no_less_than_the_invoice_amount() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // the node's record of a settled payment says it cost nothing
+    rig.ln.set(|s| s.zero_amounts = true);
+    let (inv, hash) = rig.invoice(400, 1, XBT);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(r["status"], "SUCCEEDED");
+    assert_eq!(r["charged_sats"], 400, "the invoice was paid: at least its amount is spent, whatever the node reports: {r}");
+    assert_eq!(rig.ledger_net(), 400, "403 booked, 3 of fee limit released, never the invoice amount");
+    assert_eq!(rig.s.ln_book.get(&hash).unwrap()["spent_sats"], 400);
+    // a node that reports more than the invoice is believed (it can only cost the budget more)
+    rig.ln.set(|s| {
+        s.zero_amounts = false;
+        s.fee_msat = 2_500;
+    });
+    let (inv, _) = rig.invoice(300, 2, XBT);
+    assert_eq!(rig.pay(&inv, 400)["charged_sats"], 303);
+    assert_eq!(rig.ledger_net(), 703);
+}
+
+#[test]
+fn agp082_a_settled_payment_without_the_preimage_of_its_hash_keeps_its_whole_booking_and_halts_the_rail() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // SUCCEEDED, with amounts, but the preimage is not the payment hash's: nothing proves it settled
+    rig.ln.set(|s| s.wrong_preimage = true);
+    let (inv, hash) = rig.invoice(400, 1, XBT);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["rule"], "ln_preimage", "{r}");
+    assert_eq!(r["charged_sats"], 403, "the whole booking stays: {r}");
+    assert_eq!(rig.ledger_net(), 403);
+    assert!(r.get("preimage").is_none(), "an unproven preimage is not handed on: {r}");
+    let rec = rig.s.ln_book.get(&hash).unwrap();
+    assert_eq!((&rec["state"], &rec["preimage_ok"], &rec["spent_sats"]), (&json!("settled"), &json!(false), &json!(403)), "{rec}");
+    // no proof of payment in the signature log
+    let sigs = rig.call("signatures", json!({"limit": 100}));
+    assert!(sigs["signatures"].as_array().unwrap().iter().all(|s| s["kind"] != "ln_payment"), "{sigs}");
+    assert_eq!(rig.audit("ln_preimage_mismatch").len(), 1);
+    // the rail is halted until the human resumes it
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], false, "{st}");
+    assert!(st["halted"]["reason"].as_str().unwrap().contains("preimage"), "{st}");
+    rig.ln.set(|s| s.wrong_preimage = false);
+    let (inv2, _) = rig.invoice(100, 2, XBT);
+    assert_eq!(rig.pay(&inv2, 200)["rule"], "ln_halted");
+    assert_eq!(rig.ln.sent(), 1);
+    // an empty preimage is no proof either
+    let rig = LnRig::new(json!({}));
+    let (inv, hash, _) = make_invoice(T0, "lnbcrt4u", 9, XBT, Some("coffee"), 3600);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["rule"], "ln_preimage", "the fake node knows no preimage for {hash}: {r}");
+    assert_eq!(rig.ledger_net(), 403);
+}
+
+// --- AGP-082: rail=ln pays BOLT 12 offers --------------------------------------------------------------
+
+fn b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+/// Block 0 of the chain, as a node displays it: Bitcoin's on mainnet (XBT shares it), regtest's.
+fn genesis_display(chain: &str) -> &'static str {
+    if chain == "main" { "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" } else {
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206" }
+}
+
+/// The same, as BOLT 12 carries a chain hash.
+fn genesis_wire(chain: &str) -> [u8; 32] {
+    let mut b = hex::decode(genesis_display(chain)).unwrap();
+    b.reverse();
+    b.try_into().unwrap()
+}
+
+fn issuer_key() -> SecretKey {
+    SecretKey::from_slice(&[0x44; 32]).unwrap()
+}
+
+/// An offer from the issuer: for `chain` (named, except on mainnet where an offer names no chain),
+/// `sats` or the payer's choice, these feature bits.
+fn xbt_offer(chain: &str, sats: Option<u64>, features: &[usize], description: &str) -> String {
+    let mut f = vec![(10u64, description.as_bytes().to_vec()), (22, bolt12::encode::pubkey(&issuer_key()).to_vec())];
+    if chain != "main" {
+        f.push((2, genesis_wire(chain).to_vec()));
+    }
+    if let Some(a) = sats {
+        f.push((8, bolt12::encode::tu(a * 1000)));
+    }
+    if !features.is_empty() {
+        f.push((12, bolt12::encode::features(features)));
+    }
+    bolt12::encode::offer(f)
+}
+
+fn offer_dest(offer: &str) -> String {
+    xbt_signer::ln_offer::offer_dest(&bolt12::decode_offer(offer).unwrap())
+}
+
+/// A rig whose allowlist holds these offers, and whose node has only the proven unified channel (the
+/// node chooses the channels of a BOLT 12 payment, so every one of them has to pass).
+fn offer_rig(offers: &[&str], extra: Value) -> LnRig {
+    let mut pol = json!({"allowlist": [PROVIDER, dest()]});
+    for o in offers {
+        pol["allowlist"].as_array_mut().unwrap().push(offer_dest(o).into());
+    }
+    for (k, v) in extra.as_object().unwrap() {
+        pol[k] = v.clone();
+    }
+    let rig = LnRig::new(pol);
+    rig.ln.set(|s| s.channels.truncate(1));
+    rig
+}
+
+fn ledger_of(root: &std::path::Path, dest: &str) -> i64 {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(root.join(".run/ledger.json")).unwrap()).unwrap();
+    let text = std::fs::read_to_string(root.join(".run").join(v["payments_log"].as_str().unwrap())).unwrap();
+    let mut rows: Vec<Value> = vec![];
+    for line in text.lines().skip(1) {
+        let r: Value = serde_json::from_str(line).unwrap();
+        match r.get("amend") {
+            None => rows.push(r),
+            Some(txid) => {
+                let i = rows.iter().rposition(|p| &p["txid"] == txid).unwrap();
+                if r["amount_sats"].is_null() {
+                    rows.remove(i);
+                } else {
+                    rows[i]["amount_sats"] = r["amount_sats"].clone();
+                }
+            }
+        }
+    }
+    rows.iter().filter(|p| p["dest"] == dest).map(|p| p["amount_sats"].as_i64().unwrap()).sum()
+}
+
+impl LnRig {
+    fn fetches(&self) -> usize {
+        self.ln.st.lock().unwrap().fetches.len()
+    }
+
+    fn offers_paid(&self) -> Vec<OfferPayRequest> {
+        self.ln.st.lock().unwrap().offer_paid.clone()
+    }
+}
+
+/// Pass lines 3 (against the fake node) and 4: the offer is paid from the invoice the node fetched, under
+/// the policy destination `ln-offer:<offer id>`, and the preimage is booked.
+#[test]
+fn agp082_pays_an_offer_under_the_policy_as_ln_offer_id() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let open = xbt_offer("regtest", None, &[512], "tips");
+    let rig = offer_rig(&[&offer, &open], json!({}));
+    let o = bolt12::decode_offer(&offer).unwrap();
+    let d = format!("ln-offer:{}", hex::encode(Sha256::digest(&o.tlv)));
+    assert_eq!(offer_dest(&offer), d, "the offer id is the SHA-256 of the offer's fields");
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!((&r["status"], &r["rail"], &r["dest"]), (&json!("SUCCEEDED"), &json!("ln"), &json!(d)), "{r}");
+    assert_eq!(r["offer_id"], o.id_hex());
+    assert_eq!(r["fee_limit_sats"], 3, "2 base + 1000 ppm of 300, rounded up");
+    assert_eq!(r["charged_sats"], 302, "300 + 1.5 sat fee, rounded up");
+    assert_eq!(r["invoice_reused"], false);
+    // one FetchInvoice (an offer with an amount is asked for it by leaving the amount out), then the
+    // invoice it returned is what PayOffer is given: never the offer, and never the BOLT 11 router call
+    assert_eq!(rig.ln.st.lock().unwrap().fetches, vec![(offer.clone(), 0)]);
+    let paid = rig.offers_paid();
+    assert_eq!(paid.len(), 1);
+    assert!(paid[0].invoice.starts_with("lni1"), "{}", paid[0].invoice);
+    assert_eq!((paid[0].fee_limit_msat, paid[0].timeout_s), (3_000, 60));
+    assert_eq!(rig.ln.sent(), 0);
+    let hash = r["payment_hash"].as_str().unwrap().to_string();
+    assert_eq!(bolt12::decode_invoice(&paid[0].invoice).unwrap().payment_hash_hex(), hash);
+    // booked to the offer, at what it cost; the preimage is booked and proves the payment
+    assert_eq!(ledger_of(&rig.root, &d), 302);
+    let rec = rig.s.ln_book.get(&hash).unwrap();
+    assert_eq!((&rec["state"], &rec["dest"], &rec["offer_id"]), (&json!("settled"), &json!(d), &json!(o.id_hex())), "{rec}");
+    let pre = hex::decode(rec["preimage"].as_str().unwrap()).unwrap();
+    assert_eq!(hex::encode(Sha256::digest(&pre)), hash);
+    assert_eq!(r["preimage"], rec["preimage"]);
+    let sigs: Vec<Value> = rig.call("signatures", json!({"limit": 100}))["signatures"].as_array().unwrap().iter()
+        .filter(|s| s["kind"] == "ln_payment").cloned().collect();
+    assert_eq!(sigs.len(), 1);
+    assert_eq!((&sigs[0]["sig_sha256"], &sigs[0]["dest"], &sigs[0]["rule"]), (&json!(hash), &json!(d), &json!("policy:ok")), "{}", sigs[0]);
+    // ln_status keeps its shape; the payment is among the recent ones without its strings
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], true, "{st}");
+    assert_eq!((&st["recent"][0]["state"], &st["recent"][0]["offer_id"]), (&json!("settled"), &json!(o.id_hex())));
+    assert!(st["recent"][0].get("invoice").is_none() && st["recent"][0].get("offer").is_none());
+    // an offer that names no amount: the payer's, inside max_sats
+    let r = rig.call("ln_pay", json!({"invoice": open, "max_sats": 400}));
+    assert_eq!(r["rule"], "ln_amount", "{r}");
+    let r = rig.call("ln_pay", json!({"invoice": open, "max_sats": 150, "amount_sats": 200}));
+    assert_eq!(r["rule"], "max_sats", "{r}");
+    assert_eq!(rig.call("ln_pay", json!({"invoice": open, "max_sats": 400, "amount_sats": -1}))["rule"], "amount");
+    let r = rig.call("ln_pay", json!({"invoice": open, "max_sats": 400, "amount_sats": 200}));
+    assert_eq!((&r["verdict"], &r["charged_sats"]), (&json!("allow"), &json!(202)), "{r}");
+    assert_eq!(rig.ln.st.lock().unwrap().fetches[1], (open.clone(), 200_000));
+    // an amount beside an offer that fixes one, a description that is not the offer's
+    assert_eq!(rig.call("ln_pay", json!({"invoice": offer, "max_sats": 400, "amount_sats": 250}))["rule"], "ln_amount");
+    assert_eq!(rig.call("ln_pay", json!({"invoice": offer, "max_sats": 400, "description": "tea"}))["rule"], "ln_description");
+    // above max_sats: 300 + 3
+    assert_eq!(rig.pay(&offer, 302)["rule"], "max_sats");
+    assert_eq!(rig.fetches(), 2, "none of the refusals asked for an invoice");
+    // an offer that is not on the allowlist: denied by the policy before any invoice is asked for
+    let other = xbt_offer("regtest", Some(300), &[512], "something else");
+    let r = rig.pay(&other, 400);
+    assert_eq!((&r["verdict"], &r["rule"]), (&json!("deny"), &json!("allowlist")), "{r}");
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (2, 2));
+    // with a description given, and uppercase as a QR code carries it
+    let r = rig.call("ln_pay", json!({"invoice": offer.to_uppercase(), "max_sats": 400, "description": "coffee"}));
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(ledger_of(&rig.root, &d), 604);
+}
+
+/// Pass line 1: what the local decode refuses never reaches a pay RPC.
+#[test]
+fn agp082_what_the_local_decode_refuses_never_reaches_a_pay_rpc() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({}));
+    // the offer: no bit 512, only the odd bit, another chain, no chain (off mainnet: Bitcoin's), malformed
+    for (o, rule) in [(xbt_offer("regtest", Some(300), &[], "coffee"), "ln_feature_512"), (xbt_offer("regtest", Some(300), &[513], "coffee"), "ln_feature_512"),
+                      (bolt12::encode::offer(vec![(2, vec![7; 32]), (10, b"coffee".to_vec()), (12, bolt12::encode::features(&[512])),
+                                                  (22, bolt12::encode::pubkey(&issuer_key()).to_vec())]), "ln_network"),
+                      (xbt_offer("main", Some(300), &[512], "coffee"), "ln_network"), ("lno1qqqq".to_string(), "ln_offer")] {
+        let r = rig.pay(&o, 400);
+        assert_eq!(r["rule"], rule, "{r}");
+        assert_eq!(r["charged_sats"], 0);
+    }
+    assert_eq!(rig.fetches(), 0, "an offer refused by its own fields asks the issuer for nothing");
+    // a BOLT 12 invoice or request handed in by the caller: the wallet fetches its own
+    assert_eq!(rig.pay("lni1qqqq", 400)["rule"], "ln_invoice");
+    assert_eq!(rig.pay("lnr1qqqq", 400)["rule"], "ln_invoice");
+    // the fetched invoice: no bit 512, another chain, signed by a key the offer does not name, another
+    // amount than was asked, an invoice for another offer, not an invoice
+    for (tweak, rule) in [(Tweak::No512, "ln_feature_512"), (Tweak::OtherChain, "ln_network"), (Tweak::Signer(0x66), "ln_offer_mismatch"),
+                          (Tweak::AmountBump, "ln_amount"), (Tweak::OtherOffer, "ln_offer_mismatch"), (Tweak::Garbage, "ln_invoice")] {
+        rig.ln.set(|s| s.tweak = tweak);
+        let r = rig.pay(&offer, 400);
+        assert_eq!(r["rule"], rule, "{r}");
+    }
+    rig.ln.set(|s| s.tweak = Tweak::None);
+    // the node's summary of the invoice disagrees with the invoice
+    for (k, v) in [("amount_msat", json!("299000")), ("payment_hash", json!(b64(&[5; 32]))), ("node_id", json!(b64(&[2; 33]))),
+                   ("payer_id", json!(b64(&[3; 33]))), ("created_at", json!("1")), ("relative_expiry", json!(60)),
+                   ("signature_valid", json!(false)), ("offer_id", json!(b64(&[9; 32])))] {
+        rig.ln.set(|s| s.info_lie = Some((k, v)));
+        let r = rig.pay(&offer, 400);
+        assert_eq!(r["rule"], "ln_decode_mismatch", "{k}: {r}");
+        assert!(r["reason"].as_str().unwrap().contains(k), "{r}");
+    }
+    rig.ln.set(|s| s.info_lie = None);
+    assert_eq!(rig.fetches(), 14);
+    assert_eq!((rig.offers_paid().len(), rig.ln.sent()), (0, 0), "no pay RPC");
+    assert_eq!(ledger_of(&rig.root, &offer_dest(&offer)), 0);
+    assert!(rig.s.ln_book.all().is_empty(), "nothing was booked");
+    assert_eq!(rig.audit("ln_refused").len(), 21);
+    // and the same offer, with an honest issuer and node, pays
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+}
+
+/// Pass line 1, last clause: the key that signed an offer's first invoice signs them all.
+#[test]
+fn agp082_a_later_invoice_signed_by_another_key_is_refused() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // an offer with no issuer id and two paths: BOLT 12 lets the last blinded node of either sign
+    let pk = |b: u8| bolt12::encode::pubkey(&SecretKey::from_slice(&[b; 32]).unwrap());
+    let offer = bolt12::encode::offer(vec![(2, genesis_wire("regtest").to_vec()), (8, bolt12::encode::tu(300_000)), (10, b"coffee".to_vec()),
+                                           (12, bolt12::encode::features(&[512])),
+                                           (16, [bolt12::encode::path(&pk(0x70), &pk(0x71), 2), bolt12::encode::path(&pk(0x70), &pk(0x72), 2)].concat())]);
+    let mut rig = offer_rig(&[&offer], json!({}));
+    rig.ln.set(|s| s.tweak = Tweak::Signer(0x71));
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    let id = bolt12::decode_offer(&offer).unwrap().id_hex();
+    let store = || -> Value { serde_json::from_str(&std::fs::read_to_string(rig.root.join(".run/ln_offers.json")).unwrap()).unwrap() };
+    assert_eq!(store()["offers"][&id]["node_id"], hex::encode(pk(0x71)));
+    // the second invoice is validly signed by the other path's node: refused, across a restart too
+    rig.ln.set(|s| s.tweak = Tweak::Signer(0x72));
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_offer_signer", "{r}");
+    assert!(r["reason"].as_str().unwrap().contains(&hex::encode(pk(0x71))), "{r}");
+    rig.restart();
+    assert_eq!(rig.pay(&offer, 400)["rule"], "ln_offer_signer");
+    assert_eq!(rig.offers_paid().len(), 1);
+    assert_eq!(ledger_of(&rig.root, &offer_dest(&offer)), 302);
+    // the first key again: paid
+    rig.ln.set(|s| s.tweak = Tweak::Signer(0x71));
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+    // a record that cannot be read is a refusal, not "no signer known"
+    std::fs::write(rig.root.join(".run/ln_offers.json"), "{").unwrap();
+    rig.ln.set(|s| s.tweak = Tweak::Signer(0x72));
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_offer_store", "{r}");
+    assert_eq!(rig.offers_paid().len(), 2);
+}
+
+/// Pass lines 2 and 4, through the signer on mainnet: an offer that names no chain is this chain's
+/// there, bit 512 decides, and the macaroon is the rail's four permissions.
+#[test]
+fn agp082_a_chainless_offer_on_mainnet_pays_with_bit_512_under_the_four_permission_macaroon() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("main", Some(300), &[512], "coffee");
+    let sha = xbt_offer("main", Some(300), &[], "coffee");
+    assert_eq!(bolt12::decode_offer(&offer).unwrap().chains, None);
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"allowlist": [PROVIDER, offer_dest(&offer), offer_dest(&sha)],
+                                                         "ln": {"exposure_cap_sats": 500_000}}));
+    rig.ln.set(|s| {
+        s.channels.truncate(1);
+        s.towers = Some(vec![]);
+        s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[]));
+    });
+    // without bit 512 it is SHA-256 Bitcoin's offer: the chain hash cannot tell them apart
+    let r = rig.pay(&sha, 400);
+    assert_eq!(r["rule"], "ln_feature_512", "{r}");
+    assert_eq!(rig.fetches(), 0);
+    // decoding on the node would need invoices:read, and a macaroon that has it is still refused
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(&[RAIL_OPS, &[("invoices", &["read"])]].concat(), &[])));
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_macaroon", "{r}");
+    assert!(r["reason"].as_str().unwrap().contains("invoices:read"), "{r}");
+    assert_eq!(rig.fetches(), 0);
+    // info:read, offchain:read, offchain:write, onchain:read fetch and pay it
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(r["chain_check"]["anchor_pinned"], true);
+    assert_eq!(rig.call("ln_status", json!({}))["macaroon"]["only_needed"], true);
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (1, 1));
+}
+
+/// Pass line 3, second half: a failed pay is retried from the stored `lni1`, so no second invoice exists.
+#[test]
+fn agp082_a_failed_pay_is_retried_from_the_stored_invoice() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let mut rig = offer_rig(&[&offer], json!({}));
+    let d = offer_dest(&offer);
+    // the node fails the payment (no route): nothing is spent
+    rig.ln.set(|s| s.mode = Mode::Fail);
+    let r = rig.pay(&offer, 400);
+    assert_eq!((&r["rule"], &r["charged_sats"]), (&json!("ln_payment_failed"), &json!(0)), "{r}");
+    assert_eq!((rig.fetches(), rig.offers_paid().len(), ledger_of(&rig.root, &d)), (1, 1, 0));
+    // the connection drops before the node records anything
+    rig.ln.set(|s| s.mode = Mode::NotSent);
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_payment_failed", "{r}");
+    assert_eq!(rig.fetches(), 1, "the retry asked the issuer for nothing");
+    // the signer restarts; the retry settles: the same invoice, still one FetchInvoice
+    rig.restart();
+    rig.ln.set(|s| s.mode = Mode::Succeed);
+    let r = rig.pay(&offer, 400);
+    assert_eq!((&r["verdict"], &r["invoice_reused"]), (&json!("allow"), &json!(true)), "{r}");
+    let paid = rig.offers_paid();
+    assert_eq!((rig.fetches(), paid.len()), (1, 2));
+    assert_eq!(paid[0].invoice, paid[1].invoice, "the stored lni1 is paid again, not the offer");
+    assert_eq!(ledger_of(&rig.root, &d), 302, "charged once");
+    // paying the offer again after it settled is a new purchase: a new invoice
+    let r = rig.pay(&offer, 400);
+    assert_eq!((&r["verdict"], &r["invoice_reused"]), (&json!("allow"), &json!(false)), "{r}");
+    assert_eq!(rig.fetches(), 2);
+    assert_ne!(rig.offers_paid()[2].invoice, paid[0].invoice);
+    // a stored invoice about to expire is not retried: a new one is fetched
+    rig.ln.set(|s| s.mode = Mode::Fail);
+    assert_eq!(rig.pay(&offer, 400)["rule"], "ln_payment_failed");
+    assert_eq!(rig.fetches(), 3);
+    rig.clock.fetch_add(3_600, Ordering::SeqCst);
+    rig.ln.set(|s| {
+        s.mode = Mode::Succeed;
+        s.now += 3_600;
+    });
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+    assert_eq!(rig.fetches(), 4);
+    // a payment left in flight stays booked, and nothing else is fetched or paid beside it
+    rig.ln.set(|s| s.mode = Mode::InFlight);
+    let r = rig.pay(&offer, 400);
+    assert_eq!((&r["verdict"], &r["status"], &r["charged_sats"]), (&json!("pending"), &json!("IN_FLIGHT"), &json!(303)), "{r}");
+    assert_eq!(rig.pay(&offer, 400)["rule"], "ln_in_flight");
+    assert_eq!(rig.fetches(), 5);
+}
+
+/// Pass line 5. Lightning Fork signs every invoice request with a fresh key, so `invreq_payer_id`
+/// names one payment, not the payer: this task does not ship payer identity.
+#[test]
+fn agp082_two_pays_of_one_offer_record_two_payer_ids() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({}));
+    let (a, b) = (rig.pay(&offer, 400), rig.pay(&offer, 400));
+    assert_eq!((&a["verdict"], &b["verdict"]), (&json!("allow"), &json!("allow")), "{a} {b}");
+    let payer = |r: &Value| rig.s.ln_book.get(r["payment_hash"].as_str().unwrap()).unwrap()["payer_id"].as_str().unwrap().to_string();
+    assert_eq!((payer(&a).len(), payer(&b).len()), (66, 66));
+    assert_ne!(payer(&a), payer(&b), "one offer, one wallet, two payer ids");
+    assert_eq!((a["payer_id"].as_str().unwrap(), b["payer_id"].as_str().unwrap()), (payer(&a).as_str(), payer(&b).as_str()));
+    // each is the key in the invoice that was paid
+    for (r, p) in [&a, &b].into_iter().zip(rig.offers_paid()) {
+        assert_eq!(hex::encode(bolt12::decode_invoice(&p.invoice).unwrap().payer_id), payer(r));
+    }
+    // one destination, one recorded signer
+    assert_eq!(a["dest"], b["dest"]);
+    assert_eq!(ledger_of(&rig.root, &offer_dest(&offer)), 604);
+}
+
+/// The node's PayOffer takes no set of outgoing channels, so an offer is paid only when every channel of
+/// the node would carry a BOLT 11 payment.
+#[test]
+fn agp082_an_offer_is_not_paid_while_any_channel_of_the_node_is_unsafe() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({}));
+    let good = rig.ln.st.lock().unwrap().channels[0].clone();
+    for (bad, why) in [(rig.funded(6_101, 1, "SIMPLE_TAPROOT", false, 0x00, 6_050), "taproot"), (rig.funded(6_102, 1, "ANCHORS", false, 0x01, 6_050), "not unified"),
+                       (rig.funded(6_103, 1, "ANCHORS", true, 0x01, 6_050), "funding not proven"),
+                       (rig.funded(5_990, 1, "ANCHORS", true, 0x21, 5_900), "below the split")] {
+        for active in [true, false] {
+            let mut bad = bad.clone();
+            bad["active"] = active.into();
+            rig.ln.set(|s| s.channels = vec![good.clone(), bad]);
+            let r = rig.pay(&offer, 400);
+            assert_eq!(r["rule"], "ln_offer_unsafe_channel", "{why} (active {active}): {r}");
+            assert!(r["channels"][1]["refused"].as_str().unwrap().contains(why), "{r}");
+        }
+    }
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (0, 0));
+    // a BOLT 11 invoice is still paid in that state, confined to the proven channel
+    let (inv, _) = rig.invoice(100, 1, XBT);
+    assert_eq!(rig.pay(&inv, 200)["verdict"], "allow");
+    assert_eq!(rig.ln.st.lock().unwrap().sent[0].outgoing_chan_ids, vec![scid(6_100, 1)]);
+    // an inactive channel that passes every guard does not stand in the way
+    let mut idle = rig.funded(6_104, 1, "ANCHORS", true, 0x21, 6_050);
+    idle["active"] = false.into();
+    rig.ln.set(|s| s.channels = vec![good.clone(), idle]);
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+}
+
+#[test]
+fn agp082_an_offer_over_the_threshold_needs_a_human_before_any_invoice_is_asked_for() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(1200), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({}));
+    let d = offer_dest(&offer);
+    let r = rig.pay(&offer, 2000);
+    assert_eq!(r["verdict"], "needs_human", "{r}");
+    assert_eq!(rig.fetches(), 0, "nothing is asked of the issuer before the human");
+    let (tok, exp, amount) = (r["approval_token"].as_str().unwrap().to_string(), r["approval_expires"].as_i64().unwrap(), r["amount_sats"].as_i64().unwrap());
+    assert_eq!(amount, 1200 + 2 + 2);
+    let row = rig.call("approvals", json!({}));
+    assert!(row.to_string().contains(&d), "the UI queue shows the offer: {row}");
+    let sig = sign_human(&xbt_signer::approval::canonical_message(&tok, &d, amount, exp));
+    let r = rig.call("approve", json!({"token": tok, "dest": d, "amount_sats": amount, "expiry": exp, "signature": sig}));
+    assert_eq!((&r["granted"], &r["rail"]), (&json!(true), &json!("ln")), "{r}");
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (0, 0), "approve itself fetches and pays nothing");
+    let r = rig.pay(&offer, 2000);
+    assert_eq!((&r["verdict"], &r["approved"], &r["status"]), (&json!("allow"), &json!(true), &json!("SUCCEEDED")), "{r}");
+    assert_eq!(rig.call("approval_status", json!({"token": tok}))["state"], "used");
+    // the grant is spent: the next payment of the offer needs its own
+    assert_eq!(rig.pay(&offer, 2000)["verdict"], "needs_human");
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (1, 1));
+}
+
+/// The two offer calls as Lightning Fork's REST gateway takes and answers them (`offers.proto` at
+/// v0.21.3-beta-blake2b.17): uint64 as strings, bytes as base64.
+#[test]
+fn agp082_the_rest_client_speaks_fetchinvoice_and_pay_as_lightning_fork_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let mac = macaroon_file(dir.path());
+    let body_of = |head: &str| -> Value { serde_json::from_str(head.split("\r\n\r\n").nth(1).unwrap()).unwrap() };
+    let (node, asked) = http_stub("200 OK", String::new(), "{\"bolt12\": \"lni1xyz\", \"invoice\": {\"amount_msat\": \"300000\"}, \"offer_id\": \"AQID\"}");
+    let ln = LndRest::new(&node, &mac, None).unwrap();
+    let r = ln.fetch_invoice("lno1abc", 0, 60).unwrap();
+    assert_eq!((&r["bolt12"], &r["invoice"]["amount_msat"]), (&json!("lni1xyz"), &json!("300000")));
+    let head = asked.lock().unwrap()[0].clone();
+    assert!(head.starts_with("POST /v2/offers/fetchinvoice HTTP/1.1"), "{head}");
+    assert!(head.to_lowercase().contains("grpc-metadata-macaroon: "));
+    assert_eq!(body_of(&head), json!({"offer": "lno1abc", "amount_msat": "0", "timeout_seconds": 60}));
+    // pay: the invoice, never the offer; the answer becomes a settled payment with hex fields
+    let (hash, pre) = ([0x5a; 32], [0x6b; 32]);
+    let answer: &'static str = Box::leak(json!({"bolt12": "lni1xyz", "payment_hash": b64(&hash), "payment_preimage": b64(&pre), "amount_msat": "300000",
+                                                "fee_msat": "1500"}).to_string().into_boxed_str());
+    let (node, asked) = http_stub("200 OK", String::new(), answer);
+    let ln = LndRest::new(&node, &mac, None).unwrap();
+    let p = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap();
+    assert_eq!(p, json!({"payment_hash": hex::encode(hash), "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "1500",
+                         "payment_preimage": hex::encode(pre), "htlcs": []}));
+    let head = asked.lock().unwrap()[0].clone();
+    assert!(head.starts_with("POST /v2/offers/pay HTTP/1.1"), "{head}");
+    assert_eq!(body_of(&head), json!({"invoice": "lni1xyz", "fee_limit_msat": "3000", "timeout_seconds": 60}));
+    // a fee limit of 0 would be the node's default limit: never sent
+    let _ = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 0, timeout_s: 0 });
+    assert_eq!(body_of(&asked.lock().unwrap()[1]), json!({"invoice": "lni1xyz", "fee_limit_msat": "1", "timeout_seconds": 1}));
+    // a failed payment is an error that carries the node's words, for the caller to look the hash up
+    let (node, _) = http_stub("409 Conflict", String::new(), "{\"code\": 10, \"message\": \"payment failed: no route; payment hash 5a5a\"}");
+    let ln = LndRest::new(&node, &mac, None).unwrap();
+    let e = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap_err();
+    assert!(e.msg.contains("HTTP 409") && e.msg.contains("payment failed: no route"), "{}", e.msg);
+    assert!(ln.fetch_invoice("lno1abc", 0, 60).is_err());
+}
+
+/// Each FetchInvoice is something the node does for the caller, paid or not: limited like the sends.
+#[test]
+fn agp082_invoices_asked_of_an_offer_are_rate_limited() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({"ln": {"max_sends_per_hour": 3}}));
+    rig.ln.set(|s| s.tweak = Tweak::No512);
+    for _ in 0..3 {
+        assert_eq!(rig.pay(&offer, 400)["rule"], "ln_feature_512");
+    }
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_rate_limit", "{r}");
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (3, 0));
+    // an hour on, it may ask again, and an honest issuer is paid
+    rig.clock.fetch_add(3_601, Ordering::SeqCst);
+    rig.ln.set(|s| {
+        s.tweak = Tweak::None;
+        s.now += 3_601;
+    });
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+    assert_eq!(rig.fetches(), 4);
+    // the expiry of a booked invoice of either kind is read for the late-settle watch
+    let lni = rig.offers_paid()[0].invoice.clone();
+    assert_eq!(xbt_signer::ln::invoice_expires_at(&lni), Some((T0 + 3_601 - 5 + 3_600) as f64));
+    let (inv, _) = rig.invoice(100, 1, XBT);
+    assert_eq!(xbt_signer::ln::invoice_expires_at(&inv), Some((T0 + 3_601 - 10 + 3_600) as f64));
+    assert_eq!(xbt_signer::ln::invoice_expires_at("lni1qqqq"), None);
 }

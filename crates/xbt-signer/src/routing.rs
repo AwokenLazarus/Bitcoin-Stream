@@ -254,7 +254,8 @@ impl RouteSigner {
             Some(e) => e.store.payments()?.into_iter().map(|p| p.txid).collect(),
             None => HashSet::new(),
         };
-        for (chan, b) in s.book.resolved_bookings() {
+        // AGP-080: so does a lock written as booked whose rows a crash kept from being written
+        for (chan, b) in s.book.resolved_bookings().into_iter().chain(s.book.presigned_bookings()) {
             if b.get("at").and_then(Value::as_f64).unwrap_or(0.0) >= cutoff && s.book_lock(&chan, &b, None, Some(&in_ledger))? {
                 s.recovered_bookings += 1;
             }
@@ -307,12 +308,20 @@ impl RouteSigner {
             "this signer has no ECDSA adaptor implementation (xbt402 routing, AGP-026): routed locks are refused"))
     }
 
-    /// Pending routed amount on every channel of the book.
+    /// Pending routed amount on every channel of the book that the spend log does not hold yet:
+    /// locks pre-signed before AGP-080, which are booked when they resolve. A lock pre-signed
+    /// since is a spend row from before it left.
     pub fn pending_sats(&self) -> i64 {
-        self.book.unsettled_records().iter().filter(|r| r.has_pending_lock())
+        self.book.unsettled_records().iter().filter(|r| r.has_pending_lock() && !crate::channels::lock_booked(&r.pending_lock))
             .map(|r| py_int(r.pending_lock.get("cum")).unwrap_or(0) - py_int(r.pending_lock.get("prev_used")).unwrap_or(0)).sum()
     }
 
+    /// Pre-sign a routed lock. AGP-080 W1: the pre-signature is in the routing budget and the
+    /// policy ledger before it leaves, not when it resolves: a hub that keeps it can complete it
+    /// whenever it learns the secret, whatever this wallet later calls the lock. What is booked is
+    /// the amount by which `cum` raises the most this channel is already booked for (one close
+    /// claims one state, so a lock inside an earlier, given-up lock's amount rides on its booking).
+    /// Giving a lock up releases nothing.
     pub fn sign_state_adaptor(&self, chan: &str, cum: i64, point: &str, route: Value) -> Result<Value> {
         let mut route = match route {
             Value::Object(m) => m,
@@ -323,12 +332,15 @@ impl RouteSigner {
         let hub = route.get("hub").and_then(Value::as_str).filter(|h| !h.is_empty()).map(str::to_string)
             .unwrap_or_else(|| if rec.origin.is_empty() { dest.clone() } else { rec.origin.clone() });
         let increase = cum - rec.used_sats;
+        let delta = (cum - rec.used_sats.max(rec.booked_through())).clamp(0, increase.max(0));
+        // the budget counts what this lock adds: `increase - delta` of it is booked already
         let mut denied = check_route(&self.policy(), &self.spend, &hub, py_int(route.get("amount")).unwrap_or(0),
-                                     py_int(route.get("fee")).unwrap_or(0), increase, self.pending_sats(), now_f64());
+                                     py_int(route.get("fee")).unwrap_or(0), increase, self.pending_sats() - (increase - delta), now_f64());
+        let lock_id = route.get("lockId").and_then(Value::as_str).unwrap_or("").to_string();
+        let pay = Payment::new(&normalize_dest(&hub), delta, &format!("routed lock {lock_id}"));
         if denied.is_none() {
             if let Some(engine) = &self.engine {
-                let lock_id = route.get("lockId").and_then(Value::as_str).unwrap_or("").to_string();
-                let d = engine.evaluate(&Payment::new(&normalize_dest(&hub), increase, &format!("routed lock {lock_id}")), false)?;
+                let d = engine.evaluate_booking(&Payment { amount_sats: increase, ..pay.clone() }, delta, false)?;
                 if !d.allowed() {
                     denied = Some(d.as_value());
                 }
@@ -342,12 +354,22 @@ impl RouteSigner {
         }
         let scheme = self.scheme()?;
         route.insert("hub".into(), hub.into());
-        self.book.sign_state_adaptor(&dest, cum, point, Value::Object(route), &*scheme)
+        // The lock is written with what it books, then both rows, and only then does the
+        // pre-signature leave this call. A crash in between leaves a lock on disk that never left:
+        // the next start books it (`RouteSigner::new`), so the rows are written once, never missed.
+        let out = self.book.sign_state_adaptor(&dest, cum, point, Value::Object(route), &*scheme, Some(delta))?;
+        if delta > 0 {
+            let booking = json!({"key": format!("lock:{}:{cum}", rec.chan), "amount": delta, "hub": pay.dest, "lockId": lock_id, "at": crate::pyjson::now_ts()});
+            self.book_lock(&rec.chan, &booking, None, None)?;
+        }
+        Ok(out)
     }
 
     pub fn resolve_lock(&self, chan: &str, secret: &str) -> Result<String> {
         let res = self.book.resolve_lock(&self.dest(chan)?, secret)?;
-        self.book_lock(chan, &res["booking"], None, None)?;
+        if !res["booking"].is_null() {
+            self.book_lock(chan, &res["booking"], None, None)?; // a lock from before AGP-080: booked now
+        }
         Ok(res["t"].as_str().unwrap_or("").to_string())
     }
 
@@ -358,7 +380,7 @@ impl RouteSigner {
     pub fn adopt_lock(&self, chan: &str, cum: i64) -> Result<()> {
         let res = self.book.adopt_lock(&self.dest(chan)?, cum)?;
         let amount = py_int(res.get("amount")).unwrap_or(0);
-        if amount != 0 {
+        if amount != 0 && !res["booking"].is_null() {
             self.book_lock(chan, &res["booking"], Some("adopted"), None)?;
         }
         Ok(())
@@ -367,7 +389,9 @@ impl RouteSigner {
     pub fn recover_lock(&self, chan: &str, witness: &[Vec<u8>]) -> Result<String> {
         let scheme = self.scheme()?;
         let res = self.book.recover_lock(&self.dest(chan)?, witness, &*scheme)?;
-        self.book_lock(chan, &res["booking"], Some("recovered"), None)?;
+        if !res["booking"].is_null() {
+            self.book_lock(chan, &res["booking"], Some("recovered"), None)?;
+        }
         Ok(res["t"].as_str().unwrap_or("").to_string())
     }
 

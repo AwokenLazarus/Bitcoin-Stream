@@ -1,6 +1,6 @@
 //! The CPU cost of the AGP-065 audit on the target itself (scripts: none; run it under the target's
 //! emulator or on the device): the independent bounds, one block audit, the per-call credit walk and
-//! a fraud-proof check, over a book of `INVOICES × RECEIPTS` live spans. Prints one JSON line.
+//! a fraud-proof check, over a book of `INVOICES × RECEIPTS` receipted increases. Prints one JSON line.
 use std::time::Instant;
 
 use xbt_work::audit::{audit_block, check_fraud_proof, PrimeTerms, WindowStatement};
@@ -57,7 +57,7 @@ fn main() {
         let bounds = TERMS.bounds(&block).expect("bounds");
         let proof = audit_block(&b, &sw, &block, &bounds, &[]).expect("audit").proof.expect("an unpaid block fails");
         let inv = &invoice(0);
-        out.insert(format!("spans_{}", b.spans.len()), serde_json::json!({
+        out.insert(format!("spans_{}", b.intervals.len()), serde_json::json!({
             "bounds_us": micros(2000, || { std::hint::black_box(TERMS.bounds(std::hint::black_box(&block)).expect("bounds")); }),
             "audit_block_us": micros(20, || { std::hint::black_box(audit_block(&b, &sw, &block, &bounds, &[]).expect("audit")); }),
             "room_us": micros(200, || { std::hint::black_box(b.room(std::hint::black_box(inv))); }),

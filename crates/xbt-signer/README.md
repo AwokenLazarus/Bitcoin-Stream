@@ -61,13 +61,13 @@ policy-checked where it raises the signed amount.
 | method | params | result |
 |---|---|---|
 | `xbt402_new_key` | `origin` | `{pub}`: a fresh payer key, sealed on disk at once as `pending:<origin>` |
-| `xbt402_attach` | `origin`, `params` (ChannelParams `to_dict`) | `{chan, dest}`: binds the issued key to the funded channel (open at once); `<origin>/next` is a rollover's successor |
+| `xbt402_attach` | `origin`, `params` (ChannelParams `to_dict`) | `{chan, dest}`: binds the issued key to the funded channel (open at once); `<origin>/next` is a rollover's successor, attached only once this signer's node shows the rollover (else `deny/rollover_unproven`) |
 | `xbt402_sign_state` (= `sign_state`) | `chan` or `dest`, `cum` | policy on `cum - used`, then `{verdict, chan, cum, sig}` |
 | `xbt402_sign_rollover` | `chan`, `amount`, `next_spk`, `next_capacity` | policy on the increase, then `{sig}` (audit kind `channel_rollover`) |
 | `xbt402_sign_conditional` | `chan`, `uncond`, `hash`, `amount`, `csv_delta` | policy on `uncond + amount - used`, then `{sig}` |
 | `xbt402_sign_close` | `chan` | `{sig}` (close authorisation) |
 | `xbt402_sign_refund` | `chan` | `{hex, expiry, to}`: the CLTV refund, always to the hot key |
-| `xbt402_mark_closed` | `chan`, `txid` | the channel's record after its change was learned (AGP-022) |
+| `xbt402_mark_closed` | `chan`, `txid` | the channel's record after its change was learned (AGP-022), once this signer's node shows the funding spent; before that `deny/close_unproven` and the channel stays refundable (AGP-080) |
 | `tx_confirmations` | `txid`, `vout` | `{confirmations, height}` (read-only; for the payer's P2 wait) |
 
 `client::RemoteSigner` implements `xbt402::signer::StateSigner` and `xbt402::client::Wallet` over
@@ -86,7 +86,7 @@ ECDSA adaptor (AGP-026, wire-compatible with B1 `adaptor.py`), the default `chan
 |---|---|---|
 | `xbt402_sign_state_adaptor` | `chan`, `cum`, `point` (T), `route` (`hub`, `amount`, `fee`, `lockId`) | routing policy, engine, then `{verdict, adaptor, point (T1), tweak (r), cum}`; the lock is written ahead |
 | `xbt402_resolve_lock` | `chan`, `secret` (t + r or t) | `{t}` |
-| `xbt402_void_lock` | `chan` | `{voided}` |
+| `xbt402_void_lock` | `chan` | `{voided}`; the lock's booking stays (AGP-080) |
 | `xbt402_adopt_lock` | `chan`, `cum` | `{adopted}` (only a given-up lock's own cum, with no lock pending) |
 | `xbt402_recover_lock` | `chan`, `txid`, `blockhash`, or `hex` (new: the raw close) | `{t}`; only a secret opening the stored T1 counts |
 | `routing_status` | | policy, 24 h spend, pending locks, `adaptor: available` |
@@ -179,6 +179,26 @@ signature log whose `sig_sha256` is the payment hash (the log holds the SHA-256 
 The wallet never opens channels; `ln_status` lists the node's coins below the split, which must never
 fund one.
 
+**BOLT 12 offers (AGP-082).** `ln_pay {invoice: "lno1...", max_sats, amount_sats?, description?}`
+pays an offer: `dest` is `ln-offer:<offer id>` (the SHA-256 of the offer's fields, which Lightning Fork
+and Core Lightning report as the offer id). The signer decodes the offer itself (`src/bolt12.rs`: bit
+512, a chain this node is on, where an offer that names no chain is Bitcoin's genesis and so mainnet's
+only; expiry; amount), runs the policy on the offer and the amount plus the fee limit, and only then
+has the node fetch an invoice (`POST /v2/offers/fetchinvoice`). It decodes that `lni1...` too, verifies
+the issuer's signature, checks it against the offer and against the node's summary of it, writes it to
+`.run/ln_offers.json`, and has the node pay that invoice (`POST /v2/offers/pay` with `invoice`). A
+retry pays the stored invoice, so one attempt never has two invoices out. The key that signed an
+offer's first invoice is recorded, and a later invoice signed by another key is refused
+(`ln_offer_signer`). The node chooses the channels of such a payment, so it is refused
+(`ln_offer_unsafe_channel`) unless every channel of the node passes guards 4 and 5. Decoding on the
+node is never used: the macaroon needs nothing beyond the four permissions above. Each payment records
+the `invreq_payer_id` its request was signed with; Lightning Fork draws a new one per request, so it
+names one payment, not the payer.
+
+The node's word on a settled payment is checked (AGP-082): the booking is never below the invoice
+amount, and `SUCCEEDED` counts only with the preimage of the payment hash; without it the whole
+booking stays and the rail halts. The REST client follows no redirect.
+
 policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_ppm` (5000),
 `min_expiry_s` (60), `max_cltv_blocks` (1008), `timeout_s` (60), `anchor_height`, `anchor_hash`,
 `split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none, not
@@ -212,6 +232,40 @@ the first `human_key_enroll` needs the one-time code. Passphrase blobs use scryp
 `log_n`. Details, error codes and the wire changes are in the workspace README section
 "Agent-wallet budget integrity and privileged methods (AGP-063)".
 
+## No unbooked signature, no close on anyone's word (AGP-080)
+
+- **Hash-locked last chunk.** A stream's last chunk is bought with a state that pays the plain
+  amount plus the chunk to whoever holds the key. The ledger holds both before that state is
+  signed. The plain state that folds the lock in books nothing more, and a seller that keeps the
+  signature and withholds the key releases nothing.
+- **Adaptor pre-signatures.** A routed lock is in the routing budget and the policy ledger
+  (`lock:<chan>:<cum>`) before its pre-signature leaves, not when it resolves. What is booked is
+  the amount by which the lock raises the most the channel is already booked for
+  (`ledger_booked_sats`): one close claims one state, so a lock inside an earlier, given-up lock's
+  amount rides on that booking. `xbt402_void_lock` gives the lock up locally and releases nothing;
+  no socket method releases a booking. A lock from before this change (no `booked` in its record)
+  is booked when it resolves, as before.
+- **Closed means spent on our node.** `xbt402_mark_closed` marks a channel closed only when this
+  signer's node shows its funding output spent (`deny/close_unproven` otherwise; the claim is kept
+  in memory and the watcher marks the channel closed when the spend arrives). `close_channel`
+  reports the provider's close with `close_proven`; a close our node has not shown is recorded
+  `close_unproven`, stays with the watcher, and is not replaced by a new channel
+  (`deny/close_unproven`). If the funding is still unspent at expiry the record is opened again
+  and refunded. `xbt402_attach` of `<origin>/next` needs the rollover on our node: the live
+  channel's funding spent by the transaction whose output is the next channel's script and
+  capacity (it waits up to `open_wait_s`, then `deny/rollover_unproven`; the issued key and the
+  live record are kept). A live record is never overwritten.
+- **Seller URLs.** `openUrl`, `closeUrl` and a stream's `chunkUrl` are the seller's strings. Each
+  must be a path starting with one `/`, or an absolute URL on the channel's own origin, with no
+  backslash, whitespace or control character (`xbt402::wire::seller_url`; `deny/seller_url`
+  before any request). The HTTP client follows no redirect.
+- **On-chain `pay`.** The payment is committed to the ledger before `sendtoaddress`. The node's
+  own refusal (`rpc_refused`, a JSON-RPC error) takes the row back; any other failure leaves it
+  (`onchain:unconfirmed:<id>`), because the node may have sent.
+- **Keys in memory.** The hot keys, the channel payer keys, a `Payer`'s key and every plaintext
+  the keystore opens are wiped when dropped. `SecretKey` is `Copy`: a copy made on the stack while
+  signing is not tracked, and libsecp256k1's own scratch memory is its own.
+
 ## Files and durability (AGP-055)
 
 One process owns a wallet directory. The files are B2's, byte format included: a directory written
@@ -234,9 +288,11 @@ added or dropped.
   has no `payments` key. A settled or failed Lightning booking is a line
   `{"amend": txid, "amount_sats": n | null}` in the payments log. Files from before AGP-055 are
   converted at the first start.
-- A resolved lock is remembered in its channel record (`resolved`, the last 16, key
-  `lock:<chan>:<cum>`) and booked once per key in both logs; a start books any that a crash left
-  unbooked. In the ledger a routed lock's `txid` is that key.
+- A lock is written to its channel record with what it books (`pending_lock.booked`,
+  `booked_sats`), then booked once under `lock:<chan>:<cum>` in both logs, then its pre-signature
+  leaves; a start books any lock a crash left written and unbooked. A lock from before AGP-080 is
+  remembered at its resolve (`resolved`, the last 16) and booked then, with the same recovery. In
+  the ledger a routed lock's `txid` is that key.
 - `src/fsx.rs` has the durable steps (write, fsync, rename, truncate, directory fsync) every file
   goes through, and `fsx::probe`, which counts them per thread and lets a test make any one the last
   thing the process does (`tests/lock_persist.rs`). Nothing in the signer arms it.

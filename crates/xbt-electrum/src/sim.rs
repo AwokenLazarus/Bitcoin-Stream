@@ -331,6 +331,10 @@ pub struct Knobs {
     pub junk_above: Option<u32>,
     /// Sleep this long before answering each `blockchain.block.headers`.
     pub delay_headers_ms: u64,
+    /// Serve at most this many headers per `blockchain.block.headers` answer from the checkpoint up (a trickle).
+    pub headers_per_answer: Option<u32>,
+    /// Before answering this method, send this raw line (no newline needed) as it is.
+    pub line_before: Option<(String, Arc<Vec<u8>>)>,
 }
 
 enum SLink {
@@ -487,6 +491,13 @@ impl FakeElectrum {
                 if self.knobs().mute {
                     continue;
                 }
+                if let Some((method, raw)) = self.knobs().line_before.clone() {
+                    let asked = |m: &Value| m.get("method").and_then(Value::as_str) == Some(method.as_str());
+                    if msg.as_array().map_or(asked(&msg), |a| a.iter().any(asked)) {
+                        // a client that hangs up mid-line is the point: the answer below fails too
+                        let _ = link.send(&raw).and_then(|_| link.send(b"\n"));
+                    }
+                }
                 let reply = match msg {
                     Value::Array(items) => Value::Array(items.iter().map(|m| self.answer(m, &mut subs, &mut tip_sub)).collect()),
                     m => self.answer(&m, &mut subs, &mut tip_sub),
@@ -603,7 +614,9 @@ impl FakeElectrum {
                     .map(|r| json!(hex::encode(r))).ok_or_else(|| format!("height {h} not found"))
             }
             "blockchain.block.headers" => {
-                let (start, count) = (u(0), u(1).min(2016));
+                // the trickle starts at the checkpoint: the headers below it are served whole
+                let trickle = self.knobs().headers_per_answer.filter(|_| u(0) >= CHECKPOINT).unwrap_or(u32::MAX);
+                let (start, count) = (u(0), u(1).min(2016).min(trickle));
                 let hs = self.headers_view();
                 let (refuse, junk, delay) = { let k = self.knobs(); (k.refuse_headers_above, k.junk_above, k.delay_headers_ms) };
                 if delay > 0 {

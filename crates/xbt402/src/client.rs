@@ -432,6 +432,13 @@ pub struct Client {
     pub on_refund: Option<RefundHook>,
     /// Channels replaced by a rollover, until their successor is opened at the provider.
     pub pending_rolled: HashMap<String, ClientChannel>,
+    /// Rollovers this client signed whose next channel is not the live one yet, per origin (AGP-081,
+    /// review C3). A record is saved before its request leaves, because the provider can broadcast
+    /// the transaction while the reply is lost or an error. It holds the next channel's key and
+    /// refund, or, with a signer, the params the signer binds it with once its node shows the
+    /// rollover (`refund_hex` is empty until then). [`adopt_rolled`](Self::adopt_rolled) makes one
+    /// the live channel; one whose transaction can no longer confirm is the embedder's to remove.
+    pub next_rolled: HashMap<String, Vec<ClientChannel>>,
     /// AGP-027: where the payer keys live (B2's signer). `None`: this client holds them.
     signer: Option<Arc<dyn StateSigner>>,
     /// AGP-035: where the channel book is saved. `None`: memory only.
@@ -460,6 +467,18 @@ fn header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
     r.header(name)
 }
 
+/// The PAYMENT-RESPONSE of the answer to a request that carried a payment (AGP-081, review T4c). A
+/// success without one is refused: with the receipt stripped on the way, any body passed as the
+/// paid answer. An answer of 400 or above may have none (the provider's own failures carry no
+/// receipt): it goes back as it is and nothing is adopted from it.
+fn paid_response(r: &HttpResponse) -> Result<Option<Value>> {
+    match header(r, "PAYMENT-RESPONSE") {
+        Some(h) => unb64json(h).map(Some),
+        None if r.status < 400 => fail("bad_receipt", format!("paid call returned no receipt (HTTP {})", r.status)),
+        None => Ok(None),
+    }
+}
+
 fn ex_u64(ex: &Value, k: &str) -> Result<u64> {
     py_u64(ex.get(k)).ok_or_else(|| ChannelError::new("bad_offer", format!("extra.{k} missing")))
 }
@@ -468,7 +487,7 @@ impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
                height: HeightFn) -> Self {
         Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None,
-               pending_rolled: HashMap::new(), signer: None, ledger: None, payers: vec![] }
+               pending_rolled: HashMap::new(), next_rolled: HashMap::new(), signer: None, ledger: None, payers: vec![] }
     }
 
     /// Pay with another scheme (AGP-032, `xbt-work`) whenever a 402 offers it: it is preferred
@@ -490,6 +509,10 @@ impl Client {
                 self.channels.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
             } else if let Some(o) = k.strip_prefix("rolled ") {
                 self.pending_rolled.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
+            } else if let Some(o) = k.strip_prefix("next ") {
+                let list = v.as_array().ok_or_else(|| ChannelError::new("ledger_error", "client next-channel record: not a list"))?;
+                let list = list.iter().map(|c| ClientChannel::from_json(c, self.signer.as_ref())).collect::<Result<Vec<_>>>()?;
+                self.next_rolled.insert(o.to_string(), list);
             }
         }
         self.ledger = Some(ledger);
@@ -503,14 +526,17 @@ impl Client {
         let Some(l) = &self.ledger else { return Ok(()) };
         let mut recs = vec![("book".to_string(), json!({"opened_sats": self.opened_sats, "day_spent": self.day_spent, "day_start": self.day_start}))];
         let rec = |c: Option<&ClientChannel>| c.map(ClientChannel::to_json).unwrap_or(Value::Null);
+        let list = |l: &Vec<ClientChannel>| Value::Array(l.iter().map(ClientChannel::to_json).collect());
         match origin {
             Some(o) => {
                 recs.push((format!("chan {o}"), rec(self.channels.get(o))));
                 recs.push((format!("rolled {o}"), rec(self.pending_rolled.get(o))));
+                recs.push((format!("next {o}"), self.next_rolled.get(o).map(list).unwrap_or(Value::Null)));
             }
             None => {
                 recs.extend(self.channels.iter().map(|(o, c)| (format!("chan {o}"), c.to_json())));
                 recs.extend(self.pending_rolled.iter().map(|(o, c)| (format!("rolled {o}"), c.to_json())));
+                recs.extend(self.next_rolled.iter().map(|(o, l)| (format!("next {o}"), list(l))));
             }
         }
         l.save(&recs)
@@ -611,11 +637,8 @@ impl Client {
     }
 
     fn expiry_blocks(&self, ex: &Value) -> Result<u32> {
-        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
-        // default margin is 36
-        let lo = (ex_u64(ex, "minExpiryBlocks")? + 6).max(ex_u64(ex, "minExpiryBlocks")? + 36);
-        let hi = ex_u64(ex, "maxExpiryBlocks")?.saturating_sub(1);
-        u32::try_from((self.cfg.expiry_blocks as u64).max(lo).min(hi)).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
+        let blocks = crate::funding::offer_expiry_blocks(ex, self.cfg.expiry_blocks as u64)?;
+        u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
     }
 
     fn open(&mut self, origin: &str, acc: &Value) -> Result<ClientChannel> {
@@ -632,7 +655,7 @@ impl Client {
         let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let addr = segwit_address(self.hrp(), &p.spk())?;
-        let open_url = format!("{origin}{}", ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let open_url = crate::wire::seller_url(origin, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH))?;
         let mut c = json!({"capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
                            "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
         if fee_payer != FeePayer::Payer {
@@ -678,6 +701,7 @@ impl Client {
     /// `bind`: where the request goes, `origin + path` ([`request_digest_v2`]); a close's payload
     /// binds the empty request.
     fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, bind: &str, body: &[u8]) -> Result<()> {
+        crate::wire::no_fragment(bind)?;
         let req = request_digest_v2(method, bind, body);
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
         let chan = py_str(pl.get("chan"));
@@ -772,6 +796,7 @@ impl Client {
     }
 
     fn request_inner(&mut self, method: &str, url: &str, body: &[u8], opts: &CallOpts<'_>) -> Result<HttpResponse> {
+        crate::wire::no_fragment(url)?;
         let (origin, path) = split_url(url);
         let extra = opts.checked_headers()?;
         let with_extra = |mut h: Vec<(String, String)>| {
@@ -790,6 +815,8 @@ impl Client {
         if used.is_none() && self.channels.contains_key(&origin) {
             hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
         }
+        // a payment went with the request: its answer is taken only with its receipt
+        let mut paid = !hdrs.is_empty();
         let mut r = self.transport.request(method, url, body, &with_extra(hdrs))?;
         if r.status == 402 {
             let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
@@ -799,8 +826,8 @@ impl Client {
             if let Some((p, acc)) = self.payers.iter().find_map(|p| offered(p.scheme()).map(|a| (p.clone(), a))) {
                 let h = p.answer(self.transport.as_ref(), &origin, &acc, &pr, method, &path, body)?;
                 r = self.transport.request(method, url, body, &with_extra(h))?;
-                if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
-                    p.check(&origin, &unb64json(h)?, method, &path, body)?;
+                if let Some(resp) = paid_response(&r)? {
+                    p.check(&origin, &resp, method, &path, body)?;
                 }
                 return Ok(r);
             }
@@ -828,9 +855,10 @@ impl Client {
             }
             let hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
             r = self.transport.request(method, url, body, &with_extra(hdrs))?;
+            paid = true;
         }
-        if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
-            let resp = unb64json(h)?;
+        let resp = if paid { paid_response(&r)? } else { header(&r, "PAYMENT-RESPONSE").map(unb64json).transpose()? };
+        if let Some(resp) = resp {
             match &used {
                 Some(p) => p.check(&origin, &resp, method, &path, body)?,
                 None => self.receipt(&origin, &resp, method, &path, body, (r.status, &r.body), None)?,
@@ -898,7 +926,7 @@ impl Client {
         let ch = &self.channels[origin];
         let chan = ch.payer.params.channel_id();
         let sig = hex::encode(ch.payer.sign_close()?);
-        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH));
+        let url = crate::wire::seller_url(origin, ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH))?;
         self.post(&url, &json!({"chan": chan, "sig": sig, "payload": pl}))
     }
 
@@ -933,28 +961,72 @@ impl Client {
         let txid = p.rollover_tx(owed, &next.spk(), next_cap)?.txid();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let sig = hex::encode(ch.payer.sign_rollover_next(owed, &next, next_cap)?);
+        let (accepted, price) = (ch.accepted.clone(), ch.price);
         let body = json!({"chan": chan, "amount": owed, "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry,
                           "payerSpk": hex::encode(&next.payer_spk)}, "sig": sig});
-        let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;
+        // Before the request leaves (AGP-081, review C3): the provider may broadcast the one tx we
+        // signed while its reply is lost or an error. A key of ours is bound and its refund handed
+        // out now. A signer binds a next channel only once its node shows the rollover, so its
+        // record carries the params to bind it with (take_next, adopt_rolled).
         let np = next.with_funding(&txid, 1, next_cap)?;
-        let (payer, refund_hex, auth_key) = self.bind_key(&next_origin, np, secret)?;
-        if let Some(cb) = &self.on_refund {
-            // before the reply is judged: the provider may have broadcast the one tx we signed
+        let (payer, refund_hex, auth_key) = match (&self.signer, secret) {
+            (Some(s), _) => (Payer::with_backend(np, s.clone()), String::new(), [0u8; 32]),
+            (None, secret) => self.bind_key(&next_origin, np, secret)?,
+        };
+        if let (Some(cb), false) = (&self.on_refund, refund_hex.is_empty()) {
             cb(&refund_hex, expiry);
         }
+        let next_ch = ClientChannel { payer, origin: origin.into(), accepted, refund_hex, auth_key, price, slack_msat: 0, seq: 0,
+                                      spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] };
+        self.next_rolled.entry(origin.to_string()).or_default().push(next_ch);
+        self.persist(Some(origin))?;
+        let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;
         if r.get("txid").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() != Some(txid.as_str())
             || r.get("nextChan").and_then(Value::as_str).map(str::to_ascii_lowercase) != Some(format!("{txid}:1"))
             || py_u64(r.get("nextCapacity")) != Some(next_cap)
         {
             return fail("bad_rollover", format!("the provider's rollover differs from the one we signed (tx {txid})"));
         }
+        self.take_next(origin, &txid)?;
+        Ok(r)
+    }
+
+    /// Make the next channel of the rollover `txid` the live one; the channel it replaces waits in
+    /// [`pending_rolled`](Self::pending_rolled). A key held by a signer is bound there first.
+    fn take_next(&mut self, origin: &str, txid: &str) -> Result<()> {
+        let unknown = || ChannelError::new("no_channel", format!("no signed rollover {txid} for {origin}"));
+        let list = self.next_rolled.get_mut(origin).ok_or_else(unknown)?;
+        let i = list.iter().position(|c| c.payer.params.funding_txid() == txid).ok_or_else(unknown)?;
+        if list[i].refund_hex.is_empty() {
+            let s = self.signer.as_ref().ok_or_else(|| ChannelError::new("bad_key", "the next channel has no refund and no signer"))?;
+            let p = &list[i].payer.params;
+            // a channel the signer bound before (the reply to that attach was lost) still signs its refund
+            let attached = s.attach(&format!("{origin}/next"), p);
+            let refund = match s.sign_refund(&p.channel_id()) {
+                Ok(r) => r,
+                Err(e) => return Err(attached.err().unwrap_or(e)),
+            };
+            if let Some(cb) = &self.on_refund {
+                cb(&refund, p.expiry);
+            }
+            list[i].refund_hex = refund;
+        }
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
-        let mut next_ch = ClientChannel { payer, origin: origin.into(), accepted: ch.accepted.clone(), refund_hex,
-                                          auth_key, price: ch.price, slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(),
-                                          pending_cond: None, acked_cum: 0, receipts: vec![] };
+        let mut next_ch = list.remove(i);
+        if list.is_empty() {
+            self.next_rolled.remove(origin);
+        }
         std::mem::swap(ch, &mut next_ch);
         self.pending_rolled.insert(origin.to_string(), next_ch);
-        Ok(r)
+        Ok(())
+    }
+
+    /// Make the next channel of a rollover this client signed the live one, after a reply that was
+    /// lost or an error, once the embedder sees the rollover transaction `txid` on chain (AGP-081,
+    /// review C3). Then [`open_rolled`](Self::open_rolled), as after a rollover that answered.
+    pub fn adopt_rolled(&mut self, origin: &str, txid: &str) -> Result<()> {
+        let r = self.take_next(origin, &txid.to_ascii_lowercase());
+        self.saved(origin, r)
     }
 
     /// Register the rolled-over channel with the provider (its funding must have confirmed).
@@ -972,7 +1044,7 @@ impl Client {
         if p.close_fee_payer != FeePayer::Payer {
             c["closeFeePayer"] = p.close_fee_payer.as_str().into();
         }
-        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let url = crate::wire::seller_url(origin, ch.accepted.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH))?;
         let r = self.post(&url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
         self.pending_rolled.remove(origin);
         Ok(r)
@@ -986,6 +1058,7 @@ impl Client {
     }
 
     fn request_conditional_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<(HttpResponse, Vec<u8>)> {
+        crate::wire::no_fragment(url)?;
         let (origin, path) = split_url(url);
         let r = self.transport.request(method, url, body, &[])?;
         if r.status != 402 {
@@ -1052,10 +1125,9 @@ impl Client {
         if sha256(&k) != h {
             return fail("bad_preimage", "provider preimage does not match H");
         }
-        if let Some(hv) = header(&r, "PAYMENT-RESPONSE") {
+        if let Some(resp) = paid_response(&r)? {
             // while the hash lock is pending: after a bad_receipt, recover_conditional still reads k
             // from the provider's claim
-            let resp = unb64json(hv)?;
             self.receipt(&origin, &resp, method, &path, body, (r.status, &r.body), Some(cond_amt))?;
         }
         let plain = decrypt(&cipher, &k);

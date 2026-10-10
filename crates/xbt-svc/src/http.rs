@@ -1,13 +1,14 @@
 //! The bounded HTTP/1.1 server every XBT service listens with (review T1: AGP-068 in xbt402, AGP-072
 //! for the UI, the MCP and the relay). std::net and threads, no async runtime, no dependency.
 //!
-//! A connection thread (at most [`Limits::connections`] at once) reads the head under a line cap, a
+//! A connection thread (at most [`Limits::connections`] at once, and [`Limits::per_address`] of them
+//! from one client address) reads the head under a line cap, a
 //! head cap and an absolute deadline, then a Content-Length body under the handler's limit and its
 //! own deadline. Only then does it wait for one of `threads` handler slots to run
 //! [`Handler::handle`], so a slow or endless client holds a connection slot until its deadline, and
 //! never a handler slot. One request per connection (`Connection: close`); chunked request bodies are 501.
 //! A public deployment still belongs behind a reverse proxy that terminates TLS.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,7 +29,14 @@ pub struct Limits {
     pub body_deadline: Duration,
     /// Connections open at once; above it, 503 and close.
     pub connections: usize,
+    /// Connections open at once from one client address ([`AddrKey`]); above it, 503 and close
+    /// (AGP-081, review T1: with only the global cap one address held every slot). 0: no cap per
+    /// address, for a server whose only peer is its reverse proxy.
+    pub per_address: usize,
 }
+
+/// Sets [`Limits::per_address`] for the servers a process starts with [`serve`].
+pub const PER_ADDRESS_ENV: &str = "XBT_HTTP_MAX_PER_ADDRESS";
 
 impl Default for Limits {
     fn default() -> Self {
@@ -38,7 +46,31 @@ impl Default for Limits {
             head_deadline: Duration::from_secs(10),
             body_deadline: Duration::from_secs(30),
             connections: 64,
+            per_address: 48,
         }
+    }
+}
+
+impl Limits {
+    /// The default limits with [`PER_ADDRESS_ENV`] applied: a whole number, 0 for no cap per
+    /// address. Anything else is an error, not the default.
+    pub fn from_env() -> io::Result<Self> {
+        let mut l = Self::default();
+        if let Some(v) = std::env::var_os(PER_ADDRESS_ENV) {
+            let bad = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{PER_ADDRESS_ENV} must be a whole number (0: no cap per address)"),
+                )
+            };
+            l.per_address = v
+                .to_str()
+                .ok_or_else(bad)?
+                .trim()
+                .parse()
+                .map_err(|_| bad())?;
+        }
+        Ok(l)
     }
 }
 
@@ -147,13 +179,13 @@ impl Running {
     }
 }
 
-/// [`serve_with`] the default [`Limits`].
+/// [`serve_with`] the default [`Limits`], [`PER_ADDRESS_ENV`] applied.
 pub fn serve(
     handler: Arc<dyn Handler>,
     listener: TcpListener,
     threads: usize,
 ) -> io::Result<Running> {
-    serve_with(handler, listener, threads, Limits::default())
+    serve_with(handler, listener, threads, Limits::from_env()?)
 }
 
 /// Serve `handler` on `listener` (bound by the caller, port 0 included: no window in which another
@@ -212,12 +244,67 @@ impl Drop for Pass<'_> {
     }
 }
 
-/// Releases a connection slot when its connection ends, however it ends.
-struct Slot(Arc<AtomicUsize>);
+/// What counts as one client address: an IPv4 address (an IPv4-mapped IPv6 address is its IPv4
+/// address), or an IPv6 /64, since one host is usually handed the whole prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AddrKey {
+    V4(Ipv4Addr),
+    V6Prefix(u64),
+}
+
+impl AddrKey {
+    pub fn of(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(a) => Self::V4(a),
+            IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(m) => Self::V4(m),
+                None => Self::V6Prefix((u128::from(a) >> 64) as u64),
+            },
+        }
+    }
+}
+
+/// Open connections per client address. A connection whose peer the socket cannot name counts
+/// under `None`, as one address. The map never holds more entries than there are open connections.
+struct PerAddress {
+    max: usize,
+    open: Mutex<HashMap<Option<AddrKey>, usize>>,
+}
+
+impl PerAddress {
+    /// Count one more connection for `key`, unless it is at the cap.
+    fn admit(&self, key: Option<AddrKey>) -> bool {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let n = open.entry(key).or_insert(0);
+        if self.max > 0 && *n >= self.max {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn release(&self, key: Option<AddrKey>) {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = open.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&key);
+            }
+        }
+    }
+}
+
+/// Releases a connection slot, and its address's, when its connection ends, however it ends.
+struct Slot {
+    open: Arc<AtomicUsize>,
+    per: Arc<PerAddress>,
+    key: Option<AddrKey>,
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.open.fetch_sub(1, Ordering::SeqCst);
+        self.per.release(self.key);
     }
 }
 
@@ -315,6 +402,10 @@ fn accept(
     stop: &AtomicBool,
 ) {
     let open = Arc::new(AtomicUsize::new(0));
+    let per = Arc::new(PerAddress {
+        max: limits.per_address,
+        open: Mutex::new(HashMap::new()),
+    });
     let pool = Arc::new(Pool {
         handler,
         gate,
@@ -338,8 +429,18 @@ fn accept(
             write_error(&mut sock, 503, "too many connections");
             continue;
         }
+        let key = sock.peer_addr().ok().map(|a| AddrKey::of(a.ip()));
+        if !per.admit(key) {
+            write_error(&mut sock, 503, "too many connections from this address");
+            continue;
+        }
         open.fetch_add(1, Ordering::SeqCst);
-        pool.dispatch((sock, Slot(open.clone())));
+        let slot = Slot {
+            open: open.clone(),
+            per: per.clone(),
+            key,
+        };
+        pool.dispatch((sock, slot));
     }
 }
 
@@ -477,6 +578,10 @@ fn parse_head(head: &[u8]) -> Result<Request, Refusal> {
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     if method.is_empty() || target.is_empty() {
         return Err((400, "bad request"));
+    }
+    if target.contains('#') {
+        // no client sends a fragment; a payment's request binding does not cover one (AGP-081, review T2)
+        return Err((400, "request target with a fragment"));
     }
     let mut headers = Vec::new();
     for line in lines {
@@ -654,6 +759,7 @@ mod tests {
             b"GET  HTTP/1.1",
             b"GET / HTTP/1.1\r\nno colon",
             b"GET / HTTP/1.1\r\nX: \xff",
+            b"GET /a#b HTTP/1.1",
         ] {
             assert_eq!(
                 parse_head(bad).unwrap_err().0,
@@ -662,5 +768,43 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+    }
+
+    #[test]
+    fn one_address_is_an_ipv4_address_or_an_ipv6_slash_64() {
+        let k = |s: &str| AddrKey::of(s.parse().unwrap());
+        assert_eq!(k("::ffff:192.0.2.7"), k("192.0.2.7"));
+        assert_ne!(k("192.0.2.7"), k("192.0.2.8"));
+        assert_eq!(k("2001:db8:1:2::1"), k("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
+        assert_ne!(k("::1"), k("127.0.0.1"));
+    }
+
+    #[test]
+    fn an_address_at_its_cap_is_refused_and_no_other_is() {
+        let per = PerAddress {
+            max: 2,
+            open: Mutex::new(HashMap::new()),
+        };
+        let (a, b) = (
+            Some(AddrKey::of("192.0.2.7".parse().unwrap())),
+            Some(AddrKey::of("2001:db8::1".parse().unwrap())),
+        );
+        assert!(per.admit(a) && per.admit(a) && !per.admit(a));
+        assert!(per.admit(b) && per.admit(None) && per.admit(None) && !per.admit(None));
+        per.release(a);
+        assert!(per.admit(a) && !per.admit(a));
+        for k in [a, a, b, None, None] {
+            per.release(k);
+        }
+        assert!(
+            per.open.lock().unwrap().is_empty(),
+            "a closed connection leaves no entry"
+        );
+        let off = PerAddress {
+            max: 0,
+            open: Mutex::new(HashMap::new()),
+        };
+        assert!((0..1000).all(|_| off.admit(a)), "0 is no cap per address");
     }
 }

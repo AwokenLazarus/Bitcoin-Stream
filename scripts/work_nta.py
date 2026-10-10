@@ -270,6 +270,7 @@ def provider_args(identity, port):
     return [B["provider"], "--port", str(port), "--rpc-port", str(RPC["b"]), "--cookie", cookie("b"), "--identity", identity,
             "--prime-pubkey", PRIME_PUB, "--prime-id", "70", "--receipt-url", f"{STATS_URL}/receipt", "--relay-url", RELAY_URL,
             "--window-url", f"{STATS_URL}/window", "--nta", "--admin", "--pull-secs", "3",
+            "--data-dir", os.path.join(RUN, f"provider-data-{port}"), "--state", os.path.join(RUN, f"provider-work-{port}.json" if port != API else "provider-work.json"),
             "--cap-invoice", "1", "--cap-total", "1", "--max-carry-sats", str(MAX_CARRY), "--audit-depth", "1"] + prime_terms()
 
 
@@ -628,12 +629,12 @@ def run():
         check(res.get("ok") is True and rep["carry"]["owedSats"] == 0,
               f"C: Rust audit PASS (paid {res.get('paidSats')} >= expected {res.get('expectedSats')}); the carry ledger is released "
               f"(owed {rep['carry']['owedSats']}, released {rep['carry']['releasedSats']})", audit=res)
-        # AGP-065 (review P2): the pass covers the B share, so it is credited outside the caps; the C share,
-        # mined at the block's height, is outside that bound and takes the cap
-        check(rep["credit"]["frozen"] is None and rep["credit"]["heldWork"] == 0 and rep["credit"]["unauditedWork"] == 1,
-              f"C: unfrozen; the audit covers the B share (credited outside the caps), the C share takes the cap of 1: {rep['credit']}")
+        # AGP-079: a pass covers only what the coinbase paid for. On regtest a call costs one unit and a paying
+        # block pays for one: it covers A's unit, the B share takes the cap of 1, the C share stays held until D
+        check(rep["credit"]["frozen"] is None and rep["credit"]["heldWork"] == 1 and rep["credit"]["unauditedWork"] == 1,
+              f"C: unfrozen; the coinbase pays for one unit (A's), the B share takes the cap of 1, the C share is held: {rep['credit']}")
 
-    # ---- D: one more pool block, mined outside the invoice: its audit covers C
+    # ---- D: one more pool block, mined outside the invoice: its coinbase pays for one more unit, the C share is credited
     log("== D: a pool block outside the invoice")
     d_row = mined_block("D", f"{pool_addr}.d")
     if d_row["ok"]:

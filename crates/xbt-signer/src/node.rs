@@ -82,6 +82,10 @@ impl KnotsRpc {
     }
 }
 
+/// The node answered the call with a JSON-RPC error: it did not do what was asked. Every other
+/// failure is `rpc_error`: the call may or may not have run (AGP-080: `pay` keeps its booking then).
+pub const REFUSED: &str = "rpc_refused";
+
 impl Node for KnotsRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         let m = method.to_lowercase();
@@ -101,7 +105,7 @@ impl Node for KnotsRpc {
                 // a JSON-RPC error comes back with HTTP 500 and a body; report the node's error
                 if let Ok(v) = serde_json::from_str::<Value>(&raw) {
                     if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
-                        return Err(err("rpc_error", e.to_string()));
+                        return Err(err(REFUSED, e.to_string()));
                     }
                 }
                 return Err(err("rpc_error", format!("RPC HTTP {code}: {}", raw.chars().take(400).collect::<String>())));
@@ -111,7 +115,7 @@ impl Node for KnotsRpc {
         let v: Value = serde_json::from_str(&resp.into_string().map_err(|e| err("rpc_error", e.to_string()))?)
             .map_err(|e| err("rpc_error", e.to_string()))?;
         if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
-            return Err(err("rpc_error", e.to_string()));
+            return Err(err(REFUSED, e.to_string()));
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
